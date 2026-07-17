@@ -1,0 +1,10 @@
+{
+  "id": "wetongbu",
+  "name": "WeTongbu",
+  "version": "0.8.0",
+  "minAppVersion": "1.11.4",
+  "description": "将微信文章、飞书文档和文章型网页同步到 Obsidian。",
+  "author": "WeTongbu",
+  "authorUrl": "https://wetongbu.com",
+  "isDesktopOnly": true
+}

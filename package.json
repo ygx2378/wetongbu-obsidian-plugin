@@ -1,0 +1,24 @@
+{
+  "name": "wetongbu-obsidian-plugin",
+  "version": "0.8.0",
+  "private": false,
+  "type": "module",
+  "description": "WeTongbu Obsidian plugin",
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "build": "node esbuild.config.mjs --production"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1080.0",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.13.1",
+    "typescript": "^6.0.3"
+  }
+}
