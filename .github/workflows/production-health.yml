@@ -1,0 +1,20 @@
+name: WeTongbu production health
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check API and WeChat callback service
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --max-time 15 --retry 2 https://api.wetongbu.com/healthz
+          curl --fail --silent --show-error --max-time 15 --retry 2 https://wx.wetongbu.com/healthz

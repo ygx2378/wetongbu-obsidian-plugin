@@ -17,6 +17,8 @@ Repository maintainers can receive new issue emails from GitHub without sharing 
 3. Enable **Issues** and confirm.
 4. Verify the GitHub account's notification email and delivery settings.
 
+For service availability alerts, also enable GitHub Actions notifications for this repository. The scheduled **WeTongbu production health** workflow checks both public health endpoints every five minutes; it contains no credentials or user data.
+
 This is a personal GitHub notification setting; the repository cannot enable it on behalf of another person.
 
 ## 中文
