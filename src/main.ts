@@ -37,6 +37,7 @@ interface WeTongbuSettings {
   processedSourceUrls: string[];
   imageDeliveryMode: ImageDeliveryMode;
 }
+
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
 
@@ -155,6 +156,7 @@ export default class WeTongbuPlugin extends Plugin {
   canHostImages = false;
   hostedMediaQuotaBytes = 0;
   hostedMediaUsedBytes = 0;
+  lastSafeErrorCode = "";
 
   async onload() {
     const saved = ((await this.loadData()) ?? {}) as PersistedSettings;
@@ -507,11 +509,22 @@ export default class WeTongbuPlugin extends Plugin {
       if (!quiet && synced === 0) new Notice("微同步：没有待同步文章");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.lastSafeErrorCode = "sync_failed";
       if (!quiet) new Notice(`微同步失败：${message}`, 10000);
       console.error("WeTongbu sync failed");
     } finally {
       this.syncing = false;
     }
+  }
+
+  openSupportReport() {
+    const params = new URLSearchParams({
+      source: "obsidian",
+      version: this.manifest.version,
+      platform: currentDeviceName(),
+    });
+    if (this.lastSafeErrorCode) params.set("error_code", this.lastSafeErrorCode);
+    window.open(`https://wetongbu.com/support/report/?${params}`, "_blank", "noopener,noreferrer");
   }
 
   private async syncApiTasks() {
@@ -966,6 +979,13 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .setDesc("立即检查待同步任务")
       .addButton((button) =>
         button.setButtonText("立即同步").onClick(() => this.plugin.syncNow()),
+      );
+
+    new Setting(containerEl)
+      .setName("帮助与问题反馈")
+      .setDesc(`微同步插件 ${this.plugin.manifest.version}。提交时只附带版本、操作系统和安全错误码，不会自动上传笔记、图片或密钥。`)
+      .addButton((button) =>
+        button.setButtonText("提交问题").onClick(() => this.plugin.openSupportReport()),
       );
   }
 

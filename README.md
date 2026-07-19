@@ -25,7 +25,7 @@ WeTongbu saves user-selected WeChat articles, Feishu documents, and article-styl
 Guides, support, and privacy policy:
 
 - https://wetongbu.com/docs/quick-start/
-- https://wetongbu.com/support/
+- https://wetongbu.com/support/report/
 - https://wetongbu.com/privacy/
 
 ## Network, accounts, and privacy
@@ -57,4 +57,4 @@ Attach `main.js` and `manifest.json` from the same version to each GitHub Releas
 
 ## Support
 
-Use https://wetongbu.com/support/ for support. Do not send access keys, secret keys, verification codes, recovery codes, or complete presigned URLs in support requests.
+Use the private form at https://wetongbu.com/support/report/ for account, billing, storage, or private-content context. Use GitHub Issues only for reproducible public bugs. See [SUPPORT.md](SUPPORT.md) and [SECURITY.md](SECURITY.md). Do not send access keys, secret keys, verification codes, recovery codes, cookies, device tokens, note contents, or complete signed URLs.

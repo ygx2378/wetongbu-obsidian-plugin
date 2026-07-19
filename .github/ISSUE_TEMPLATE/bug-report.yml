@@ -1,0 +1,66 @@
+name: Bug report / 问题报告
+description: Report a reproducible, non-sensitive WeTongbu plugin problem
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve WeTongbu. GitHub Issues are public.
+        Do not paste note contents, storage credentials, verification or recovery codes, cookies, device tokens, or signed URLs. For private details, use https://wetongbu.com/support/report/.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area / 问题位置
+      options:
+        - Obsidian task download
+        - Markdown or local attachments
+        - Account authorization
+        - Free object storage setup
+        - Hosted image links
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version / 插件版本
+      placeholder: 0.9.7
+    validations:
+      required: true
+  - type: input
+    id: obsidian
+    attributes:
+      label: Obsidian and operating system versions
+      placeholder: Obsidian 1.x, macOS 15 / Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened? / 发生了什么
+      description: Describe the visible behavior without private note content.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / 复现步骤
+      placeholder: |
+        1. Open...
+        2. Click...
+        3. See...
+    validations:
+      required: true
+  - type: input
+    id: safe_error
+    attributes:
+      label: Safe error code (optional) / 安全错误码（选填）
+      description: Enter only a short error code, not the complete log or URL.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation / 隐私确认
+      options:
+        - label: I removed note content, credentials, codes, cookies, tokens, and signed URLs.
+          required: true

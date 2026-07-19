@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private support / 私密问题反馈
+    url: https://wetongbu.com/support/report/
+    about: Use this when the report may include account, billing, or private-content context.
+  - name: Setup documentation / 配置文档
+    url: https://wetongbu.com/docs/quick-start/
+    about: Start here for installation, object storage, and Chrome binding.
