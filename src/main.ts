@@ -40,9 +40,10 @@ interface WeTongbuSettings {
   rootFolder: string;
   processedTaskIds: string[];
   processedSourceUrls: string[];
+  imageDeliveryMode: ImageDeliveryMode;
 }
-
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
+type ImageDeliveryMode = "local" | "hosted_link";
 type PersistedSettings = Partial<WeTongbuSettings> & {
   noteFolder?: string;
   attachmentFolder?: string;
@@ -68,6 +69,25 @@ function providerLabel(value: unknown) {
     : "对象存储";
 }
 
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  return `${(value / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+const HOSTED_MEDIA_LINK = /https:\/\/[a-z0-9.-]+(?:\/media)?\/m\/[0-9a-f]{8}-[0-9a-f-]{27}\/[a-f0-9]{64}/gi;
+
+function imageExtension(body: Buffer, contentType: string) {
+  if (body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
+  if (body.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "jpg";
+  if (body.subarray(0, 6).toString("ascii") === "GIF87a" || body.subarray(0, 6).toString("ascii") === "GIF89a") return "gif";
+  if (body.subarray(8, 12).toString("ascii") === "WEBP") return "webp";
+  if (/image\/svg\+xml/i.test(contentType)) return "svg";
+  if (/image\/avif/i.test(contentType)) return "avif";
+  return "img";
+}
+
 const DEFAULT_SETTINGS: WeTongbuSettings = {
   apiBaseUrl: "https://api.wetongbu.com",
   userId: "",
@@ -84,6 +104,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   rootFolder: "微同步",
   processedTaskIds: [],
   processedSourceUrls: [],
+  imageDeliveryMode: "local",
 };
 
 async function ensureFolder(plugin: WeTongbuPlugin, folder: string) {
@@ -125,6 +146,11 @@ export default class WeTongbuPlugin extends Plugin {
   recoveryToken = "";
   storageStatus = "";
   accountStatus = "未登录";
+  accountLoggedIn = false;
+  accountPlanType = "free";
+  canHostImages = false;
+  hostedMediaQuotaBytes = 0;
+  hostedMediaUsedBytes = 0;
 
   async onload() {
     const saved = ((await this.loadData()) ?? {}) as PersistedSettings;
@@ -135,6 +161,7 @@ export default class WeTongbuPlugin extends Plugin {
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
     await this.saveSettings();
+    void this.refreshAccountStatus();
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "微同步：手动同步", () => {
       void this.syncNow();
@@ -288,7 +315,7 @@ export default class WeTongbuPlugin extends Plugin {
     const authorization = response.json;
     const verificationUrl = `${authorization.verification_uri}?user_code=${encodeURIComponent(authorization.user_code)}`;
     window.open(verificationUrl, "_blank");
-    this.accountStatus = `请在浏览器确认 ${authorization.user_code}`;
+    this.accountStatus = "请在浏览器完成账号登录并确认授权";
     for (;;) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
       const polled = await requestUrl({
@@ -302,9 +329,132 @@ export default class WeTongbuPlugin extends Plugin {
       if (polled.json.status === "pending") continue;
       if (!polled.json.plugin_token) throw new Error("登录授权响应无效");
       this.app.secretStorage.setSecret(this.pluginTokenSecretId(), polled.json.plugin_token);
-      this.accountStatus = "已登录，可使用 Pro 试用";
+      await this.refreshAccountStatus();
+      if (!this.accountLoggedIn) throw new Error("账号状态读取失败，请重新登录");
       return;
     }
+  }
+
+  async refreshAccountStatus() {
+    const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (!this.settings.syncTargetId || !token) {
+      this.accountLoggedIn = false;
+      this.accountPlanType = "free";
+      this.canHostImages = false;
+      this.accountStatus = "未登录";
+      return;
+    }
+    try {
+      const response = await requestUrl({
+        url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/account`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+        throw: false,
+      });
+      if (response.status !== 200) {
+        this.accountLoggedIn = false;
+        this.accountPlanType = "free";
+        this.canHostImages = false;
+        this.accountStatus = "未登录（Free 可继续使用）";
+        return;
+      }
+      const account = response.json?.account ?? {};
+      this.accountLoggedIn = Boolean(account.email);
+      this.accountPlanType = account.planType === "pro" ? "pro" : "free";
+      this.accountStatus = this.accountLoggedIn
+        ? `当前账号：${account.email} · ${account.planType === "pro" ? "Pro 托管版" : "Free 自有存储"}`
+        : "未登录（Free 可继续使用）";
+      await this.refreshImageDeliveryPreference(token);
+    } catch {
+      this.accountStatus = this.accountLoggedIn ? "已登录（账号状态暂时无法读取）" : "未登录（Free 可继续使用）";
+    }
+  }
+
+  private async refreshImageDeliveryPreference(token?: string) {
+    const pluginToken = token ?? this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (!this.settings.syncTargetId || !pluginToken) return;
+    const response = await requestUrl({
+      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/image-delivery`,
+      method: "GET",
+      headers: { Authorization: `Bearer ${pluginToken}` },
+      throw: false,
+    });
+    if (response.status !== 200) {
+      this.canHostImages = false;
+      return;
+    }
+    const mode = response.json?.mode === "hosted_link" ? "hosted_link" : "local";
+    const changed = this.settings.imageDeliveryMode !== mode;
+    this.settings.imageDeliveryMode = mode;
+    this.canHostImages = Boolean(response.json?.can_host_images);
+    this.hostedMediaQuotaBytes = Number(response.json?.media_quota_bytes ?? 0);
+    this.hostedMediaUsedBytes = Number(response.json?.media_used_bytes ?? 0);
+    if (changed) await this.saveSettings();
+  }
+
+  async setImageDeliveryMode(mode: ImageDeliveryMode) {
+    const token = await this.ensureCurrentVaultRegistered();
+    const response = await requestUrl({
+      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/image-delivery`,
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      contentType: "application/json",
+      body: JSON.stringify({ mode }),
+      throw: false,
+    });
+    if (response.status !== 200) throw new Error(response.json?.error ?? "图片保存位置更新失败");
+    this.settings.imageDeliveryMode = response.json?.mode === "hosted_link" ? "hosted_link" : "local";
+    this.canHostImages = Boolean(response.json?.can_host_images);
+    this.hostedMediaQuotaBytes = Number(response.json?.media_quota_bytes ?? this.hostedMediaQuotaBytes);
+    this.hostedMediaUsedBytes = Number(response.json?.media_used_bytes ?? this.hostedMediaUsedBytes);
+    await this.saveSettings();
+  }
+
+  openAccountCenter() {
+    window.open("https://app.wetongbu.com/account/", "_blank");
+  }
+
+  async migrateHostedImagesToLocal() {
+    const root = normalizePath(this.settings.rootFolder);
+    const assetFolder = normalizePath(`${root}/90_附件/云端图片`);
+    let notes = 0;
+    let images = 0;
+    for (const note of this.app.vault.getMarkdownFiles()) {
+      if (note.path !== root && !note.path.startsWith(`${root}/`)) continue;
+      const original = await this.app.vault.cachedRead(note);
+      const links = [...new Set(original.match(HOSTED_MEDIA_LINK) ?? [])];
+      if (!links.length) continue;
+      let markdown = original;
+      for (const link of links) {
+        const downloaded = await requestUrl({ url: link, method: "GET", throw: false });
+        if (downloaded.status !== 200) throw new Error(`图片下载失败（${downloaded.status}）`);
+        const body = Buffer.from(downloaded.arrayBuffer);
+        if (!body.length) throw new Error("图片下载为空");
+        const headers = downloaded.headers ?? {};
+        const contentType = String(headers["content-type"] ?? headers["Content-Type"] ?? "");
+        const filename = `${createHash("sha256").update(link).digest("hex").slice(0, 24)}.${imageExtension(body, contentType)}`;
+        const targetPath = normalizePath(`${assetFolder}/${filename}`);
+        await ensureFolder(this, assetFolder);
+        if (!(await this.app.vault.adapter.exists(targetPath))) {
+          await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(body));
+          const written = await this.app.vault.adapter.stat(targetPath);
+          if (!written || written.type !== "file" || written.size !== body.length) {
+            throw new Error("本地图片写入校验失败");
+          }
+        }
+        const localPath = path.posix.relative(note.parent?.path ?? "", targetPath);
+        markdown = markdown.split(link).join(localPath);
+        images += 1;
+      }
+      if (markdown !== original) {
+        await this.app.vault.modify(note, markdown);
+        if (await this.app.vault.adapter.read(note.path) !== markdown) {
+          throw new Error("本地 Markdown 写入校验失败");
+        }
+        notes += 1;
+      }
+    }
+    return { notes, images };
   }
 
   async configureUserStorage(accessKeyInput: string, secretKeyInput: string) {
@@ -380,7 +530,7 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!quiet) new Notice(`微同步失败：${message}`, 10000);
-      console.error("WeTongbu sync failed", { message: message.slice(0, 240) });
+      console.error("WeTongbu sync failed");
     } finally {
       this.syncing = false;
     }
@@ -436,7 +586,7 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       new Notice(`旧版任务迁移失败：${message}`, 10000);
-      console.error("WeTongbu legacy migration failed", { message: message.slice(0, 240) });
+      console.error("WeTongbu legacy migration failed");
     } finally {
       client?.destroy();
       this.syncing = false;
@@ -469,7 +619,10 @@ export default class WeTongbuPlugin extends Plugin {
       if (zipBytes.length !== item.file_size) throw new Error("ZIP 校验失败：任务包大小不一致");
       const task = await this.unpackWebclipTask(zipBytes);
       if (task.manifest.taskId !== item.task_id) throw new Error("manifest task_id 与服务器任务不一致");
-      await this.writeTask(task);
+      const imageLinks = item.image_delivery_mode === "hosted_link"
+        ? await this.publishHostedImages(base, token, item.task_id)
+        : {};
+      await this.writeTask(task, imageLinks);
       this.settings.processedTaskIds.push(item.task_id);
       this.settings.processedTaskIds = this.settings.processedTaskIds.slice(-1000);
       await this.saveSettings();
@@ -489,6 +642,21 @@ export default class WeTongbuPlugin extends Plugin {
       throw: false,
     });
     if (response.status !== 200) throw new Error(response.json?.error ?? "云端任务清理失败");
+  }
+
+  private async publishHostedImages(base: string, token: string, taskId: string) {
+    const response = await requestUrl({
+      url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/${taskId}/media/publish`,
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      contentType: "application/json",
+      body: "{}",
+      throw: false,
+    });
+    if (response.status !== 200) throw new Error(response.json?.error ?? "云端图片保存失败");
+    const links = response.json?.image_links;
+    if (!links || typeof links !== "object" || Array.isArray(links)) throw new Error("云端图片链接响应无效");
+    return links as Record<string, string>;
   }
 
   private async unpackWebclipTask(zipBytes: Buffer) {
@@ -517,7 +685,12 @@ export default class WeTongbuPlugin extends Plugin {
       markdown: files.get(manifest.entry_file)!.toString("utf8"),
       assets: manifest.files
         .filter((file: any) => file.path.startsWith("assets/"))
-        .map((file: any) => ({ relativePath: file.path, body: files.get(file.path)! })),
+        .map((file: any) => ({
+          relativePath: file.path,
+          body: files.get(file.path)!,
+          kind: file.kind,
+          contentType: file.content_type,
+        })),
     };
   }
 
@@ -538,7 +711,7 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
-  private async writeTask(task: any) {
+  private async writeTask(task: any, imageLinks: Record<string, string> = {}) {
     const layout = buildVaultPaths({
       rootFolder: normalizePath(this.settings.rootFolder),
       title: task.manifest.title,
@@ -549,17 +722,24 @@ export default class WeTongbuPlugin extends Plugin {
     const noteFolder = normalizePath(layout.noteFolder);
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
-    await ensureFolder(this, taskAttachmentFolder);
 
     let markdown = task.markdown;
     const assetPlans = task.assets.map((asset: any, index: number) => {
       const filename = layout.assetNames[index];
+      const remoteLink = asset.kind === "image" ? imageLinks[asset.relativePath] : undefined;
+      if (remoteLink) {
+        markdown = markdown.split(`<${asset.relativePath}>`).join(`<${remoteLink}>`);
+        markdown = markdown.split(asset.relativePath).join(remoteLink);
+        return { asset, filename, targetPath: "", writeLocal: false };
+      }
       const targetPath = normalizePath(`${taskAttachmentFolder}/${filename}`);
       const relativePath = path.posix.relative(noteFolder, targetPath);
       markdown = markdown.split(`<${asset.relativePath}>`).join(relativePath);
       markdown = markdown.split(asset.relativePath).join(relativePath);
-      return { asset, filename, targetPath };
+      return { asset, filename, targetPath, writeLocal: true };
     });
+    const localAssetPlans = assetPlans.filter((plan: { writeLocal: boolean }) => plan.writeLocal);
+    if (localAssetPlans.length) await ensureFolder(this, taskAttachmentFolder);
     markdown = markdown.replace(/^[\t ]+(?=(?:!\[|\[!\[))/gm, "");
 
     const notePath = await uniqueNotePath(
@@ -571,7 +751,7 @@ export default class WeTongbuPlugin extends Plugin {
     let noteCreatedByThisAttempt = false;
     const assetsCreatedByThisAttempt: string[] = [];
     try {
-      for (const { asset, filename, targetPath } of assetPlans) {
+      for (const { asset, filename, targetPath } of localAssetPlans) {
         if (!(await this.app.vault.adapter.exists(targetPath))) {
           assetsCreatedByThisAttempt.push(targetPath);
         }
@@ -602,7 +782,7 @@ export default class WeTongbuPlugin extends Plugin {
         throw new Error("本地 Markdown 写入校验失败");
       }
     } catch (error) {
-      if (createdNote && noteCreatedByThisAttempt) await this.app.vault.delete(createdNote);
+      if (createdNote && noteCreatedByThisAttempt) await this.app.fileManager.trashFile(createdNote);
       for (const targetPath of assetsCreatedByThisAttempt) {
         const asset = this.app.vault.getAbstractFileByPath(targetPath);
         if (asset instanceof TFile) await this.app.fileManager.trashFile(asset);
@@ -651,7 +831,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
             });
         })
         .addButton((button) =>
-          button.setButtonText("恢复连接").onClick(async () => {
+          button.setButtonText("恢复免费版 Vault").onClick(async () => {
             try {
               await this.plugin.recoverFreeVault(this.recoveryTokenInput);
               this.recoveryTokenInput = "";
@@ -666,11 +846,9 @@ class WeTongbuSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("账号与 Pro")
-      .setDesc(this.plugin.accountStatus === "未登录"
-        ? "Free 不登录也能使用；登录后可试用微同步托管存储"
-        : this.plugin.accountStatus)
+      .setDesc(`${this.plugin.accountStatus}。登录 Pro 会在浏览器中完成账号登录和授权；Free 使用绑定码，不需要登录。`)
       .addButton((button) =>
-        button.setButtonText(this.plugin.accountStatus === "未登录" ? "登录并使用 Pro" : "重新登录")
+        button.setButtonText(this.plugin.accountLoggedIn ? "更换账号" : "登录 Pro 账号")
           .onClick(async () => {
             try {
               button.setDisabled(true);
@@ -683,7 +861,57 @@ class WeTongbuSettingTab extends PluginSettingTab {
               button.setDisabled(false);
             }
           }),
+      )
+      .addButton((button) =>
+        button.setButtonText("打开账号中心").onClick(() => this.plugin.openAccountCenter()),
       );
+
+    new Setting(containerEl)
+      .setName("插件版本")
+      .setDesc(`当前已加载：${this.plugin.manifest.version}`);
+
+    if ((this.plugin.accountPlanType === "pro" && this.plugin.canHostImages)
+      || this.plugin.settings.imageDeliveryMode === "hosted_link") {
+      new Setting(containerEl)
+        .setName("图片保存位置")
+        .setDesc(this.plugin.canHostImages
+          ? `本地下载保持默认；云端图片会写入稳定链接，不下载到本地。已使用 ${formatBytes(this.plugin.hostedMediaUsedBytes)} / ${formatBytes(this.plugin.hostedMediaQuotaBytes)}。请勿公开分享包含云端图片链接的笔记。`
+          : "云端图片目前处于只读和转存宽限期：可以将已有图片下载回本地，但不能创建新的云端图片。")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("local", "下载到 Obsidian 本地（默认）")
+            .addOption("hosted_link", "保存在微同步云端，以链接插入笔记")
+            .setValue(this.plugin.settings.imageDeliveryMode)
+            .onChange(async (value) => {
+              try {
+                await this.plugin.setImageDeliveryMode(value as ImageDeliveryMode);
+                this.display();
+              } catch (error) {
+                new Notice(`图片保存位置更新失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+                this.display();
+              }
+            }),
+        )
+        .addButton((button) =>
+          button.setButtonText("将云端图片转存到本地").onClick(async () => {
+            try {
+              button.setDisabled(true);
+              const result = await this.plugin.migrateHostedImagesToLocal();
+              new Notice(`已转存 ${result.images} 张图片，更新 ${result.notes} 篇笔记`);
+            } catch (error) {
+              new Notice(`转存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            } finally {
+              button.setDisabled(false);
+            }
+          }),
+        );
+    } else {
+      new Setting(containerEl)
+        .setName("图片保存位置")
+        .setDesc(this.plugin.accountLoggedIn
+          ? "当前套餐使用本地下载。开通有效 Pro 后，可选择将图片保存在微同步云端，并在笔记中插入稳定链接。"
+          : "图片会下载到 Obsidian 本地。登录并开通 Pro 后，可选择云端图片链接。");
+    }
 
     new Setting(containerEl)
       .setName("存储服务")
@@ -797,11 +1025,11 @@ class WeTongbuSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName("连接浏览器扩展")
+      .setName("不登录：绑定 Chrome")
       .setDesc(
         this.plugin.pairingCode
           ? `绑定码 ${this.plugin.pairingCode}，有效至 ${new Date(this.plugin.pairingExpiresAt).toLocaleTimeString()}`
-          : "对象存储测试通过后，生成 6 位一次性绑定码连接浏览器",
+          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成绑定；这不需要登录账号",
       )
       .addButton((button) =>
         button.setButtonText("生成绑定码").onClick(async () => {
