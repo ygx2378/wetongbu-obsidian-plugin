@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { unzipSync } from "fflate";
 import {
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -38,6 +39,15 @@ interface WeTongbuSettings {
 }
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
+
+function currentDeviceName() {
+  if (Platform.isIosApp) return "iOS";
+  if (Platform.isAndroidApp) return "Android";
+  if (Platform.isWin) return "Windows";
+  if (Platform.isLinux) return "Linux";
+  if (Platform.isMacOS) return "macOS";
+  return "Obsidian";
+}
 type PersistedSettings = Partial<WeTongbuSettings> & {
   noteFolder?: string;
   attachmentFolder?: string;
@@ -191,7 +201,7 @@ export default class WeTongbuPlugin extends Plugin {
       contentType: "application/json",
       body: JSON.stringify({
         targetName: this.app.vault.getName(),
-        deviceName: navigator.platform || "Obsidian Desktop",
+        deviceName: currentDeviceName(),
       }),
       throw: false,
     });
@@ -213,7 +223,7 @@ export default class WeTongbuPlugin extends Plugin {
       contentType: "application/json",
       body: JSON.stringify({
         recovery_token: recoveryToken.trim(),
-        device_name: navigator.platform || "Obsidian Desktop",
+        device_name: currentDeviceName(),
       }),
       throw: false,
     });
