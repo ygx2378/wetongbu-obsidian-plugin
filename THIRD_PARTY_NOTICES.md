@@ -5,8 +5,7 @@ license texts are provided by the respective package distributions.
 
 | Package | License |
 | --- | --- |
-| `@aws-sdk/client-s3` | Apache-2.0 |
-| `jszip` | MIT OR GPL-3.0-or-later |
+| `fflate` | MIT |
 | `obsidian` API types | MIT |
 | `esbuild` | MIT (build only) |
 | `typescript` | Apache-2.0 (build only) |

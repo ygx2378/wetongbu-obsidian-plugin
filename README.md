@@ -1,42 +1,42 @@
-# WeTongbu for Obsidian
+# WeTongbu
 
 ![WeTongbu logo](icon.png)
 
-微同步把你主动选择的微信文章、飞书文档和文章型网页同步到 Obsidian Vault，并保存为本地 Markdown 和附件。
+WeTongbu saves user-selected WeChat articles, Feishu documents, and article-style web pages to the current Obsidian Vault as Markdown notes with local attachments.
 
-## 功能
+## Features
 
-- 在 Obsidian 中自动轮询微同步任务，并把 Markdown、图片和附件保存到当前 Vault。
-- 不登录也可通过一次性 6 位绑定码连接 Chrome 扩展，使用 Free 自有对象存储。
-- 登录后可使用 Pro 托管版；Pro 可以选择把图片下载到本地，或保存在微同步云端并以稳定链接写入笔记。
-- Free 使用自己的 Cloudflare R2、Amazon S3、阿里云 OSS 或腾讯云 COS；Pro 使用微同步托管对象存储。
-- 对象存储只作为临时任务信箱，任务完成、失败或过期后由服务端清理；最终文件保存在本地 Vault。
-- 支持桌面端 Obsidian；插件声明 `isDesktopOnly: true`，因为需要本地二进制附件写入和对象存储 SDK。
+- Polls WeTongbu tasks and writes Markdown, images, and attachments to the current Vault.
+- Free users can use a six-digit binding code to connect the Chrome extension without signing in.
+- Pro users authorize the desktop plugin in a browser and can choose local image downloads or stable hosted image links.
+- Free uses the user's own Cloudflare R2, Amazon S3, Alibaba Cloud OSS, or Tencent Cloud COS. Pro uses WeTongbu-hosted temporary object storage.
+- Temporary task objects are deleted by the service after completion, failure, or expiry. Markdown and attachments remain in the Vault.
+- Desktop-only: the plugin needs desktop binary-file support to write attachments into the Vault.
 
-## 开始使用
+## Getting started
 
-1. 安装并启用插件。
-2. 选择 Free 自有对象存储，或登录使用 Pro 托管版。
-3. Free 用户按官网教程创建私有 Bucket 和最小权限密钥，再点击“测试并保存”。
-4. Free 用户点击“生成绑定码”，在 Chrome 扩展中输入 6 位绑定码；这条流程不要求登录。
-5. Pro 用户在插件中点击“登录 Pro 账号”，在浏览器完成登录并明确授权此设备。
-6. 在浏览器中主动点击“同步到 Obsidian”，保持 Obsidian 打开等待任务完成。
+1. Install and enable the plugin.
+2. Choose Free storage or sign in for Pro.
+3. Free users follow the storage guide, create a private bucket with least-privilege credentials, and select **Test and save**.
+4. Free users create a six-digit binding code and enter it in the Chrome extension. This path does not require an account login.
+5. Pro users select **Sign in to Pro**, then complete the browser authorization for this desktop plugin.
+6. In Chrome, explicitly select a supported document or article and choose **Sync to Obsidian**. Keep Obsidian open until the task completes.
 
-官网、详细教程、隐私政策和支持入口：
+Guides, support, and privacy policy:
 
 - https://wetongbu.com/docs/quick-start/
-- https://wetongbu.com/privacy/
 - https://wetongbu.com/support/
+- https://wetongbu.com/privacy/
 
-## 隐私与权限
+## Network, accounts, and privacy
 
-插件只处理用户主动选择同步的内容，以及完成任务所需的任务状态和临时对象。不会读取浏览器历史，不会用于广告、画像或客户端遥测，也不会把对象存储长期密钥交给浏览器扩展。Free 密钥使用 Obsidian SecretStorage 保存，并由服务端以加密字段保存用于任务处理。
+The plugin only processes content that the user explicitly chooses to sync, plus task metadata and temporary objects required to complete that sync. It does not read browser history, show advertising, profile users, or include client-side telemetry. Long-lived object-storage keys are never provided to the browser extension. Free credentials are stored in Obsidian SecretStorage and encrypted by the service only for the requested storage workflow.
 
-插件通过 `api.wetongbu.com` 创建或恢复 Vault、验证 Free 对象存储、获取同步任务、完成网页登录授权，并通知服务端清理远端任务对象。任务包和 Pro 云端图片可能经由服务端签发的临时对象存储或媒体地址传输；旧微信回调域名 `wx.wetongbu.com` 不由插件直接调用。插件会校验任务包哈希、文件大小和安全路径。
+The plugin calls `api.wetongbu.com` to create or recover a Vault, validate Free object storage, obtain tasks, complete browser-based account authorization, and request deletion of temporary task objects. Task packages and optional Pro hosted images may be transferred through service-issued temporary object-storage or media URLs. The legacy WeChat callback domain is not called by the plugin.
 
-插件只在当前 Vault 内写入同步产生的 Markdown 和附件。若一次写入失败，它会将本次新建附件移入 Obsidian 回收站；不会访问 Vault 外的文件。Pro 托管版需要微同步账号和付费订阅才能使用完整功能，具体数据处理说明见 [隐私政策](https://wetongbu.com/privacy/)。
+The plugin writes sync output only inside the current Vault. If a task write fails, it moves newly-created files to the Obsidian trash. The optional hosted-image migration reads Markdown notes only under the plugin's configured root folder. Pro requires a WeTongbu account and paid subscription for full hosted features. See the privacy policy above for server-side data handling.
 
-## 本地开发
+## Development
 
 ```bash
 npm install
@@ -44,8 +44,17 @@ npm run check
 npm run build
 ```
 
-`manifest.json`、`main.js` 和可选的 `styles.css` 应作为同版本 GitHub Release 附件提供。默认分支不提交构建生成的 `main.js`。
+Attach `main.js` and `manifest.json` from the same version to each GitHub Release. The default branch does not commit generated `main.js`.
 
-## 支持
+## 中文说明
 
-请通过 https://wetongbu.com/support/ 反馈问题。不要在反馈中发送 Access Key、Secret Key、验证码、恢复码或完整预签名链接。
+微同步把用户主动选择的微信文章、飞书文档和文章型网页保存到当前 Obsidian Vault，并生成 Markdown 与本地附件。
+
+- Free 用户不登录也可通过六位绑定码连接 Chrome 扩展，并使用自己的 R2、S3、OSS 或 COS。
+- Pro 用户在浏览器中明确授权桌面插件，可选图片下载到本地，或保存到微同步云端并以稳定链接写入笔记。
+- 对象存储只承担临时任务中转；任务完成、失败或过期后由服务端清理，最终 Markdown 和附件保留在 Vault。
+- 插件只处理用户主动同步的内容。网络请求、账号、付费能力和数据处理说明见上方英文说明与隐私政策。
+
+## Support
+
+Use https://wetongbu.com/support/ for support. Do not send access keys, secret keys, verification codes, recovery codes, or complete presigned URLs in support requests.

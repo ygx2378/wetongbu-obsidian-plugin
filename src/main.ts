@@ -1,7 +1,6 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { S3Client } from "@aws-sdk/client-s3";
-import JSZip from "jszip";
+import { unzipSync } from "fflate";
 import {
   Notice,
   Plugin,
@@ -12,11 +11,6 @@ import {
   requestUrl,
   type App,
 } from "obsidian";
-import {
-  deleteReadyTask,
-  downloadReadyTask,
-  listReadyManifestKeys,
-} from "./shared/inbox.mjs";
 import { buildVaultPaths } from "./shared/vault-layout.mjs";
 import {
   isSafePackagePath,
@@ -170,11 +164,6 @@ export default class WeTongbuPlugin extends Plugin {
       id: "sync-now",
       name: "手动同步",
       callback: () => void this.syncNow(),
-    });
-    this.addCommand({
-      id: "migrate-legacy-r2-inbox",
-      name: "迁移旧版 R2 待同步任务",
-      callback: () => void this.migrateLegacyR2Inbox(),
     });
     this.app.workspace.onLayoutReady(() => {
       void this.ensureWorkspace();
@@ -496,27 +485,6 @@ export default class WeTongbuPlugin extends Plugin {
     this.storageStatus = `连接正常 · ${providerLabel(response.json.storage.provider ?? this.settings.storageProvider)} · ${response.json.storage.bucket}`;
   }
 
-  private createClient() {
-    const accessKeyId = this.app.secretStorage.getSecret(
-      this.settings.accessKeySecretId,
-    );
-    const secretAccessKey = this.app.secretStorage.getSecret(
-      this.settings.secretKeySecretId,
-    );
-    if (!this.settings.endpoint || !this.settings.bucket) {
-      throw new Error("请先填写 R2 Endpoint 和 Bucket");
-    }
-    if (!accessKeyId || !secretAccessKey) {
-      throw new Error("请先输入 Access Key 和 Secret Key，然后点击“测试并保存”");
-    }
-    return new S3Client({
-      endpoint: this.settings.endpoint,
-      region: this.settings.region,
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    });
-  }
-
   async syncNow(quiet = false) {
     if (this.syncing) {
       if (!quiet) new Notice("微同步正在运行");
@@ -532,63 +500,6 @@ export default class WeTongbuPlugin extends Plugin {
       if (!quiet) new Notice(`微同步失败：${message}`, 10000);
       console.error("WeTongbu sync failed");
     } finally {
-      this.syncing = false;
-    }
-  }
-
-  private async migrateLegacyR2Inbox() {
-    if (this.syncing) {
-      new Notice("微同步正在运行");
-      return;
-    }
-    if (this.settings.storageProvider !== "cloudflare_r2") {
-      new Notice("旧版任务迁移只适用于 Cloudflare R2");
-      return;
-    }
-    this.syncing = true;
-    let client: S3Client | null = null;
-    try {
-      client = this.createClient();
-      const manifestKeys = await listReadyManifestKeys(
-        client,
-        this.settings.bucket,
-        this.settings.prefix,
-      );
-      if (manifestKeys.length === 0) {
-        new Notice("微同步：没有需要迁移的旧版任务");
-        return;
-      }
-
-      let synced = 0;
-      for (const manifestKey of manifestKeys) {
-        const task = await downloadReadyTask(
-          client,
-          this.settings.bucket,
-          manifestKey,
-        );
-        const taskSeen = this.settings.processedTaskIds.includes(task.manifest.taskId);
-        const urlSeen = task.manifest.sourceUrl
-          && this.settings.processedSourceUrls.includes(task.manifest.sourceUrl);
-        if (!taskSeen && !urlSeen) {
-          await this.writeTask(task);
-          this.settings.processedTaskIds.push(task.manifest.taskId);
-          this.settings.processedTaskIds = this.settings.processedTaskIds.slice(-1000);
-          if (task.manifest.sourceUrl) {
-            this.settings.processedSourceUrls.push(task.manifest.sourceUrl);
-            this.settings.processedSourceUrls = this.settings.processedSourceUrls.slice(-1000);
-          }
-          await this.saveSettings();
-        }
-        await deleteReadyTask(client, this.settings.bucket, task);
-        synced += 1;
-      }
-      new Notice(`微同步：已迁移 ${synced} 篇旧版任务`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      new Notice(`旧版任务迁移失败：${message}`, 10000);
-      console.error("WeTongbu legacy migration failed");
-    } finally {
-      client?.destroy();
       this.syncing = false;
     }
   }
@@ -660,21 +571,21 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   private async unpackWebclipTask(zipBytes: Buffer) {
-    const zip = await JSZip.loadAsync(zipBytes);
-    const entries = Object.values(zip.files).filter((entry) => !entry.dir);
-    if (entries.some((entry) => !isSafePackagePath(entry.name))) throw new Error("ZIP 包含不安全路径");
-    const manifestEntry = zip.file("manifest.json");
+    const entries = unzipSync(zipBytes);
+    const entryNames = Object.keys(entries).filter((entry) => !entry.endsWith("/"));
+    if (entryNames.some((entry) => !isSafePackagePath(entry))) throw new Error("ZIP 包含不安全路径");
+    const manifestEntry = entries["manifest.json"];
     if (!manifestEntry) throw new Error("manifest.json 缺失");
-    const manifest = validateWebclipManifest(JSON.parse(await manifestEntry.async("string")));
+    const manifest = validateWebclipManifest(JSON.parse(new TextDecoder().decode(manifestEntry)));
     const files = new Map<string, Buffer>();
     for (const record of manifest.files) {
-      const entry = zip.file(record.path);
+      const entry = entries[record.path];
       if (!entry) throw new Error(`任务文件缺失：${record.path}`);
-      files.set(record.path, Buffer.from(await entry.async("uint8array")));
+      files.set(record.path, Buffer.from(entry));
     }
     verifyWebclipPackageFiles(manifest, files);
     const allowed = new Set(["manifest.json", ...manifest.files.map((file: any) => file.path)]);
-    if (entries.some((entry) => !allowed.has(entry.name))) throw new Error("ZIP 包含未声明文件");
+    if (entryNames.some((entry) => !allowed.has(entry))) throw new Error("ZIP 包含未声明文件");
     return {
       manifest: {
         taskId: manifest.task_id,
@@ -1001,14 +912,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
             ? `请保存到安全位置，用于更换设备或重装插件：${this.plugin.recoveryToken}`
             : "生成恢复码并保存到安全位置；重新生成后旧恢复码立即失效",
         );
-      if (this.plugin.recoveryToken) {
-        recoverySetting.addButton((button) =>
-          button.setButtonText("复制恢复码").onClick(async () => {
-            await navigator.clipboard.writeText(this.plugin.recoveryToken);
-            new Notice("恢复码已复制");
-          }),
-        );
-      }
       recoverySetting.addButton((button) =>
         button
           .setButtonText(this.plugin.recoveryToken ? "重新生成" : "生成恢复码")

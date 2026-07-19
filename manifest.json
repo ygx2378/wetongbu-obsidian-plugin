@@ -1,9 +1,9 @@
 {
   "id": "wetongbu",
   "name": "WeTongbu",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "minAppVersion": "1.11.4",
-  "description": "将微信文章、飞书文档和文章型网页同步到 Obsidian。",
+  "description": "Sync selected WeChat articles, Feishu documents, and web pages to local Markdown notes.",
   "author": "WeTongbu",
   "authorUrl": "https://wetongbu.com",
   "isDesktopOnly": true
