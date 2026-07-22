@@ -190,6 +190,8 @@ export default class WeTongbuPlugin extends Plugin {
   private syncing = false;
   pairingCode = "";
   pairingExpiresAt = "";
+  vaultPairingCode = "";
+  vaultPairingExpiresAt = "";
   recoveryToken = "";
   storageStatus = "";
   accountStatus = "未登录";
@@ -369,6 +371,56 @@ export default class WeTongbuPlugin extends Plugin {
     this.pairingExpiresAt = response.json.expires_at;
   }
 
+  private async adoptVaultTarget(userId: string, targetId: string, targetName: string, recoveryToken?: string) {
+    const changed = this.settings.syncTargetId !== targetId;
+    this.settings.userId = userId;
+    this.settings.syncTargetId = targetId;
+    this.settings.syncTargetName = targetName || this.settings.syncTargetName;
+    if (recoveryToken) this.recoveryToken = recoveryToken;
+    if (changed) {
+      this.settings.vaultDeviceTokenSecretId = "";
+      this.settings.vaultDeviceId = "";
+      this.vaultDeviceTokenCache = "";
+      await createPrevSyncStore(this.app).clear();
+    }
+    await this.saveSettings();
+  }
+
+  async createVaultDevicePairingCode() {
+    const token = await this.ensureCurrentVaultRegistered();
+    const response = await requestUrl({
+      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/vault-bindings/codes`,
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      contentType: "application/json",
+      body: "{}",
+      throw: false,
+    });
+    if (response.status !== 201) throw new Error(response.json?.error ?? "多端加入码生成失败");
+    this.vaultPairingCode = response.json.code;
+    this.vaultPairingExpiresAt = response.json.expires_at;
+  }
+
+  async joinVaultByPairingCode(pairingCode: string) {
+    const token = await this.ensureCurrentVaultRegistered();
+    const response = await requestUrl({
+      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/vault-bindings/confirm`,
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      contentType: "application/json",
+      body: JSON.stringify({ code: pairingCode.trim() }),
+      throw: false,
+    });
+    if (response.status !== 200) throw new Error(response.json?.error ?? "加入 Vault 失败");
+    await this.adoptVaultTarget(
+      response.json.user_id,
+      response.json.target_id,
+      response.json.target_name,
+      response.json.recovery_token,
+    );
+    await this.refreshAccountStatus();
+  }
+
   async startAccountLogin() {
     const token = await this.ensureCurrentVaultRegistered();
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -416,7 +468,14 @@ export default class WeTongbuPlugin extends Plugin {
       if (polled.status !== 200) throw new Error(polled.json?.error ?? "登录授权已失效");
       if (polled.json.status === "pending") return;
       if (!polled.json.plugin_token) throw new Error("登录授权响应无效");
+      const previousTargetId = this.settings.syncTargetId;
       this.app.secretStorage.setSecret(this.pluginTokenSecretId(), polled.json.plugin_token);
+      await this.adoptVaultTarget(
+        polled.json.user_id,
+        polled.json.target_id,
+        polled.json.target_name ?? this.settings.syncTargetName,
+      );
+      if (previousTargetId !== polled.json.target_id) this.settings.vaultSyncEnabled = false;
       this.settings.pendingDeviceCode = "";
       this.settings.pendingDeviceVerificationUri = "";
       await this.saveSettings();
@@ -1020,6 +1079,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
   private accessKeyInput: string | null = null;
   private secretKeyInput: string | null = null;
   private recoveryTokenInput = "";
+  private vaultPairingCodeInput = "";
 
   constructor(app: App, private plugin: WeTongbuPlugin) {
     super(app, plugin);
@@ -1085,6 +1145,40 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("打开账号中心").onClick(() => this.plugin.openAccountCenter()),
       );
+
+    new Setting(containerEl)
+      .setName("电脑和手机加入同一个 Vault")
+      .setDesc(this.plugin.vaultPairingCode
+        ? `加入码 ${this.plugin.vaultPairingCode}，有效至 ${new Date(this.plugin.vaultPairingExpiresAt).toLocaleTimeString()}`
+        : "在已有设备生成一次性加入码；另一台设备输入后会加入同一个 Vault，不会断开当前设备。")
+      .addButton((button) => button.setButtonText("生成多端加入码").onClick(async () => {
+        try {
+          button.setDisabled(true);
+          await this.plugin.createVaultDevicePairingCode();
+          this.display();
+        } catch (error) {
+          new Notice(`加入码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+        } finally {
+          button.setDisabled(false);
+        }
+      }))
+      .addText((text) => text
+        .setPlaceholder("在新设备输入加入码")
+        .setValue(this.vaultPairingCodeInput)
+        .onChange((value) => { this.vaultPairingCodeInput = value; }))
+      .addButton((button) => button.setButtonText("加入已有 Vault").onClick(async () => {
+        try {
+          button.setDisabled(true);
+          await this.plugin.joinVaultByPairingCode(this.vaultPairingCodeInput);
+          this.vaultPairingCodeInput = "";
+          this.display();
+          new Notice("已加入同一个 Vault；现有设备保持连接");
+        } catch (error) {
+          new Notice(`加入失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+        } finally {
+          button.setDisabled(false);
+        }
+      }));
 
     new Setting(containerEl)
       .setName("插件版本")
