@@ -588,9 +588,25 @@ export default class WeTongbuPlugin extends Plugin {
       targetId: this.settings.syncTargetId,
       pluginToken,
     });
-    const result = await remote.enable(enabled, this.settings.vaultSyncScope);
+    const current = await remote.getStatus();
+    const remoteEncryption = current.encryption;
+    if (enabled && remoteEncryption?.enabled && remoteEncryption.salt_hex) {
+      this.settings.vaultEncryptionEnabled = true;
+      this.settings.vaultEncryptionSaltHex = remoteEncryption.salt_hex;
+    }
+    const result = await remote.enable(
+      enabled,
+      this.settings.vaultSyncScope,
+      this.settings.vaultEncryptionEnabled
+        ? { enabled: true, saltHex: this.settings.vaultEncryptionSaltHex, version: 1 }
+        : undefined,
+    );
     this.settings.vaultSyncEnabled = result.enabled;
     this.settings.vaultSyncScope = result.scope === "root_folder" ? "root_folder" : "whole_vault";
+    if (result.encryption?.enabled && result.encryption.saltHex) {
+      this.settings.vaultEncryptionEnabled = true;
+      this.settings.vaultEncryptionSaltHex = result.encryption.saltHex;
+    }
     if (!result.enabled) {
       this.settings.vaultDeviceTokenSecretId = "";
       this.settings.vaultDeviceId = "";
@@ -609,6 +625,21 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.vaultEncryptionSaltHex = derived.saltHex;
     this.vaultEncryptionInput = "";
     await this.saveSettings();
+    const token = this.settings.syncTargetId
+      ? this.app.secretStorage.getSecret(this.pluginTokenSecretId())
+      : null;
+    if (token && this.settings.syncTargetId) {
+      const remote = new VaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId: this.settings.syncTargetId,
+        pluginToken: token,
+      });
+      await remote.enable(this.settings.vaultSyncEnabled, this.settings.vaultSyncScope, {
+        enabled: true,
+        saltHex: derived.saltHex,
+        version: 1,
+      });
+    }
   }
 
   async disableVaultEncryption() {
@@ -688,18 +719,30 @@ export default class WeTongbuPlugin extends Plugin {
         region: this.settings.region,
         bucket: this.settings.bucket,
         prefix: this.settings.prefix,
+        remote_vault_name: this.app.vault.getName(),
         access_key_id: accessKeyId,
         secret_access_key: secretAccessKey,
       }),
       throw: false,
     });
     if (response.status !== 200) throw new Error(response.json?.error ?? "对象存储测试失败");
+    const resolved = response.json?.storage;
+    if (resolved?.target_id && resolved.target_id !== this.settings.syncTargetId) {
+      await this.adoptVaultTarget(
+        resolved.user_id ?? this.settings.userId,
+        resolved.target_id,
+        resolved.target_name ?? this.settings.syncTargetName,
+        resolved.recovery_token ?? undefined,
+      );
+    }
     this.settings.accessKeySecretId = accessKeySecretId;
     this.settings.secretKeySecretId = secretKeySecretId;
     this.app.secretStorage.setSecret(accessKeySecretId, accessKeyId);
     this.app.secretStorage.setSecret(secretKeySecretId, secretAccessKey);
     await this.saveSettings();
-    this.storageStatus = `连接正常 · ${providerLabel(response.json.storage.provider ?? this.settings.storageProvider)} · ${response.json.storage.bucket}`;
+    this.storageStatus = resolved?.resolution === "adopted"
+      ? `已找到远程 Vault · ${resolved.target_name ?? this.settings.syncTargetName}`
+      : `连接正常 · ${providerLabel(resolved?.provider ?? this.settings.storageProvider)} · ${resolved?.bucket ?? this.settings.bucket}`;
   }
 
   /**
@@ -747,6 +790,12 @@ export default class WeTongbuPlugin extends Plugin {
         pluginToken,
         deviceToken,
       });
+      const status = await remote.getStatus();
+      if (status.encryption?.enabled && status.encryption.salt_hex) {
+        this.settings.vaultEncryptionEnabled = true;
+        this.settings.vaultEncryptionSaltHex = status.encryption.salt_hex;
+        await this.saveSettings();
+      }
 
       // Pro 走托管存储（预签名 URL）；Free 直连用户自有 bucket（SigV4）。
       let storage: VaultSyncStorage;
@@ -1147,38 +1196,8 @@ class WeTongbuSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("电脑和手机加入同一个 Vault")
-      .setDesc(this.plugin.vaultPairingCode
-        ? `加入码 ${this.plugin.vaultPairingCode}，有效至 ${new Date(this.plugin.vaultPairingExpiresAt).toLocaleTimeString()}`
-        : "在已有设备生成一次性加入码；另一台设备输入后会加入同一个 Vault，不会断开当前设备。")
-      .addButton((button) => button.setButtonText("生成多端加入码").onClick(async () => {
-        try {
-          button.setDisabled(true);
-          await this.plugin.createVaultDevicePairingCode();
-          this.display();
-        } catch (error) {
-          new Notice(`加入码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-        } finally {
-          button.setDisabled(false);
-        }
-      }))
-      .addText((text) => text
-        .setPlaceholder("在新设备输入加入码")
-        .setValue(this.vaultPairingCodeInput)
-        .onChange((value) => { this.vaultPairingCodeInput = value; }))
-      .addButton((button) => button.setButtonText("加入已有 Vault").onClick(async () => {
-        try {
-          button.setDisabled(true);
-          await this.plugin.joinVaultByPairingCode(this.vaultPairingCodeInput);
-          this.vaultPairingCodeInput = "";
-          this.display();
-          new Notice("已加入同一个 Vault；现有设备保持连接");
-        } catch (error) {
-          new Notice(`加入失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-        } finally {
-          button.setDisabled(false);
-        }
-      }));
+      .setName("电脑和手机自动同步")
+      .setDesc("Free 版在每台设备填写相同的对象存储配置，并使用相同的 Vault 名称；测试并保存时会自动找到已有远程 Vault，不需要加入码。Pro 版登录后自动使用账号中的 Vault。");
 
     new Setting(containerEl)
       .setName("插件版本")

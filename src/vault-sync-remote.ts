@@ -47,6 +47,11 @@ export interface VaultSyncStatus {
   used_bytes: number;
   can_write: boolean;
   can_read: boolean;
+  encryption?: {
+    enabled: boolean;
+    salt_hex: string | null;
+    version: number;
+  };
 }
 
 export interface VaultSyncClientOptions {
@@ -105,9 +110,13 @@ export class VaultSyncRemoteClient {
     return this.request(`/api/sync-targets/${this.targetId}/vault/status`, { method: "GET", token: "plugin" });
   }
 
-  async enable(enabled: boolean, scope: string): Promise<{ enabled: boolean; scope: string }> {
+  async enable(enabled: boolean, scope: string, encryption?: { enabled: boolean; saltHex: string; version: number }): Promise<{ enabled: boolean; scope: string; encryption?: { enabled: boolean; saltHex: string | null; version: number } }> {
     return this.request(`/api/sync-targets/${this.targetId}/vault/settings`, {
-      method: "PUT", token: "plugin", body: { enabled, scope },
+      method: "PUT", token: "plugin", body: {
+        enabled,
+        scope,
+        ...(encryption ? { encryption: { enabled: encryption.enabled, salt_hex: encryption.saltHex, version: encryption.version } } : {}),
+      },
     });
   }
 
