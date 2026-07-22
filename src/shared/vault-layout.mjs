@@ -1,5 +1,3 @@
-import path from "node:path";
-
 export function sanitizeFilename(value) {
   const sanitized = value
     .replace(/[\\/:*?"<>|\r\n]/g, "-")
@@ -34,7 +32,10 @@ export function buildVaultPaths({ rootFolder, title, capturedAt, taskId, assets 
   const noteFilename = `${sanitizeFilename(title)}_${year}-${month}-${day}_WTB.md`;
   const shortTaskId = taskId.replace(/-/g, "").slice(0, 8);
   const assetNames = assets.map((asset, index) => {
-    const extension = path.posix.extname(asset.relativePath).toLowerCase();
+    const slash = asset.relativePath.lastIndexOf("/");
+    const basename = slash >= 0 ? asset.relativePath.slice(slash + 1) : asset.relativePath;
+    const dot = basename.lastIndexOf(".");
+    const extension = dot > 0 ? basename.slice(dot).toLowerCase() : "";
     const sequence = String(index + 1).padStart(3, "0");
     return `WTB-${year}${month}${day}-${hour}${minute}${second}-${shortTaskId}-${sequence}${extension}`;
   });

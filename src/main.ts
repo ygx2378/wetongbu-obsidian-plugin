@@ -1,5 +1,3 @@
-import path from "node:path";
-import { createHash } from "node:crypto";
 import { unzipSync } from "fflate";
 import {
   Notice,
@@ -18,6 +16,12 @@ import {
   validateWebclipManifest,
   verifyWebclipPackageFiles,
 } from "./shared/feishu-package.mjs";
+import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
+import { VaultSyncRemoteClient } from "./vault-sync-remote";
+import { createPrevSyncStore } from "./vault-sync-local";
+import { createVaultSyncOrchestrator } from "./vault-sync";
+import { sha256Hex } from "./shared/hash";
+import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
 
 interface WeTongbuSettings {
   apiBaseUrl: string;
@@ -36,10 +40,25 @@ interface WeTongbuSettings {
   processedTaskIds: string[];
   processedSourceUrls: string[];
   imageDeliveryMode: ImageDeliveryMode;
+  vaultSyncEnabled: boolean;
+  vaultSyncScope: VaultSyncScope;
+  /** SecretStorage key for the vault device token (一次一密)。 */
+  vaultDeviceTokenSecretId: string;
+  /** Stable per-installation identity; never use a platform name as identity. */
+  vaultInstallationId: string;
+  /** Server-side device row ID for the current installation. */
+  vaultDeviceId: string;
+  vaultEncryptionEnabled: boolean;
+  vaultEncryptionSecretId: string;
+  vaultEncryptionSaltHex: string;
+  /** Pending account device authorization survives mobile backgrounding. */
+  pendingDeviceCode: string;
+  pendingDeviceVerificationUri: string;
 }
 
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
+type VaultSyncScope = "whole_vault" | "root_folder";
 
 function currentDeviceName() {
   if (Platform.isIosApp) return "iOS";
@@ -83,11 +102,13 @@ function formatBytes(value: number) {
 
 const HOSTED_MEDIA_LINK = /https:\/\/[a-z0-9.-]+(?:\/media)?\/m\/[0-9a-f]{8}-[0-9a-f-]{27}\/[a-f0-9]{64}/gi;
 
-function imageExtension(body: Buffer, contentType: string) {
-  if (body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
-  if (body.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "jpg";
-  if (body.subarray(0, 6).toString("ascii") === "GIF87a" || body.subarray(0, 6).toString("ascii") === "GIF89a") return "gif";
-  if (body.subarray(8, 12).toString("ascii") === "WEBP") return "webp";
+function imageExtension(body: Uint8Array, contentType: string) {
+  const startsWith = (values: number[], offset = 0) => values.every((value, index) => body[offset + index] === value);
+  const ascii = (offset: number, length: number) => new TextDecoder().decode(body.slice(offset, offset + length));
+  if (startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "png";
+  if (startsWith([0xff, 0xd8, 0xff])) return "jpg";
+  if (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a") return "gif";
+  if (ascii(8, 4) === "WEBP") return "webp";
   if (/image\/svg\+xml/i.test(contentType)) return "svg";
   if (/image\/avif/i.test(contentType)) return "avif";
   return "img";
@@ -110,6 +131,16 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   processedTaskIds: [],
   processedSourceUrls: [],
   imageDeliveryMode: "local",
+  vaultSyncEnabled: false,
+  vaultSyncScope: "whole_vault",
+  vaultDeviceTokenSecretId: "",
+  vaultInstallationId: "",
+  vaultDeviceId: "",
+  vaultEncryptionEnabled: false,
+  vaultEncryptionSecretId: "",
+  vaultEncryptionSaltHex: "",
+  pendingDeviceCode: "",
+  pendingDeviceVerificationUri: "",
 };
 
 async function ensureFolder(plugin: WeTongbuPlugin, folder: string) {
@@ -136,11 +167,22 @@ async function uniqueNotePath(
   }
 }
 
-function toArrayBuffer(buffer: Buffer): ArrayBuffer {
+function toArrayBuffer(buffer: Uint8Array): ArrayBuffer {
   return buffer.buffer.slice(
     buffer.byteOffset,
     buffer.byteOffset + buffer.byteLength,
   ) as ArrayBuffer;
+}
+
+/** POSIX vault paths without depending on Node's path module (mobile-safe). */
+function relativeVaultPath(from: string, to: string): string {
+  const fromParts = from.split("/").filter(Boolean);
+  const toParts = to.split("/").filter(Boolean);
+  let common = 0;
+  while (common < fromParts.length && common < toParts.length && fromParts[common] === toParts[common]) common += 1;
+  const up = fromParts.slice(common).map(() => "..");
+  const down = toParts.slice(common);
+  return [...up, ...down].join("/") || toParts.at(-1) || "";
 }
 
 export default class WeTongbuPlugin extends Plugin {
@@ -157,6 +199,10 @@ export default class WeTongbuPlugin extends Plugin {
   hostedMediaQuotaBytes = 0;
   hostedMediaUsedBytes = 0;
   lastSafeErrorCode = "";
+  private vaultSyncing = false;
+  private vaultDeviceTokenCache = "";
+  private accountPollTimer: number | null = null;
+  vaultEncryptionInput = "";
 
   async onload() {
     const saved = ((await this.loadData()) ?? {}) as PersistedSettings;
@@ -166,8 +212,16 @@ export default class WeTongbuPlugin extends Plugin {
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
+    if (!this.settings.vaultInstallationId) {
+      this.settings.vaultInstallationId = crypto.randomUUID();
+    }
     await this.saveSettings();
     void this.refreshAccountStatus();
+    void this.resumeAccountLogin().catch(() => undefined);
+    this.registerDomEvent(window, "focus", () => { void this.resumeAccountLogin().catch(() => undefined); });
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (!document.hidden) void this.resumeAccountLogin().catch(() => undefined);
+    });
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "微同步：手动同步", () => {
       void this.syncNow();
@@ -177,13 +231,27 @@ export default class WeTongbuPlugin extends Plugin {
       name: "手动同步",
       callback: () => void this.syncNow(),
     });
+    this.addCommand({
+      id: "vault-sync-now",
+      name: "Vault 多端同步：立即同步",
+      callback: () => void this.runVaultSync(false),
+    });
     this.app.workspace.onLayoutReady(() => {
       void this.ensureWorkspace();
       void this.syncNow(true);
       this.registerInterval(
         window.setInterval(() => void this.syncNow(true), 30_000),
       );
+      // Vault 多端同步：60s 轮询，只在用户开启且已配置时运行。
+      this.registerInterval(
+        window.setInterval(() => { void this.runVaultSync(true); }, 60_000),
+      );
     });
+  }
+
+  onunload() {
+    if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
+    this.accountPollTimer = null;
   }
 
   async saveSettings() {
@@ -316,23 +384,54 @@ export default class WeTongbuPlugin extends Plugin {
     const authorization = response.json;
     const verificationUrl = `${authorization.verification_uri}?user_code=${encodeURIComponent(authorization.user_code)}`;
     window.open(verificationUrl, "_blank");
+    this.settings.pendingDeviceCode = authorization.device_code;
+    this.settings.pendingDeviceVerificationUri = verificationUrl;
+    await this.saveSettings();
     this.accountStatus = "请在浏览器完成账号登录并确认授权";
-    for (;;) {
-      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    await this.resumeAccountLogin(base);
+  }
+
+  /** Poll once and keep polling in a lifecycle-safe interval. Mobile may
+   * suspend the plugin while the browser approval page is in the foreground,
+   * so the device code is persisted before polling starts. */
+  private async resumeAccountLogin(base = this.settings.apiBaseUrl.replace(/\/$/, "")) {
+    if (!this.settings.pendingDeviceCode) return;
+    if (this.accountPollTimer === null) {
+      this.accountPollTimer = window.setInterval(() => { void this.pollAccountLogin(base); }, 2000);
+    }
+    await this.pollAccountLogin(base);
+  }
+
+  private async pollAccountLogin(base: string) {
+    const deviceCode = this.settings.pendingDeviceCode;
+    if (!deviceCode) return;
+    try {
       const polled = await requestUrl({
         url: `${base}/api/device-authorizations/token`,
         method: "POST",
         contentType: "application/json",
-        body: JSON.stringify({ device_code: authorization.device_code }),
+        body: JSON.stringify({ device_code: deviceCode }),
         throw: false,
       });
       if (polled.status !== 200) throw new Error(polled.json?.error ?? "登录授权已失效");
-      if (polled.json.status === "pending") continue;
+      if (polled.json.status === "pending") return;
       if (!polled.json.plugin_token) throw new Error("登录授权响应无效");
       this.app.secretStorage.setSecret(this.pluginTokenSecretId(), polled.json.plugin_token);
+      this.settings.pendingDeviceCode = "";
+      this.settings.pendingDeviceVerificationUri = "";
+      await this.saveSettings();
+      if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
+      this.accountPollTimer = null;
       await this.refreshAccountStatus();
       if (!this.accountLoggedIn) throw new Error("账号状态读取失败，请重新登录");
-      return;
+    } catch (error) {
+      if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
+      this.accountPollTimer = null;
+      this.settings.pendingDeviceCode = "";
+      this.settings.pendingDeviceVerificationUri = "";
+      await this.saveSettings();
+      this.accountStatus = `登录失败：${error instanceof Error ? error.message : String(error)}`;
+      throw error;
     }
   }
 
@@ -411,6 +510,53 @@ export default class WeTongbuPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  async setVaultSyncEnabled(enabled: boolean) {
+    let pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (enabled && !this.settings.syncTargetId) {
+      await this.registerCurrentVault();
+      pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    }
+    if (!this.settings.syncTargetId || !pluginToken) {
+      if (!enabled) {
+        this.settings.vaultSyncEnabled = false;
+        await this.saveSettings();
+        return;
+      }
+      throw new Error("请先连接当前 Vault");
+    }
+    const remote = new VaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+    });
+    const result = await remote.enable(enabled, this.settings.vaultSyncScope);
+    this.settings.vaultSyncEnabled = result.enabled;
+    this.settings.vaultSyncScope = result.scope === "root_folder" ? "root_folder" : "whole_vault";
+    if (!result.enabled) {
+      this.settings.vaultDeviceTokenSecretId = "";
+      this.settings.vaultDeviceId = "";
+      this.vaultDeviceTokenCache = "";
+    }
+    await this.saveSettings();
+  }
+
+  async enableVaultEncryption(passphrase: string) {
+    if (passphrase.length < 8) throw new Error("Vault 加密密码至少需要 8 个字符");
+    const derived = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex || undefined);
+    const secretId = this.settings.vaultEncryptionSecretId || `wetongbu-vault-encryption-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    await this.app.secretStorage.setSecret(secretId, passphrase);
+    this.settings.vaultEncryptionEnabled = true;
+    this.settings.vaultEncryptionSecretId = secretId;
+    this.settings.vaultEncryptionSaltHex = derived.saltHex;
+    this.vaultEncryptionInput = "";
+    await this.saveSettings();
+  }
+
+  async disableVaultEncryption() {
+    this.settings.vaultEncryptionEnabled = false;
+    await this.saveSettings();
+  }
+
   openAccountCenter() {
     window.open("https://app.wetongbu.com/account/", "_blank");
   }
@@ -429,11 +575,11 @@ export default class WeTongbuPlugin extends Plugin {
       for (const link of links) {
         const downloaded = await requestUrl({ url: link, method: "GET", throw: false });
         if (downloaded.status !== 200) throw new Error(`图片下载失败（${downloaded.status}）`);
-        const body = Buffer.from(downloaded.arrayBuffer);
+        const body = new Uint8Array(downloaded.arrayBuffer);
         if (!body.length) throw new Error("图片下载为空");
         const headers = downloaded.headers ?? {};
         const contentType = String(headers["content-type"] ?? headers["Content-Type"] ?? "");
-        const filename = `${createHash("sha256").update(link).digest("hex").slice(0, 24)}.${imageExtension(body, contentType)}`;
+        const filename = `${(await sha256Hex(new TextEncoder().encode(link))).slice(0, 24)}.${imageExtension(body, contentType)}`;
         const targetPath = normalizePath(`${assetFolder}/${filename}`);
         await ensureFolder(this, assetFolder);
         if (!(await this.app.vault.adapter.exists(targetPath))) {
@@ -443,7 +589,7 @@ export default class WeTongbuPlugin extends Plugin {
             throw new Error("本地图片写入校验失败");
           }
         }
-        const localPath = path.posix.relative(note.parent?.path ?? "", targetPath);
+        const localPath = relativeVaultPath(note.parent?.path ?? "", targetPath);
         markdown = markdown.split(link).join(localPath);
         images += 1;
       }
@@ -497,6 +643,144 @@ export default class WeTongbuPlugin extends Plugin {
     this.storageStatus = `连接正常 · ${providerLabel(response.json.storage.provider ?? this.settings.storageProvider)} · ${response.json.storage.bucket}`;
   }
 
+  /**
+   * Vault 多端同步入口。由 60s 轮询或手动命令触发。
+   * quiet=true 时静默；false 时弹 Notice。
+   * 前置条件：vaultSyncEnabled + 已注册（syncTargetId）+ 有 plugin token + 有 user_s3 凭证。
+   */
+  async runVaultSync(quiet = false) {
+    if (!this.settings.vaultSyncEnabled) return;
+    if (!this.settings.syncTargetId) return;
+    if (this.vaultSyncing) {
+      if (!quiet) new Notice("Vault 同步正在运行");
+      return;
+    }
+    this.vaultSyncing = true;
+    try {
+      const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+      if (!pluginToken) throw new Error("Vault 连接已失效，请重新连接");
+
+      // 设备 token：首次启用时注册，之后从 SecretStorage 读。
+      let deviceToken = this.vaultDeviceTokenCache
+        || (this.settings.vaultDeviceTokenSecretId
+          ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId)
+          : "");
+      if (!deviceToken) {
+        const remote = new VaultSyncRemoteClient({
+          apiBaseUrl: this.settings.apiBaseUrl,
+          targetId: this.settings.syncTargetId,
+          pluginToken,
+        });
+        const reg = await remote.registerDevice(currentDeviceName(), this.settings.vaultInstallationId);
+        deviceToken = reg.token;
+        const secretId = `wetongbu-vault-device-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        await this.app.secretStorage.setSecret(secretId, deviceToken);
+        this.settings.vaultDeviceTokenSecretId = secretId;
+        this.settings.vaultDeviceId = reg.deviceId;
+        this.vaultDeviceTokenCache = deviceToken;
+        await this.saveSettings();
+      }
+
+      // 构造 remote 客户端（先建，Pro storage 需要它注入 prepare 回调）。
+      const remote = new VaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId: this.settings.syncTargetId,
+        pluginToken,
+        deviceToken,
+      });
+
+      // Pro 走托管存储（预签名 URL）；Free 直连用户自有 bucket（SigV4）。
+      let storage: VaultSyncStorage;
+      if (this.accountPlanType === "pro") {
+        storage = createProHostedStorage({
+          prepareUpload: async (hash, byteSize) => {
+            const r = await remote.prepareUpload(hash, byteSize);
+            return { uploadUrl: r.upload_url ?? null, deduped: !!r.deduped };
+          },
+          prepareDownload: async (hash) => {
+            const r = await remote.prepareDownload(hash);
+            return { downloadUrl: r.download_url ?? null };
+          },
+          verifyHash: !this.settings.vaultEncryptionEnabled,
+        });
+      } else {
+        const accessKey = await this.app.secretStorage.getSecret(
+          this.settings.accessKeySecretId || "wetongbu-storage-access-key-id",
+        );
+        const secretKey = await this.app.secretStorage.getSecret(
+          this.settings.secretKeySecretId || "wetongbu-storage-secret-access-key",
+        );
+        if (!accessKey || !secretKey) {
+          throw new Error("缺少对象存储凭证，请先在插件设置中验证并保存存储配置");
+        }
+        const s3cfg = deriveS3Config(
+          this.settings.storageProvider, this.settings.endpoint, this.settings.region,
+          this.settings.bucket, this.settings.prefix,
+        );
+        storage = createFreeS3Storage({
+          endpoint: s3cfg.endpoint,
+          region: s3cfg.region,
+          bucket: this.settings.bucket,
+          prefix: this.settings.prefix,
+          accessKeyId: accessKey,
+          secretAccessKey: secretKey,
+          forcePathStyle: s3cfg.forcePathStyle,
+          targetId: this.settings.syncTargetId,
+          verifyHash: !this.settings.vaultEncryptionEnabled,
+        });
+      }
+
+      if (this.settings.vaultEncryptionEnabled) {
+        const passphrase = this.settings.vaultEncryptionSecretId
+          ? await this.app.secretStorage.getSecret(this.settings.vaultEncryptionSecretId)
+          : "";
+        if (!passphrase) throw new Error("缺少 Vault 加密密码，请在当前设备输入并启用端到端加密");
+        const vaultCrypto = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex);
+        storage = createEncryptedVaultStorage(storage, vaultCrypto);
+      }
+
+      const store = createPrevSyncStore(this.app);
+      const orchestrator = createVaultSyncOrchestrator({
+        app: this.app,
+        storage,
+        remote,
+        store,
+        deviceId: this.settings.vaultDeviceId || this.settings.vaultInstallationId,
+        rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
+        notify: quiet ? undefined : (msg) => new Notice(msg, 10000),
+      });
+      const result = await orchestrator.runOnce();
+      if (!quiet) {
+        if (result.aborted) {
+          new Notice("Vault 同步已中止，请检查后重试", 10000);
+        } else {
+          const total = result.uploaded + result.downloaded + result.deletedLocal + result.deletedRemote;
+          if (total === 0 && result.conflicts === 0) {
+            new Notice("Vault 同步完成：已是最新");
+          } else {
+            const parts: string[] = [];
+            if (result.uploaded) parts.push(`上传 ${result.uploaded}`);
+            if (result.downloaded) parts.push(`下载 ${result.downloaded}`);
+            if (result.deletedLocal) parts.push(`本地删除 ${result.deletedLocal}`);
+            if (result.deletedRemote) parts.push(`远端删除 ${result.deletedRemote}`);
+            if (result.conflicts) parts.push(`冲突 ${result.conflicts}`);
+            new Notice(`Vault 同步完成：${parts.join(" · ")}`, 8000);
+            if (result.conflictPaths && result.conflictPaths.length) {
+              new Notice(`已生成冲突副本：${result.conflictPaths.slice(0, 3).join(", ")}${result.conflictPaths.length > 3 ? " 等" : ""}`, 10000);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastSafeErrorCode = "vault_sync_failed";
+      if (!quiet) new Notice(`Vault 同步失败：${message}`, 10000);
+      console.error("WeTongbu vault sync failed", error);
+    } finally {
+      this.vaultSyncing = false;
+    }
+  }
+
   async syncNow(quiet = false) {
     if (this.syncing) {
       if (!quiet) new Notice("微同步正在运行");
@@ -547,8 +831,8 @@ export default class WeTongbuPlugin extends Plugin {
       }
       const downloaded = await requestUrl({ url: item.download_url, method: "GET", throw: false });
       if (downloaded.status !== 200) throw new Error(`任务下载失败（${downloaded.status}）`);
-      const zipBytes = Buffer.from(downloaded.arrayBuffer);
-      const packageHash = createHash("sha256").update(zipBytes).digest("hex");
+      const zipBytes = new Uint8Array(downloaded.arrayBuffer);
+      const packageHash = await sha256Hex(zipBytes);
       if (packageHash !== item.content_hash) throw new Error("ZIP 校验失败：任务包哈希不一致");
       if (zipBytes.length !== item.file_size) throw new Error("ZIP 校验失败：任务包大小不一致");
       const task = await this.unpackWebclipTask(zipBytes);
@@ -593,20 +877,20 @@ export default class WeTongbuPlugin extends Plugin {
     return links as Record<string, string>;
   }
 
-  private async unpackWebclipTask(zipBytes: Buffer) {
+  private async unpackWebclipTask(zipBytes: Uint8Array) {
     const entries = unzipSync(zipBytes);
     const entryNames = Object.keys(entries).filter((entry) => !entry.endsWith("/"));
     if (entryNames.some((entry) => !isSafePackagePath(entry))) throw new Error("ZIP 包含不安全路径");
     const manifestEntry = entries["manifest.json"];
     if (!manifestEntry) throw new Error("manifest.json 缺失");
     const manifest = validateWebclipManifest(JSON.parse(new TextDecoder().decode(manifestEntry)));
-    const files = new Map<string, Buffer>();
+    const files = new Map<string, Uint8Array>();
     for (const record of manifest.files) {
       const entry = entries[record.path];
       if (!entry) throw new Error(`任务文件缺失：${record.path}`);
-      files.set(record.path, Buffer.from(entry));
+      files.set(record.path, entry);
     }
-    verifyWebclipPackageFiles(manifest, files);
+    await verifyWebclipPackageFiles(manifest, files);
     const allowed = new Set(["manifest.json", ...manifest.files.map((file: any) => file.path)]);
     if (entryNames.some((entry) => !allowed.has(entry))) throw new Error("ZIP 包含未声明文件");
     return {
@@ -616,7 +900,7 @@ export default class WeTongbuPlugin extends Plugin {
         sourceUrl: manifest.source_url,
         capturedAt: manifest.created_at,
       },
-      markdown: files.get(manifest.entry_file)!.toString("utf8"),
+        markdown: new TextDecoder().decode(files.get(manifest.entry_file)!),
       assets: manifest.files
         .filter((file: any) => file.path.startsWith("assets/"))
         .map((file: any) => ({
@@ -667,7 +951,7 @@ export default class WeTongbuPlugin extends Plugin {
         return { asset, filename, targetPath: "", writeLocal: false };
       }
       const targetPath = normalizePath(`${taskAttachmentFolder}/${filename}`);
-      const relativePath = path.posix.relative(noteFolder, targetPath);
+      const relativePath = relativeVaultPath(noteFolder, targetPath);
       markdown = markdown.split(`<${asset.relativePath}>`).join(relativePath);
       markdown = markdown.split(asset.relativePath).join(relativePath);
       return { asset, filename, targetPath, writeLocal: true };
@@ -788,7 +1072,9 @@ class WeTongbuSettingTab extends PluginSettingTab {
               button.setDisabled(true);
               await this.plugin.startAccountLogin();
               this.display();
-              new Notice("登录成功，可开始使用 Pro 试用");
+              new Notice(this.plugin.accountLoggedIn
+                ? "登录成功，可开始使用 Pro 试用"
+                : "已打开授权页面，完成授权后插件会自动登录");
             } catch (error) {
               new Notice(`登录失败：${error instanceof Error ? error.message : String(error)}`, 10000);
             } finally {
@@ -969,6 +1255,85 @@ class WeTongbuSettingTab extends PluginSettingTab {
       );
 
     this.textSetting("微同步目录", "文章、附件和 AI 说明文件的根目录", "rootFolder");
+
+    new Setting(containerEl)
+      .setName("Vault 多端同步")
+      .setDesc("在多台设备间双向同步笔记内容（类 Remotely Save）。免费版直接使用你已配置的对象存储，内容不经过微同步服务器。同文件在两台设备都修改时生成冲突副本，不会静默覆盖。")
+      .addToggle((toggle) =>
+      toggle
+          .setValue(this.plugin.settings.vaultSyncEnabled)
+          .onChange(async (value) => {
+            try {
+              toggle.setDisabled(true);
+              await this.plugin.setVaultSyncEnabled(value);
+              if (value) {
+                new Notice("Vault 多端同步已开启：将在后台检查并同步", 6000);
+                void this.plugin.runVaultSync(false);
+              } else {
+                new Notice("Vault 多端同步已暂停");
+              }
+              this.display();
+            } catch (error) {
+              new Notice(`Vault 同步设置失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              toggle.setValue(this.plugin.settings.vaultSyncEnabled);
+            } finally {
+              toggle.setDisabled(false);
+            }
+          }),
+      );
+
+    if (this.plugin.settings.vaultSyncEnabled) {
+      new Setting(containerEl)
+        .setName("同步范围")
+        .setDesc("选择要同步的范围。整个 Vault 会包含所有笔记；仅微同步目录只同步剪藏产生的内容。")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("whole_vault", "整个 Vault（推荐）")
+            .addOption("root_folder", `仅 ${this.plugin.settings.rootFolder} 目录`)
+            .setValue(this.plugin.settings.vaultSyncScope)
+            .onChange(async (value) => {
+              this.plugin.settings.vaultSyncScope = value as VaultSyncScope;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("立即同步")
+        .setDesc("手动触发一次 Vault 多端同步")
+        .addButton((button) =>
+          button.setButtonText("立即同步").onClick(() => this.plugin.runVaultSync(false)),
+        );
+
+      new Setting(containerEl)
+        .setName("端到端加密（可选）")
+        .setDesc(this.plugin.settings.vaultEncryptionEnabled
+          ? "已启用：笔记内容在本地加密后才上传。其他设备需要输入相同密码；忘记密码无法恢复云端内容。"
+          : "启用后，微同步服务器和托管对象存储都不会看到笔记明文；请在每台设备输入相同密码。")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text.setPlaceholder("至少 8 个字符").setValue(this.plugin.vaultEncryptionInput)
+            .onChange((value) => { this.plugin.vaultEncryptionInput = value; });
+        })
+        .addButton((button) => button
+          .setButtonText(this.plugin.settings.vaultEncryptionEnabled ? "更新密码" : "启用加密")
+          .onClick(async () => {
+            try {
+              await this.plugin.enableVaultEncryption(this.plugin.vaultEncryptionInput);
+              this.display();
+              new Notice("端到端加密已启用；请在其他设备输入相同密码");
+            } catch (error) {
+              new Notice(`加密设置失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            }
+          }))
+        .addButton((button) => button
+          .setButtonText("停用")
+          .setDisabled(!this.plugin.settings.vaultEncryptionEnabled)
+          .onClick(async () => {
+            await this.plugin.disableVaultEncryption();
+            this.display();
+            new Notice("端到端加密已停用；已有云端文件仍保持加密，请先转存或继续使用原密码");
+          }));
+    }
 
     new Setting(containerEl)
       .setName("自动同步")

@@ -1,6 +1,3 @@
-import crypto from "node:crypto";
-import path from "node:path";
-
 export const WEBCLIP_PACKAGE_VERSION = 1;
 export const FEISHU_PACKAGE_VERSION = WEBCLIP_PACKAGE_VERSION;
 
@@ -18,13 +15,20 @@ export function isSafePackagePath(value) {
   if (typeof value !== "string" || value === "" || value.includes("\\")) {
     return false;
   }
-  if (value.startsWith("/") || path.posix.isAbsolute(value)) return false;
-  const normalized = path.posix.normalize(value);
+  if (value.startsWith("/")) return false;
+  const parts = value.split("/");
+  const normalizedParts = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!normalizedParts.length) return false;
+      normalizedParts.pop();
+    } else {
+      normalizedParts.push(part);
+    }
+  }
+  const normalized = normalizedParts.join("/");
   return normalized === value && !normalized.startsWith("../") && normalized !== "..";
-}
-
-export function sha256(body) {
-  return crypto.createHash("sha256").update(body).digest("hex");
 }
 
 export function validateWebclipManifest(manifest) {
@@ -104,7 +108,7 @@ export function validateWebclipManifest(manifest) {
   return manifest;
 }
 
-export function verifyFeishuPackageFiles(manifest, files) {
+export async function verifyFeishuPackageFiles(manifest, files) {
   validateWebclipManifest(manifest);
   const expectedPaths = new Set(manifest.files.map((file) => file.path));
   const actualPaths = new Set(files.keys());
@@ -114,7 +118,9 @@ export function verifyFeishuPackageFiles(manifest, files) {
     const body = files.get(expected.path);
     if (!body) throw new Error(`package file is missing: ${expected.path}`);
     if (body.length !== expected.bytes) throw new Error(`file size mismatch: ${expected.path}`);
-    if (sha256(body) !== expected.sha256) throw new Error(`file SHA-256 mismatch: ${expected.path}`);
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", body);
+    const actual = [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+    if (actual !== expected.sha256) throw new Error(`file SHA-256 mismatch: ${expected.path}`);
   }
 }
 

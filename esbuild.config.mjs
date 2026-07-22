@@ -8,7 +8,10 @@ await esbuild.build({
   bundle: true,
   external: ["obsidian", "electron"],
   format: "cjs",
-  platform: "node",
+  // The Obsidian plugin runs on desktop and iOS/Android. Keep the bundle
+  // browser-compatible; the only external runtime modules are Obsidian and
+  // Electron APIs supplied by the host.
+  platform: "browser",
   target: "es2022",
   outfile: "main.js",
   sourcemap: production ? false : "inline",

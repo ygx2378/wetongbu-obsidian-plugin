@@ -11,7 +11,7 @@ WeTongbu saves user-selected WeChat articles, Feishu documents, and article-styl
 - Pro users authorize the desktop plugin in a browser and can choose local image downloads or stable hosted image links.
 - Free uses the user's own Cloudflare R2, Amazon S3, Alibaba Cloud OSS, or Tencent Cloud COS. Pro uses WeTongbu-hosted temporary object storage.
 - Temporary task objects are deleted by the service after completion, failure, or expiry. Markdown and attachments remain in the Vault.
-- Desktop-only: the plugin needs desktop binary-file support to write attachments into the Vault.
+- Mobile-compatible: the plugin runs on Obsidian desktop, iOS, and Android. The Vault sync MVP supports Markdown and attachments across devices; install the same plugin version on each device and follow the sync setup guide.
 
 ## Getting started
 
