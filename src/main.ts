@@ -20,6 +20,7 @@ import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorag
 import { VaultSyncRemoteClient } from "./vault-sync-remote";
 import { createPrevSyncStore } from "./vault-sync-local";
 import { createVaultSyncOrchestrator } from "./vault-sync";
+import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
 import { sha256Hex } from "./shared/hash";
 import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
 import {
@@ -223,6 +224,7 @@ export default class WeTongbuPlugin extends Plugin {
   private vaultSyncing = false;
   private vaultDeviceTokenCache = "";
   private accountPollTimer: number | null = null;
+  private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
   vaultEncryptionInput = "";
 
   async onload() {
@@ -240,11 +242,21 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
     await this.saveSettings();
+    this.vaultSyncRetry = createVaultSyncRetryScheduler({
+      run: () => this.runVaultSync(true),
+    });
     void this.refreshAccountStatus();
     void this.resumeAccountLogin().catch(() => undefined);
-    this.registerDomEvent(window, "focus", () => { void this.resumeAccountLogin().catch(() => undefined); });
+    this.registerDomEvent(window, "focus", () => {
+      void this.resumeAccountLogin().catch(() => undefined);
+      this.vaultSyncRetry?.wake();
+    });
+    this.registerDomEvent(window, "online", () => { this.vaultSyncRetry?.wake(); });
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) void this.resumeAccountLogin().catch(() => undefined);
+      if (!document.hidden) {
+        void this.resumeAccountLogin().catch(() => undefined);
+        this.vaultSyncRetry?.wake();
+      }
     });
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "微同步：立即同步", () => {
@@ -276,6 +288,8 @@ export default class WeTongbuPlugin extends Plugin {
   onunload() {
     if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
     this.accountPollTimer = null;
+    this.vaultSyncRetry?.clear();
+    this.vaultSyncRetry = null;
   }
 
   async saveSettings() {
@@ -635,6 +649,7 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.vaultEncryptionSaltHex = result.encryption.saltHex;
     }
     if (!result.enabled) {
+      this.vaultSyncRetry?.clear();
       this.settings.vaultDeviceTokenSecretId = "";
       this.settings.vaultDeviceId = "";
       this.vaultDeviceTokenCache = "";
@@ -895,6 +910,13 @@ export default class WeTongbuPlugin extends Plugin {
         notify: quiet ? undefined : (msg) => new Notice(msg, 10000),
       });
       const result = await orchestrator.runOnce();
+      if (result.aborted) {
+        this.vaultSyncRetry?.clear();
+      } else if (result.failed > 0 && result.failureMessages?.some(isRetryableVaultSyncError)) {
+        this.vaultSyncRetry?.scheduleRetry();
+      } else if (result.failed === 0) {
+        this.vaultSyncRetry?.clear();
+      }
       if (!quiet) {
         if (result.aborted) {
           new Notice("Vault 同步已中止，请检查后重试", 10000);
@@ -922,6 +944,7 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.lastSafeErrorCode = "vault_sync_failed";
+      if (isRetryableVaultSyncError(error)) this.vaultSyncRetry?.scheduleRetry();
       if (!quiet) new Notice(`Vault 同步失败：${message}`, 10000);
       console.error("WeTongbu vault sync failed", error);
     } finally {
