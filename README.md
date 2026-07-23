@@ -8,7 +8,7 @@ WeTongbu saves user-selected WeChat articles, Feishu documents, and article-styl
 
 - Polls WeTongbu tasks and writes Markdown, images, and attachments to the current Vault.
 - Free users can use a six-digit binding code to connect the Chrome extension without signing in.
-- Pro users authorize the desktop plugin in a browser and can choose local image downloads or stable hosted image links.
+- Pro users authorize the plugin in a browser and can choose local image downloads or stable hosted image links.
 - Free uses the user's own Cloudflare R2, Amazon S3, Alibaba Cloud OSS, or Tencent Cloud COS. Pro uses WeTongbu-hosted temporary object storage.
 - Temporary task objects are deleted by the service after completion, failure, or expiry. Markdown and attachments remain in the Vault.
 - Mobile-compatible: the plugin runs on Obsidian desktop, iOS, and Android. The Vault sync MVP supports Markdown and attachments across devices; install the same plugin version on each device and follow the sync setup guide.
@@ -19,7 +19,7 @@ WeTongbu saves user-selected WeChat articles, Feishu documents, and article-styl
 2. Choose Free storage or sign in for Pro.
 3. Free users follow the storage guide, create a private bucket with least-privilege credentials, and select **Test and save**.
 4. Free users create a six-digit binding code and enter it in the Chrome extension. This path does not require an account login.
-5. Pro users select **Sign in to Pro**, then complete the browser authorization for this desktop plugin.
+5. Pro users select **Sign in to Pro**, then complete the browser authorization for this Obsidian installation.
 6. In Chrome, explicitly select a supported document or article and choose **Sync to Obsidian**. Keep Obsidian open until the task completes.
 
 Guides, support, and privacy policy:
@@ -34,7 +34,7 @@ The plugin only processes content that the user explicitly chooses to sync, plus
 
 The plugin calls `api.wetongbu.com` to create or recover a Vault, validate Free object storage, obtain tasks, complete browser-based account authorization, and request deletion of temporary task objects. Task packages and optional Pro hosted images may be transferred through service-issued temporary object-storage or media URLs. The legacy WeChat callback domain is not called by the plugin.
 
-The plugin writes sync output only inside the current Vault. If a task write fails, it moves newly-created files to the Obsidian trash. The optional hosted-image migration reads Markdown notes only under the plugin's configured root folder. Pro requires a WeTongbu account and paid subscription for full hosted features. See the privacy policy above for server-side data handling.
+The plugin writes sync output only inside the current Vault. If a task write fails, it moves newly-created files to the Obsidian trash. The optional hosted-image migration reads Markdown notes only under the plugin's configured root folder. Pro requires a WeTongbu account and a valid trial or subscription. See the privacy policy above for server-side data handling.
 
 ## Development
 
@@ -44,7 +44,7 @@ npm run check
 npm run build
 ```
 
-Attach `main.js` and `manifest.json` from the same version to each GitHub Release. The default branch does not commit generated `main.js`.
+Keep root `main.js`, `manifest.json`, and `versions.json` aligned for BRAT and Community Plugins updates. Attach `main.js` and `manifest.json` from the same version to each GitHub Release.
 
 ## 中文说明
 

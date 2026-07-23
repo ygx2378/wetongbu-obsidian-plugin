@@ -127,6 +127,33 @@ export interface DiffPlan {
   totalCount: number;
 }
 
+/** A stable, in-memory identity for the exact set of changes in a plan. */
+export function safetyPlanFingerprint(plan: DiffPlan): string {
+  return plan.ops
+    .filter((op) => op.decision !== VAULT_SYNC_DECISION.EQUAL)
+    .map((op) => [
+      op.path,
+      op.decision,
+      op.local?.contentHash ?? "",
+      op.local?.byteSize ?? "",
+      op.remote?.contentHash ?? "",
+      op.remote?.byteSize ?? "",
+      op.prev?.contentHash ?? "",
+      op.prev?.byteSize ?? "",
+      op.local?.mtimeMs ?? "",
+      op.remote?.mtimeMs ?? "",
+      op.prev?.mtimeMs ?? "",
+      op.local?.revision ?? "",
+      op.remote?.revision ?? "",
+      op.prev?.revision ?? "",
+      op.local?.isDeleted ? "1" : "0",
+      op.remote?.isDeleted ? "1" : "0",
+      op.prev?.isDeleted ? "1" : "0",
+    ].join("\u0000"))
+    .sort()
+    .join("\n");
+}
+
 /**
  * 对整棵文件树批量决策。输入是三张 path → FileEntity 的表。
  */

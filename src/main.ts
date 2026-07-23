@@ -1,5 +1,7 @@
 import { unzipSync } from "fflate";
 import {
+  addIcon,
+  Modal,
   Notice,
   Platform,
   Plugin,
@@ -19,7 +21,7 @@ import {
 import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
 import { VaultSyncRemoteClient } from "./vault-sync-remote";
 import { createPrevSyncStore } from "./vault-sync-local";
-import { createVaultSyncOrchestrator } from "./vault-sync";
+import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
 import { sha256Hex } from "./shared/hash";
 import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
@@ -56,8 +58,13 @@ interface WeTongbuSettings {
   processedTaskIds: string[];
   processedSourceUrls: string[];
   imageDeliveryMode: ImageDeliveryMode;
+  articleSyncIntervalSeconds: number;
   vaultSyncEnabled: boolean;
+  /** 新安装完成必要配置后自动开启；旧安装和用户手动关闭后为 false。 */
+  vaultSyncAutoEnablePending: boolean;
   vaultSyncScope: VaultSyncScope;
+  vaultSafetyEnabled: boolean;
+  vaultSafetyRatio: number;
   /** 首次双侧都有内容时的同步方向；ask 表示先让用户选择。 */
   vaultFirstSyncDirection: VaultFirstSyncDirection;
   /** SecretStorage key for the vault device token (一次一密)。 */
@@ -106,6 +113,37 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
   tencent_cos: "腾讯云 COS",
 };
 
+const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
+const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9] as const;
+
+const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <path d="M23 36a10 10 0 0 1 10-10h27l12 12v46a10 10 0 0 1-10 10H33a10 10 0 0 1-10-10z" fill="currentColor" opacity=".18"/>
+  <path d="M60 26v15a7 7 0 0 0 7 7h15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="5" opacity=".72"/>
+  <path d="M34 59h25M34 70h25M34 81h17" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="5"/>
+  <path d="M51 35a28 28 0 0 1 38 8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="8"/>
+  <path d="m87 33 8 10-13 1" fill="currentColor"/>
+  <path d="M77 93a28 28 0 0 1-38-8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="8" opacity=".72"/>
+  <path d="m41 95-8-10 13-1" fill="currentColor" opacity=".72"/>
+</svg>`;
+
+function normalizeArticleSyncInterval(value: unknown) {
+  const numeric = Number(value);
+  return ARTICLE_SYNC_INTERVAL_OPTIONS.includes(numeric as typeof ARTICLE_SYNC_INTERVAL_OPTIONS[number])
+    ? numeric
+    : 30;
+}
+
+function normalizeVaultSafetyRatio(value: unknown) {
+  const numeric = Number(value);
+  return VAULT_SAFETY_RATIO_OPTIONS.includes(numeric as typeof VAULT_SAFETY_RATIO_OPTIONS[number])
+    ? numeric
+    : 0.5;
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
 function providerLabel(value: unknown) {
   return typeof value === "string" && value in PROVIDER_LABEL
     ? PROVIDER_LABEL[value as StorageProvider]
@@ -150,8 +188,12 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   processedTaskIds: [],
   processedSourceUrls: [],
   imageDeliveryMode: "local",
+  articleSyncIntervalSeconds: 30,
   vaultSyncEnabled: false,
+  vaultSyncAutoEnablePending: false,
   vaultSyncScope: "whole_vault",
+  vaultSafetyEnabled: true,
+  vaultSafetyRatio: 0.5,
   vaultFirstSyncDirection: "ask",
   vaultDeviceTokenSecretId: "",
   vaultInstallationId: "",
@@ -224,17 +266,27 @@ export default class WeTongbuPlugin extends Plugin {
   private vaultSyncing = false;
   private vaultDeviceTokenCache = "";
   private accountPollTimer: number | null = null;
+  private articleSyncTimer: number | null = null;
+  private articleSyncSchedulerStarted = false;
   private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
+  private vaultSafetyOverrideFingerprint = "";
   vaultEncryptionInput = "";
 
   async onload() {
-    const saved = ((await this.loadData()) ?? {}) as PersistedSettings;
+    const rawSaved = await this.loadData();
+    const freshInstall = !rawSaved || Object.keys(rawSaved).length === 0;
+    const saved = (rawSaved ?? {}) as PersistedSettings;
     const {
       noteFolder: _legacyNoteFolder,
       attachmentFolder: _legacyAttachmentFolder,
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
+    if (!Object.prototype.hasOwnProperty.call(currentSettings, "vaultSyncAutoEnablePending")) {
+      this.settings.vaultSyncAutoEnablePending = freshInstall;
+    }
+    this.settings.articleSyncIntervalSeconds = normalizeArticleSyncInterval(this.settings.articleSyncIntervalSeconds);
+    this.settings.vaultSafetyRatio = normalizeVaultSafetyRatio(this.settings.vaultSafetyRatio);
     // The API base is not a user-facing setting. Normalize old/manual data so
     // plugin credentials can never be sent to an arbitrary endpoint.
     this.settings.apiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
@@ -259,7 +311,8 @@ export default class WeTongbuPlugin extends Plugin {
       }
     });
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
-    this.addRibbonIcon("refresh-cw", "微同步：立即同步", () => {
+    addIcon("wetongbu-sync", WETONGBU_RIBBON_ICON);
+    this.addRibbonIcon("wetongbu-sync", "微同步：立即同步", () => {
       void this.manualSync();
     });
     this.addCommand({
@@ -269,15 +322,15 @@ export default class WeTongbuPlugin extends Plugin {
     });
     this.addCommand({
       id: "vault-sync-now",
-      name: "Vault 多端同步：立即同步",
+      name: "微同步：仅同步 Vault 文件（高级）",
       callback: () => void this.runVaultSync(false),
     });
     this.app.workspace.onLayoutReady(() => {
+      this.articleSyncSchedulerStarted = true;
       void this.ensureWorkspace();
+      void this.maybeEnableVaultSyncAfterSetup(false);
       void this.syncNow(true);
-      this.registerInterval(
-        window.setInterval(() => void this.syncNow(true), 30_000),
-      );
+      this.restartArticleSyncTimer();
       // Vault 多端同步：60s 轮询，只在用户开启且已配置时运行。
       this.registerInterval(
         window.setInterval(() => { void this.runVaultSync(true); }, 60_000),
@@ -288,12 +341,61 @@ export default class WeTongbuPlugin extends Plugin {
   onunload() {
     if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
     this.accountPollTimer = null;
+    if (this.articleSyncTimer !== null) window.clearInterval(this.articleSyncTimer);
+    this.articleSyncTimer = null;
     this.vaultSyncRetry?.clear();
     this.vaultSyncRetry = null;
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  private restartArticleSyncTimer() {
+    if (this.articleSyncTimer !== null) window.clearInterval(this.articleSyncTimer);
+    this.articleSyncTimer = null;
+    if (!this.articleSyncSchedulerStarted) return;
+    this.articleSyncTimer = window.setInterval(
+      () => { void this.syncNow(true); },
+      this.settings.articleSyncIntervalSeconds * 1000,
+    );
+  }
+
+  async setArticleSyncInterval(seconds: number) {
+    this.settings.articleSyncIntervalSeconds = normalizeArticleSyncInterval(seconds);
+    await this.saveSettings();
+    this.restartArticleSyncTimer();
+  }
+
+  private hasConfiguredUserStorage() {
+    return Boolean(
+      this.settings.accessKeySecretId
+      && this.settings.secretKeySecretId
+      && this.settings.bucket
+      && this.settings.region
+      && (this.settings.storageProvider !== "cloudflare_r2" || this.settings.endpoint),
+    );
+  }
+
+  private async maybeEnableVaultSyncAfterSetup(announce: boolean) {
+    if (!this.settings.vaultSyncAutoEnablePending || this.settings.vaultSyncEnabled) return;
+    if (!this.settings.syncTargetId) return;
+    const pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (!pluginToken) return;
+    const ready = this.accountPlanType === "pro"
+      ? this.accountLoggedIn
+      : this.hasConfiguredUserStorage();
+    if (!ready) return;
+    try {
+      await this.setVaultSyncEnabled(true);
+      if (!this.settings.vaultSyncEnabled) return;
+      this.settings.vaultSyncAutoEnablePending = false;
+      await this.saveSettings();
+      if (announce) new Notice("电脑和手机同步已自动开启", 6000);
+      void this.runVaultSync(false);
+    } catch (error) {
+      console.warn("WeTongbu default Vault sync enable deferred", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private pluginTokenSecretId() {
@@ -414,6 +516,7 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.syncTargetName = targetName || this.settings.syncTargetName;
     if (recoveryToken) this.recoveryToken = recoveryToken;
     if (changed) {
+      this.settings.vaultSyncEnabled = false;
       this.settings.vaultDeviceTokenSecretId = "";
       this.settings.vaultDeviceId = "";
       this.vaultDeviceTokenCache = "";
@@ -524,6 +627,7 @@ export default class WeTongbuPlugin extends Plugin {
       this.accountPollTimer = null;
       await this.refreshAccountStatus();
       if (!this.accountLoggedIn) throw new Error("账号状态读取失败，请重新登录");
+      await this.maybeEnableVaultSyncAfterSetup(true);
     } catch (error) {
       if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
       this.accountPollTimer = null;
@@ -619,6 +723,7 @@ export default class WeTongbuPlugin extends Plugin {
     if (!this.settings.syncTargetId || !pluginToken) {
       if (!enabled) {
         this.settings.vaultSyncEnabled = false;
+        this.settings.vaultSyncAutoEnablePending = false;
         await this.saveSettings();
         return;
       }
@@ -643,6 +748,7 @@ export default class WeTongbuPlugin extends Plugin {
         : undefined,
     );
     this.settings.vaultSyncEnabled = result.enabled;
+    this.settings.vaultSyncAutoEnablePending = false;
     this.settings.vaultSyncScope = result.scope === "root_folder" ? "root_folder" : "whole_vault";
     if (result.encryption?.enabled && result.encryption.saltHex) {
       this.settings.vaultEncryptionEnabled = true;
@@ -792,6 +898,7 @@ export default class WeTongbuPlugin extends Plugin {
     this.storageStatus = resolved?.resolution === "adopted"
       ? `已找到远程 Vault · ${resolved.target_name ?? this.settings.syncTargetName}`
       : `连接正常 · ${providerLabel(resolved?.provider ?? this.settings.storageProvider)} · ${resolved?.bucket ?? this.settings.bucket}`;
+    await this.maybeEnableVaultSyncAfterSetup(true);
   }
 
   /**
@@ -897,6 +1004,7 @@ export default class WeTongbuPlugin extends Plugin {
       }
 
       const store = createPrevSyncStore(this.app);
+      const safetyOverrideFingerprint = this.vaultSafetyOverrideFingerprint;
       const orchestrator = createVaultSyncOrchestrator({
         app: this.app,
         storage,
@@ -908,8 +1016,18 @@ export default class WeTongbuPlugin extends Plugin {
           ? undefined
           : this.settings.vaultFirstSyncDirection,
         notify: quiet ? undefined : (msg) => new Notice(msg, 10000),
+        safetyEnabled: this.settings.vaultSafetyEnabled,
+        safetyRatio: this.settings.vaultSafetyRatio,
+        safetyOverrideFingerprint,
       });
       const result = await orchestrator.runOnce();
+      if (safetyOverrideFingerprint) this.vaultSafetyOverrideFingerprint = "";
+      if (result.safetyBlocked) {
+        this.lastSafeErrorCode = "vault_sync_safety_blocked";
+        this.vaultSyncRetry?.clear();
+        if (!quiet) this.openVaultSafetyModal(result);
+        return;
+      }
       if (result.aborted) {
         this.vaultSyncRetry?.clear();
       } else if (result.failed > 0 && result.failureMessages?.some(isRetryableVaultSyncError)) {
@@ -942,6 +1060,7 @@ export default class WeTongbuPlugin extends Plugin {
         }
       }
     } catch (error) {
+      this.vaultSafetyOverrideFingerprint = "";
       const message = error instanceof Error ? error.message : String(error);
       this.lastSafeErrorCode = "vault_sync_failed";
       if (isRetryableVaultSyncError(error)) this.vaultSyncRetry?.scheduleRetry();
@@ -970,6 +1089,22 @@ export default class WeTongbuPlugin extends Plugin {
     } finally {
       this.syncing = false;
     }
+  }
+
+  async setVaultSafety(enabled: boolean, ratio = this.settings.vaultSafetyRatio) {
+    this.settings.vaultSafetyEnabled = enabled;
+    this.settings.vaultSafetyRatio = normalizeVaultSafetyRatio(ratio);
+    await this.saveSettings();
+  }
+
+  private openVaultSafetyModal(result: SyncResult) {
+    new VaultSafetyModal(this.app, this, result).open();
+  }
+
+  async allowVaultSafetyOnce(fingerprint: string) {
+    if (!fingerprint) return;
+    this.vaultSafetyOverrideFingerprint = fingerprint;
+    await this.runVaultSync(false);
   }
 
   /**
@@ -1200,6 +1335,93 @@ export default class WeTongbuPlugin extends Plugin {
   }
 }
 
+class VaultSafetyModal extends Modal {
+  constructor(
+    app: App,
+    private plugin: WeTongbuPlugin,
+    private result: SyncResult,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.titleEl.setText("发现大量文件变化，已暂停同步");
+    const { contentEl } = this;
+    contentEl.empty();
+    const changed = this.result.safetyChangeCount ?? 0;
+    const total = this.result.safetyTotalCount ?? 0;
+    const actualRatio = total > 0 ? changed / total : 0;
+    const threshold = this.result.safetyRatio ?? this.plugin.settings.vaultSafetyRatio;
+    contentEl.createEl("p", {
+      text: `本次涉及 ${changed} / ${total} 个文件（${formatPercent(actualRatio)}），超过当前 ${formatPercent(threshold)} 保护比例。`,
+    });
+    const labels: Record<string, string> = {
+      local_created: "本地新增",
+      local_modified: "本地修改",
+      remote_created: "远端新增",
+      remote_modified: "远端修改",
+      local_deleted_propagate: "远端将删除",
+      remote_deleted_propagate: "本地将删除",
+      conflict: "冲突副本",
+    };
+    const details = Object.entries(this.result.safetyCounts ?? {})
+      .filter(([key, count]) => key !== "equal" && count > 0)
+      .map(([key, count]) => `${labels[key] ?? key} ${count}`)
+      .join(" · ");
+    if (details) contentEl.createEl("p", { text: details });
+    contentEl.createEl("p", {
+      text: "可以取消本次同步、只放行这一次，或调整后续保护比例。",
+    });
+
+    let selected = this.plugin.settings.vaultSafetyEnabled
+      ? String(this.plugin.settings.vaultSafetyRatio)
+      : "off";
+    new Setting(contentEl)
+      .setName("保护比例")
+      .setDesc("仅影响当前设备；首次同步方向确认仍会单独生效")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("0.3", "30%")
+          .addOption("0.5", "50%（默认）")
+          .addOption("0.7", "70%")
+          .addOption("0.9", "90%")
+          .addOption("off", "关闭保护（有风险）")
+          .setValue(selected)
+          .onChange((value) => { selected = value; });
+      });
+
+    new Setting(contentEl)
+      .addButton((button) => button
+        .setButtonText("取消本次同步")
+        .setCta()
+        .onClick(() => this.close()))
+      .addButton((button) => button
+        .setButtonText("仅允许这一次")
+        .onClick(() => {
+          const fingerprint = this.result.safetyPlanFingerprint ?? "";
+          this.close();
+          void this.plugin.allowVaultSafetyOnce(fingerprint).catch((error) => {
+            new Notice(`继续同步失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+          });
+        }))
+      .addButton((button) => button
+        .setButtonText("保存保护设置")
+        .onClick(async () => {
+          try {
+            await this.plugin.setVaultSafety(selected !== "off", selected === "off" ? 0.5 : Number(selected));
+            this.close();
+            new Notice("大批量变更保护设置已保存，请再次点击立即同步", 6000);
+          } catch (error) {
+            new Notice(`保护设置保存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+          }
+        }));
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class WeTongbuSettingTab extends PluginSettingTab {
   private accessKeyInput: string | null = null;
   private secretKeyInput: string | null = null;
@@ -1219,33 +1441,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
     this.secretKeyInput ??= this.plugin.settings.secretKeySecretId
       ? this.app.secretStorage.getSecret(this.plugin.settings.secretKeySecretId) ?? ""
       : "";
-
-    if (!this.plugin.settings.syncTargetId) {
-      new Setting(containerEl)
-        .setName("恢复已有免费版")
-        .setDesc("更换设备或重装插件时，输入之前保存的免费版恢复码")
-        .addText((text) => {
-          text.inputEl.type = "password";
-          text
-            .setPlaceholder("请输入恢复码")
-            .setValue(this.recoveryTokenInput)
-            .onChange((value) => {
-              this.recoveryTokenInput = value;
-            });
-        })
-        .addButton((button) =>
-          button.setButtonText("恢复免费版 Vault").onClick(async () => {
-            try {
-              await this.plugin.recoverFreeVault(this.recoveryTokenInput);
-              this.recoveryTokenInput = "";
-              this.display();
-              new Notice("免费版 Vault 已恢复，请保存新的恢复码");
-            } catch (error) {
-              new Notice(`恢复失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-            }
-          }),
-        );
-    }
 
     new Setting(containerEl)
       .setName("账号与 Pro")
@@ -1270,14 +1465,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("打开账号中心").onClick(() => this.plugin.openAccountCenter()),
       );
-
-    new Setting(containerEl)
-      .setName("电脑和手机自动同步")
-      .setDesc("Free 版在每台设备填写相同的对象存储配置，并使用相同的 Vault 名称；测试并保存时会自动找到已有远程 Vault，不需要加入码。Pro 版登录后自动使用账号中的 Vault。");
-
-    new Setting(containerEl)
-      .setName("插件版本")
-      .setDesc(`当前已加载：${this.plugin.manifest.version}`);
 
     if ((this.plugin.accountPlanType === "pro" && this.plugin.canHostImages)
       || this.plugin.settings.imageDeliveryMode === "hosted_link") {
@@ -1402,38 +1589,15 @@ class WeTongbuSettingTab extends PluginSettingTab {
         }),
       );
 
-    if (this.plugin.settings.syncTargetId) {
-      const recoverySetting = new Setting(containerEl)
-        .setName("免费版恢复")
-        .setDesc(
-          this.plugin.recoveryToken
-            ? `请保存到安全位置，用于更换设备或重装插件：${this.plugin.recoveryToken}`
-            : "生成恢复码并保存到安全位置；重新生成后旧恢复码立即失效",
-        );
-      recoverySetting.addButton((button) =>
-        button
-          .setButtonText(this.plugin.recoveryToken ? "重新生成" : "生成恢复码")
-          .onClick(async () => {
-            try {
-              await this.plugin.rotateRecoveryToken();
-              this.display();
-              new Notice("已生成新的恢复码，旧恢复码已失效");
-            } catch (error) {
-              new Notice(`恢复码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-            }
-          }),
-      );
-    }
-
     new Setting(containerEl)
-      .setName("不登录：绑定 Chrome")
+      .setName("连接 Chrome 扩展")
       .setDesc(
         this.plugin.pairingCode
           ? `绑定码 ${this.plugin.pairingCode}，有效至 ${new Date(this.plugin.pairingExpiresAt).toLocaleTimeString()}`
-          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成绑定；这不需要登录账号",
+          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成连接；Free 无需登录账号",
       )
       .addButton((button) =>
-        button.setButtonText("生成绑定码").onClick(async () => {
+        button.setButtonText("生成 6 位绑定码").onClick(async () => {
           try {
             await this.plugin.createBrowserPairingCode();
             this.display();
@@ -1446,8 +1610,32 @@ class WeTongbuSettingTab extends PluginSettingTab {
     this.textSetting("微同步目录", "文章、附件和 AI 说明文件的根目录", "rootFolder");
 
     new Setting(containerEl)
-      .setName("Vault 多端同步")
-      .setDesc("在多台设备间双向同步笔记内容（类 Remotely Save）。免费版直接使用你已配置的对象存储，内容不经过微同步服务器。同文件在两台设备都修改时生成冲突副本，不会静默覆盖。")
+      .setName("立即同步")
+      .setDesc(this.plugin.settings.vaultSyncEnabled
+        ? "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除"
+        : "检查飞书、网页和微信剪藏任务；开启电脑和手机同步后也会同步 Vault 文件")
+      .addButton((button) =>
+        button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
+      );
+
+    new Setting(containerEl)
+      .setName("自动获取剪藏笔记")
+      .setDesc(`插件启动时立即检查，之后每 ${this.plugin.settings.articleSyncIntervalSeconds} 秒检查一次飞书、网页和微信任务`)
+      .addDropdown((dropdown) => {
+        for (const seconds of ARTICLE_SYNC_INTERVAL_OPTIONS) {
+          dropdown.addOption(String(seconds), seconds === 60 ? "1 分钟" : seconds === 300 ? "5 分钟" : `${seconds} 秒${seconds === 30 ? "（默认）" : ""}`);
+        }
+        dropdown
+          .setValue(String(this.plugin.settings.articleSyncIntervalSeconds))
+          .onChange(async (value) => {
+            await this.plugin.setArticleSyncInterval(Number(value));
+            this.display();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("电脑和手机同步")
+      .setDesc(`在多台设备间双向同步整个 Vault（类 Remotely Save）。${this.plugin.settings.vaultSyncAutoEnablePending && !this.plugin.settings.vaultSyncEnabled ? "完成对象存储测试或账号授权后会自动开启。" : "同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"}`)
       .addToggle((toggle) =>
       toggle
           .setValue(this.plugin.settings.vaultSyncEnabled)
@@ -1502,11 +1690,31 @@ class WeTongbuSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("立即同步")
-        .setDesc("手动触发一次 Vault 多端同步")
-        .addButton((button) =>
-          button.setButtonText("立即同步").onClick(() => this.plugin.runVaultSync(false)),
-        );
+        .setName("大批量变更保护")
+        .setDesc(this.plugin.settings.vaultSafetyEnabled
+          ? `一次同步涉及超过 ${formatPercent(this.plugin.settings.vaultSafetyRatio)} 的文件时暂停，避免异常状态导致大量文件被修改或删除。`
+          : "已关闭：大批量文件变化会直接执行，请确认你了解可能的批量修改和删除风险。")
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.vaultSafetyEnabled)
+          .onChange(async (value) => {
+            if (!value && !window.confirm("关闭后，大量修改和删除可能直接同步到其他设备。确定关闭保护吗？")) {
+              toggle.setValue(true);
+              return;
+            }
+            await this.plugin.setVaultSafety(value);
+            this.display();
+          }))
+        .addDropdown((dropdown) => dropdown
+          .addOption("0.3", "30%")
+          .addOption("0.5", "50%（默认）")
+          .addOption("0.7", "70%")
+          .addOption("0.9", "90%")
+          .setValue(String(this.plugin.settings.vaultSafetyRatio))
+          .setDisabled(!this.plugin.settings.vaultSafetyEnabled)
+          .onChange(async (value) => {
+            await this.plugin.setVaultSafety(true, Number(value));
+            this.display();
+          }));
 
       new Setting(containerEl)
         .setName("端到端加密（可选）")
@@ -1539,16 +1747,53 @@ class WeTongbuSettingTab extends PluginSettingTab {
           }));
     }
 
-    new Setting(containerEl)
-      .setName("自动同步")
-      .setDesc("插件启动时检查，并每 30 秒检查一次待同步任务");
+    if (!this.plugin.settings.syncTargetId) {
+      new Setting(containerEl)
+        .setName("更换设备与恢复（低频）")
+        .setDesc("仅在更换电脑或重装插件后，使用之前保存的 Free 恢复码恢复原 Vault")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text
+            .setPlaceholder("请输入恢复码")
+            .setValue(this.recoveryTokenInput)
+            .onChange((value) => { this.recoveryTokenInput = value; });
+        })
+        .addButton((button) => button
+          .setButtonText("恢复 Free Vault")
+          .onClick(async () => {
+            try {
+              await this.plugin.recoverFreeVault(this.recoveryTokenInput);
+              this.recoveryTokenInput = "";
+              this.display();
+              new Notice("Free Vault 已恢复，请保存新的恢复码");
+            } catch (error) {
+              new Notice(`恢复失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            }
+          }));
+    } else {
+      const recoverySetting = new Setting(containerEl)
+        .setName("更换设备与恢复（低频）")
+        .setDesc(
+          this.plugin.recoveryToken
+            ? `请保存到安全位置，用于更换设备或重装插件：${this.plugin.recoveryToken}`
+            : "仅在更换设备或重装插件后使用；重新生成后旧恢复码立即失效",
+        );
+      recoverySetting.addButton((button) => button
+        .setButtonText(this.plugin.recoveryToken ? "重新生成恢复码" : "生成恢复码")
+        .onClick(async () => {
+          try {
+            await this.plugin.rotateRecoveryToken();
+            this.display();
+            new Notice("已生成新的恢复码，旧恢复码已失效");
+          } catch (error) {
+            new Notice(`恢复码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+          }
+        }));
+    }
 
     new Setting(containerEl)
-      .setName("文章任务同步")
-      .setDesc("立即检查飞书、网页和微信文章任务")
-      .addButton((button) =>
-        button.setButtonText("检查文章任务").onClick(() => this.plugin.syncNow()),
-      );
+      .setName("插件版本")
+      .setDesc(`当前已加载：${this.plugin.manifest.version}`);
 
     new Setting(containerEl)
       .setName("帮助与问题反馈")

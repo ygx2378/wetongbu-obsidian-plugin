@@ -7,7 +7,7 @@
 //   2. 扫描本地 vault → local index
 //   3. 拉远端 manifest（since=prevSync.lastCursor）→ remote index
 //   4. 三方 diff → plan
-//   5. 安全阀：改动 > 50% 中止
+//   5. 安全阀：按插件设置的比例（默认 > 50%）中止
 //   6. 执行：
 //      a. 本地新增/修改 → 上传到 storage + commit 到服务端
 //      b. 远端新增/修改 → 从 storage 下载 + 写入 vault
@@ -23,7 +23,7 @@ import type { App } from "obsidian";
 import { VAULT_SYNC_DECISION } from "./shared/vault-sync-protocol.mjs";
 import {
   type FileEntity, type PlannedOp, type DiffPlan,
-  planSync, shouldAbortForSafety, shouldAbortForBootstrap, conflictCopyName,
+  planSync, shouldAbortForSafety, shouldAbortForBootstrap, conflictCopyName, safetyPlanFingerprint,
 } from "./vault-sync-diff.ts";
 import {
   type LocalIndex, type PrevSyncState, type PrevSyncStore,
@@ -63,6 +63,11 @@ export interface VaultSyncOrchestratorDeps {
   bootstrapDirection?: "remote" | "local";
   /** 是否在 UI 弹 Notice。后台静默同步传 false。 */
   notify?: (msg: string) => void;
+  /** 大比例变更保护；默认启用并使用 50%。 */
+  safetyEnabled?: boolean;
+  safetyRatio?: number;
+  /** 仅允许与该 fingerprint 完全一致的一次计划执行。 */
+  safetyOverrideFingerprint?: string;
 }
 
 export interface SyncResult {
@@ -75,6 +80,12 @@ export interface SyncResult {
   failureMessages?: string[];
   aborted?: boolean;
   needsBootstrapDecision?: boolean;
+  safetyBlocked?: boolean;
+  safetyChangeCount?: number;
+  safetyTotalCount?: number;
+  safetyRatio?: number;
+  safetyCounts?: DiffPlan["counts"];
+  safetyPlanFingerprint?: string;
   /** 冲突文件的本地副本路径（供 UI 提示）。 */
   conflictPaths?: string[];
 }
@@ -166,9 +177,21 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       notify("首次同步发现本机和电脑端都有内容，请在设置中选择“从电脑同步到本机”或“从本机上传到电脑”后重试。\n选择会决定首次同步方向，不会自动覆盖内容。");
       return { ...result, aborted: true, needsBootstrapDecision: true };
     }
-    if (!isBootstrap && !oneSidedBootstrap && shouldAbortForSafety(plan)) {
-      notify("Vault 同步中止：改动比例超过 50%，请检查远端或其他设备状态后重试。");
-      return { ...result, aborted: true };
+    const safetyRatio = deps.safetyRatio ?? 0.5;
+    const safetyFingerprint = safetyPlanFingerprint(plan);
+    const safetyBypassed = deps.safetyOverrideFingerprint === safetyFingerprint;
+    if (!isBootstrap && !oneSidedBootstrap && deps.safetyEnabled !== false
+      && !safetyBypassed && shouldAbortForSafety(plan, safetyRatio)) {
+      return {
+        ...result,
+        aborted: true,
+        safetyBlocked: true,
+        safetyChangeCount: plan.modifyCount,
+        safetyTotalCount: plan.totalCount,
+        safetyRatio,
+        safetyCounts: plan.counts,
+        safetyPlanFingerprint: safetyFingerprint,
+      };
     }
 
     const conflictPaths: string[] = [];
