@@ -59,6 +59,8 @@ export interface VaultSyncOrchestratorDeps {
   deviceId: string;
   /** 同步范围根目录（undefined = 整个 vault）。 */
   rootFolder?: string | undefined;
+  /** 首次双侧都有内容时的明确方向；未提供则安全暂停等待用户选择。 */
+  bootstrapDirection?: "remote" | "local";
   /** 是否在 UI 弹 Notice。后台静默同步传 false。 */
   notify?: (msg: string) => void;
 }
@@ -70,6 +72,7 @@ export interface SyncResult {
   deletedRemote: number;
   conflicts: number;
   aborted?: boolean;
+  needsBootstrapDecision?: boolean;
   /** 冲突文件的本地副本路径（供 UI 提示）。 */
   conflictPaths?: string[];
 }
@@ -81,6 +84,7 @@ const DEFAULT_NOTIFY = (_msg: string) => {};
 export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
   const { app, storage, remote, store, deviceId } = deps;
   const rootFolder = deps.rootFolder;
+  const bootstrapDirection = deps.bootstrapDirection;
   const notify = deps.notify ?? DEFAULT_NOTIFY;
 
   async function runOnce(): Promise<SyncResult> {
@@ -137,19 +141,31 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       }
     }
 
-    // 4. diff
-    const plan = planSync(localIndex, remoteMap, prevMap);
+    // A first run that failed before committing any file can leave an empty
+    // state file behind. Treat that state as no baseline; otherwise the safety
+    // guard would classify every local note as a mass change and block the
+    // retry forever.
+    const isBootstrap = !prev || (prev.lastCursor === 0 && Object.keys(prev.files).length === 0);
+
+    // 4. diff。首次双侧都有内容时，用用户明确选择的一侧作为基线：
+    // remote 表示把电脑端内容下载到本机，local 表示把本机内容上传到远端。
+    const bootstrapBaseline = isBootstrap && bootstrapDirection === "remote"
+      ? localIndex
+      : isBootstrap && bootstrapDirection === "local"
+        ? remoteMap
+        : prevMap;
+    const plan = planSync(localIndex, remoteMap, bootstrapBaseline);
 
     // 5. 安全阀。首次同步只有一侧有内容时可安全建立基线；两侧同时
     // 有内容而没有 prevSync 时，无法判断覆盖方向，必须先让用户确认。
-    const isBootstrap = !prev;
     const oneSidedBootstrap = isBootstrap && (localIndex.size === 0 || remoteMap.size === 0);
-    if (!oneSidedBootstrap && shouldAbortForSafety(plan)) {
-      notify("Vault 同步中止：改动比例超过 50%，请检查远端或其他设备状态后重试。");
-      return { ...result, aborted: true };
+    if (isBootstrap && shouldAbortForBootstrap(localIndex.size, remoteMap.size, plan)
+      && !bootstrapDirection) {
+      notify("首次同步发现本机和电脑端都有内容，请在设置中选择“从电脑同步到本机”或“从本机上传到电脑”后重试。\n选择会决定首次同步方向，不会自动覆盖内容。");
+      return { ...result, aborted: true, needsBootstrapDecision: true };
     }
-    if (isBootstrap && shouldAbortForBootstrap(localIndex.size, remoteMap.size, plan)) {
-      notify("Vault 同步暂停：本地和远端都已有内容，请先在空 Vault 中完成首次同步，或清理一侧后重试。");
+    if (!isBootstrap && !oneSidedBootstrap && shouldAbortForSafety(plan)) {
+      notify("Vault 同步中止：改动比例超过 50%，请检查远端或其他设备状态后重试。");
       return { ...result, aborted: true };
     }
 

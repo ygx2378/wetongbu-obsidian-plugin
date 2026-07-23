@@ -22,6 +22,20 @@ import { createPrevSyncStore } from "./vault-sync-local";
 import { createVaultSyncOrchestrator } from "./vault-sync";
 import { sha256Hex } from "./shared/hash";
 import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
+import {
+  assertBucketName,
+  assertR2Endpoint,
+  assertSha256,
+  assertStoragePrefix,
+  DEFAULT_API_BASE_URL,
+  isTrustedApiUrl,
+  isTrustedStorageUrl,
+  MAX_MANIFEST_BYTES,
+  MAX_TASK_ENTRY_BYTES,
+  MAX_TASK_PACKAGE_BYTES,
+  MAX_TASK_PACKAGE_ENTRIES,
+  normalizeApiBaseUrl,
+} from "./shared/security";
 
 interface WeTongbuSettings {
   apiBaseUrl: string;
@@ -42,6 +56,8 @@ interface WeTongbuSettings {
   imageDeliveryMode: ImageDeliveryMode;
   vaultSyncEnabled: boolean;
   vaultSyncScope: VaultSyncScope;
+  /** 首次双侧都有内容时的同步方向；ask 表示先让用户选择。 */
+  vaultFirstSyncDirection: VaultFirstSyncDirection;
   /** SecretStorage key for the vault device token (一次一密)。 */
   vaultDeviceTokenSecretId: string;
   /** Stable per-installation identity; never use a platform name as identity. */
@@ -59,6 +75,7 @@ interface WeTongbuSettings {
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
 type VaultSyncScope = "whole_vault" | "root_folder";
+type VaultFirstSyncDirection = "ask" | "remote" | "local";
 
 function currentDeviceName() {
   if (Platform.isIosApp) return "iOS";
@@ -100,7 +117,7 @@ function formatBytes(value: number) {
   return `${(value / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-const HOSTED_MEDIA_LINK = /https:\/\/[a-z0-9.-]+(?:\/media)?\/m\/[0-9a-f]{8}-[0-9a-f-]{27}\/[a-f0-9]{64}/gi;
+const HOSTED_MEDIA_LINK = /https:\/\/api\.wetongbu\.com\/m\/[0-9a-f]{8}-[0-9a-f-]{27}\/[a-f0-9]{64}/gi;
 
 function imageExtension(body: Uint8Array, contentType: string) {
   const startsWith = (values: number[], offset = 0) => values.every((value, index) => body[offset + index] === value);
@@ -115,7 +132,7 @@ function imageExtension(body: Uint8Array, contentType: string) {
 }
 
 const DEFAULT_SETTINGS: WeTongbuSettings = {
-  apiBaseUrl: "https://api.wetongbu.com",
+  apiBaseUrl: DEFAULT_API_BASE_URL,
   userId: "",
   syncTargetId: "",
   syncTargetName: "",
@@ -133,6 +150,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   imageDeliveryMode: "local",
   vaultSyncEnabled: false,
   vaultSyncScope: "whole_vault",
+  vaultFirstSyncDirection: "ask",
   vaultDeviceTokenSecretId: "",
   vaultInstallationId: "",
   vaultDeviceId: "",
@@ -214,6 +232,9 @@ export default class WeTongbuPlugin extends Plugin {
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
+    // The API base is not a user-facing setting. Normalize old/manual data so
+    // plugin credentials can never be sent to an arbitrary endpoint.
+    this.settings.apiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
     if (!this.settings.vaultInstallationId) {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
@@ -225,13 +246,13 @@ export default class WeTongbuPlugin extends Plugin {
       if (!document.hidden) void this.resumeAccountLogin().catch(() => undefined);
     });
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
-    this.addRibbonIcon("refresh-cw", "微同步：手动同步", () => {
-      void this.syncNow();
+    this.addRibbonIcon("refresh-cw", "微同步：立即同步", () => {
+      void this.manualSync();
     });
     this.addCommand({
       id: "sync-now",
-      name: "手动同步",
-      callback: () => void this.syncNow(),
+      name: "微同步：立即同步",
+      callback: () => void this.manualSync(),
     });
     this.addCommand({
       id: "vault-sync-now",
@@ -434,7 +455,13 @@ export default class WeTongbuPlugin extends Plugin {
     });
     if (response.status !== 201) throw new Error(response.json?.error ?? "登录授权申请失败");
     const authorization = response.json;
-    const verificationUrl = `${authorization.verification_uri}?user_code=${encodeURIComponent(authorization.user_code)}`;
+    if (!isTrustedApiUrl(authorization.verification_uri, base)
+      && !isTrustedApiUrl(String(authorization.verification_uri).replace("api.", "app."), "https://app.wetongbu.com")) {
+      throw new Error("登录授权地址不受信任");
+    }
+    const verification = new URL(authorization.verification_uri);
+    verification.search = `?user_code=${encodeURIComponent(authorization.user_code)}`;
+    const verificationUrl = verification.toString();
     window.open(verificationUrl, "_blank");
     this.settings.pendingDeviceCode = authorization.device_code;
     this.settings.pendingDeviceVerificationUri = verificationUrl;
@@ -663,6 +690,9 @@ export default class WeTongbuPlugin extends Plugin {
       if (!links.length) continue;
       let markdown = original;
       for (const link of links) {
+        if (!isTrustedApiUrl(link, this.settings.apiBaseUrl)) {
+          throw new Error("云端图片链接不受信任");
+        }
         const downloaded = await requestUrl({ url: link, method: "GET", throw: false });
         if (downloaded.status !== 200) throw new Error(`图片下载失败（${downloaded.status}）`);
         const body = new Uint8Array(downloaded.arrayBuffer);
@@ -698,11 +728,15 @@ export default class WeTongbuPlugin extends Plugin {
     const accessKeyId = accessKeyInput.trim();
     const secretAccessKey = secretKeyInput;
     if (!accessKeyId || !secretAccessKey) throw new Error("请先输入 Access Key 和 Secret Key");
-    if (!this.settings.bucket) throw new Error("请先填写 Bucket");
+    assertBucketName(this.settings.bucket);
     if (!this.settings.region) throw new Error("请先填写 Region");
     if (this.settings.storageProvider === "cloudflare_r2" && !this.settings.endpoint) {
       throw new Error("请先填写 R2 Endpoint");
     }
+    if (this.settings.storageProvider === "cloudflare_r2") {
+      this.settings.endpoint = assertR2Endpoint(this.settings.endpoint);
+    }
+    this.settings.prefix = assertStoragePrefix(this.settings.prefix);
     const accessKeySecretId = this.settings.accessKeySecretId || "wetongbu-storage-access-key-id";
     const secretKeySecretId = this.settings.secretKeySecretId || "wetongbu-storage-secret-access-key";
     const token = await this.ensureCurrentVaultRegistered();
@@ -855,6 +889,9 @@ export default class WeTongbuPlugin extends Plugin {
         store,
         deviceId: this.settings.vaultDeviceId || this.settings.vaultInstallationId,
         rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
+        bootstrapDirection: this.settings.vaultFirstSyncDirection === "ask"
+          ? undefined
+          : this.settings.vaultFirstSyncDirection,
         notify: quiet ? undefined : (msg) => new Notice(msg, 10000),
       });
       const result = await orchestrator.runOnce();
@@ -906,6 +943,19 @@ export default class WeTongbuPlugin extends Plugin {
       console.error("WeTongbu sync failed");
     } finally {
       this.syncing = false;
+    }
+  }
+
+  /**
+   * User-facing manual action. When Vault multi-device sync is enabled, run
+   * both the article inbox and the local Vault sync without showing the
+   * article-inbox "没有待同步文章" notice for an otherwise valid Vault run.
+   */
+  async manualSync() {
+    const articleSyncQuiet = this.settings.vaultSyncEnabled;
+    await this.syncNow(articleSyncQuiet);
+    if (this.settings.vaultSyncEnabled) {
+      await this.runVaultSync(false);
     }
   }
 
@@ -1411,6 +1461,21 @@ class WeTongbuSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
+        .setName("首次同步方向")
+        .setDesc("仅在此设备第一次同步且本机已有文件时生效。选择从电脑下载到本机，或从本机上传到电脑；已有同步基线后不再使用。")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("ask", "首次遇到时提醒我")
+            .addOption("remote", "从电脑/云端下载到本机")
+            .addOption("local", "从本机上传到电脑/云端")
+            .setValue(this.plugin.settings.vaultFirstSyncDirection)
+            .onChange(async (value) => {
+              this.plugin.settings.vaultFirstSyncDirection = value as VaultFirstSyncDirection;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
         .setName("立即同步")
         .setDesc("手动触发一次 Vault 多端同步")
         .addButton((button) =>
@@ -1453,10 +1518,10 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .setDesc("插件启动时检查，并每 30 秒检查一次待同步任务");
 
     new Setting(containerEl)
-      .setName("手动同步")
-      .setDesc("立即检查待同步任务")
+      .setName("文章任务同步")
+      .setDesc("立即检查飞书、网页和微信文章任务")
       .addButton((button) =>
-        button.setButtonText("立即同步").onClick(() => this.plugin.syncNow()),
+        button.setButtonText("检查文章任务").onClick(() => this.plugin.syncNow()),
       );
 
     new Setting(containerEl)
