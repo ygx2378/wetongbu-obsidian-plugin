@@ -71,6 +71,8 @@ export interface SyncResult {
   deletedLocal: number;
   deletedRemote: number;
   conflicts: number;
+  failed: number;
+  failureMessages?: string[];
   aborted?: boolean;
   needsBootstrapDecision?: boolean;
   /** 冲突文件的本地副本路径（供 UI 提示）。 */
@@ -89,7 +91,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
   async function runOnce(): Promise<SyncResult> {
     const result: SyncResult = {
-      uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: 0,
+      uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: 0, failed: 0,
     };
 
     // 1. 读 prevSync
@@ -189,6 +191,16 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       } catch (error) {
         // 单文件失败不阻塞整体；该文件下次同步会重试（prevSync 未推进）。
         hadFailures = true;
+        result.failed += 1;
+        const rawMessage = error instanceof Error ? error.message : String(error);
+        const safeMessage = rawMessage
+          .replace(/https?:\/\/[^\s)]+/gi, "[url]")
+          .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
+          .slice(0, 160);
+        result.failureMessages ??= [];
+        if (result.failureMessages.length < 3 && !result.failureMessages.includes(safeMessage)) {
+          result.failureMessages.push(safeMessage || "未知错误");
+        }
         console.error("vault sync operation failed", { code: error instanceof Error ? error.name : "unknown" });
       }
     }

@@ -898,6 +898,9 @@ export default class WeTongbuPlugin extends Plugin {
       if (!quiet) {
         if (result.aborted) {
           new Notice("Vault 同步已中止，请检查后重试", 10000);
+        } else if (result.failed > 0) {
+          const reason = result.failureMessages?.[0];
+          new Notice(`Vault 同步未完成：${result.failed} 个文件失败${reason ? `（${reason}）` : ""}，请重试`, 12000);
         } else {
           const total = result.uploaded + result.downloaded + result.deletedLocal + result.deletedRemote;
           if (total === 0 && result.conflicts === 0) {
