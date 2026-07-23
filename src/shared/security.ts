@@ -3,6 +3,8 @@
 export const DEFAULT_API_BASE_URL = "https://api.wetongbu.com";
 
 const TRUSTED_API_HOSTS = new Set(["api.wetongbu.com", "wx.wetongbu.com"]);
+const TRUSTED_AUTHORIZATION_HOSTS = new Set(["app.wetongbu.com"]);
+const TRUSTED_AUTHORIZATION_PATHS = new Set(["/device", "/browser-device"]);
 const TRUSTED_STORAGE_SUFFIXES = [
   ".r2.cloudflarestorage.com",
   ".amazonaws.com",
@@ -39,6 +41,13 @@ export function isTrustedApiUrl(value: unknown, baseUrl = DEFAULT_API_BASE_URL):
   if (!url) return false;
   const base = parseHttpsUrl(normalizeApiBaseUrl(baseUrl));
   return Boolean(base && url.hostname.toLowerCase() === base.hostname.toLowerCase());
+}
+
+export function isTrustedAuthorizationUrl(value: unknown): boolean {
+  const url = parseHttpsUrl(value);
+  if (!url || !TRUSTED_AUTHORIZATION_HOSTS.has(url.hostname.toLowerCase())) return false;
+  const pathname = url.pathname.replace(/\/$/, "") || "/";
+  return TRUSTED_AUTHORIZATION_PATHS.has(pathname);
 }
 
 export function isTrustedStorageUrl(value: unknown, configuredEndpoint = "", apiBaseUrl = DEFAULT_API_BASE_URL): boolean {

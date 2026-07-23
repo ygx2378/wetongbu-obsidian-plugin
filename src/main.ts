@@ -29,6 +29,7 @@ import {
   assertStoragePrefix,
   DEFAULT_API_BASE_URL,
   isTrustedApiUrl,
+  isTrustedAuthorizationUrl,
   isTrustedStorageUrl,
   MAX_MANIFEST_BYTES,
   MAX_TASK_ENTRY_BYTES,
@@ -455,8 +456,7 @@ export default class WeTongbuPlugin extends Plugin {
     });
     if (response.status !== 201) throw new Error(response.json?.error ?? "登录授权申请失败");
     const authorization = response.json;
-    if (!isTrustedApiUrl(authorization.verification_uri, base)
-      && !isTrustedApiUrl(String(authorization.verification_uri).replace("api.", "app."), "https://app.wetongbu.com")) {
+    if (!isTrustedAuthorizationUrl(authorization.verification_uri)) {
       throw new Error("登录授权地址不受信任");
     }
     const verification = new URL(authorization.verification_uri);

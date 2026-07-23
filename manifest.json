@@ -1,7 +1,7 @@
 {
   "id": "wetongbu",
   "name": "WeTongbu",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "minAppVersion": "1.11.4",
   "description": "Sync selected WeChat articles, Feishu documents, and web pages to local Markdown notes.",
   "author": "WeTongbu",
