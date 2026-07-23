@@ -13,6 +13,8 @@
 import { requestUrl } from "obsidian";
 import { sha256Hex } from "./shared/hash";
 import type { VaultSyncCrypto } from "./shared/vault-sync-crypto";
+import { buildFreeS3BaseUrl, deriveS3Config } from "./vault-sync-storage-config";
+export { deriveS3Config } from "./vault-sync-storage-config";
 
 export interface VaultSyncStorage {
   /** 写入内容（按 hash 寻址）。上传 Pro 需先 prepare。 */
@@ -40,13 +42,9 @@ export interface FreeStorageConfig {
   verifyHash?: boolean;
 }
 
-export function createFreeS3Storage(config: FreeStorageConfig): VaultSyncStorage {
+export function createFreeS3Storage(config: FreeStorageConfig, request: typeof requestUrl = requestUrl): VaultSyncStorage {
   const region = config.region || "auto";
-  const baseUrl = config.endpoint
-    ? (config.forcePathStyle
-      ? `${config.endpoint.replace(/\/$/, "")}/${config.bucket}`
-      : `${config.endpoint.replace(/\/$/, "")}`)
-    : `https://${config.bucket}.s3.${region}.amazonaws.com`;
+  const baseUrl = buildFreeS3BaseUrl(config);
 
   const objectKey = (hash: string) => {
     const cleanPrefix = config.prefix.replace(/^\/+|\/+$/g, "");
@@ -76,12 +74,19 @@ export function createFreeS3Storage(config: FreeStorageConfig): VaultSyncStorage
     const signingKey = await deriveSigningKey(config.secretAccessKey, dateStamp, region, "s3");
     const signature = await hmacHex(signingKey, stringToSign);
     const authHeader = `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${dateStamp}/${region}/s3/aws4_request, SignedHeaders=${Object.keys(headers).sort().join(";")}, Signature=${signature}`;
-    headers.authorization = authHeader;
 
-    const response = await requestUrl({
+    // Electron rejects an explicitly supplied Host header with
+    // net::ERR_INVALID_ARGUMENT. The URL sets the same Host header on the
+    // wire, so keep it in the canonical signature but do not pass it through
+    // Obsidian's requestUrl headers.
+    const response = await request({
       url,
       method,
-      headers,
+      headers: {
+        "x-amz-date": amzDate,
+        "x-amz-content-sha256": payloadHash,
+        authorization: authHeader,
+      },
       body: body ? body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer : undefined,
       throw: false,
     });
@@ -221,31 +226,6 @@ async function deriveSigningKey(secretKey: string, dateStamp: string, region: st
   const kRegion = await hmac(kDate, region);
   const kService = await hmac(kRegion, service);
   return hmac(kService, "aws4_request");
-}
-
-export function deriveS3Config(
-  provider: string,
-  endpoint: string,
-  region: string,
-  bucket: string,
-  prefix: string,
-): { endpoint: string; region: string; forcePathStyle: boolean } {
-  switch (provider) {
-    case "cloudflare_r2":
-      return { endpoint, region: "auto", forcePathStyle: true };
-    case "aws_s3":
-      return { endpoint: "", region: region || "ap-southeast-1", forcePathStyle: false };
-    case "aliyun_oss": {
-      const r = region || "cn-hangzhou";
-      return { endpoint: `https://s3.oss-${r}.aliyuncs.com`, region: r, forcePathStyle: true };
-    }
-    case "tencent_cos": {
-      const r = region || "ap-guangzhou";
-      return { endpoint: `https://cos.${r}.myqcloud.com`, region: r, forcePathStyle: true };
-    }
-    default:
-      return { endpoint, region, forcePathStyle: true };
-  }
 }
 
 export async function computeHash(body: Uint8Array): Promise<string> {
