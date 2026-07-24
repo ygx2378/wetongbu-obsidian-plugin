@@ -22,6 +22,7 @@ import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorag
 import { VaultSyncRemoteClient } from "./vault-sync-remote";
 import { createPrevSyncStore } from "./vault-sync-local";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
+import type { DeletionAction, DeletionResolution } from "./vault-sync-deletion";
 import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
 import { sha256Hex } from "./shared/hash";
 import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
@@ -282,6 +283,7 @@ export default class WeTongbuPlugin extends Plugin {
   private articleSyncSchedulerStarted = false;
   private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
   private vaultSafetyOverrideFingerprint = "";
+  private pendingDeletionReview: SyncResult | null = null;
   vaultEncryptionInput = "";
 
   async onload() {
@@ -929,7 +931,7 @@ export default class WeTongbuPlugin extends Plugin {
    * quiet=true 时静默；false 时弹 Notice。
    * 前置条件：vaultSyncEnabled + 已注册（syncTargetId）+ 有 plugin token + 有 user_s3 凭证。
    */
-  async runVaultSync(quiet = false) {
+  async runVaultSync(quiet = false, deletionResolution?: DeletionResolution) {
     if (!this.settings.vaultSyncEnabled) return;
     if (!this.settings.syncTargetId) return;
     if (this.vaultSyncing) {
@@ -1072,6 +1074,7 @@ export default class WeTongbuPlugin extends Plugin {
         safetyEnabled: this.settings.vaultSafetyEnabled,
         safetyRatio: this.settings.vaultSafetyRatio,
         safetyOverrideFingerprint,
+        deletionResolution,
       });
       const result = await orchestrator.runOnce();
       if (safetyOverrideFingerprint) this.vaultSafetyOverrideFingerprint = "";
@@ -1081,6 +1084,14 @@ export default class WeTongbuPlugin extends Plugin {
         if (!quiet) this.openVaultSafetyModal(result);
         return;
       }
+      if (result.deletionReviewRequired) {
+        this.lastSafeErrorCode = "vault_sync_deletion_review";
+        this.pendingDeletionReview = result;
+        this.vaultSyncRetry?.clear();
+        if (!quiet) this.openVaultDeletionReviewModal(result);
+        return;
+      }
+      if (!result.failed) this.pendingDeletionReview = null;
       if (result.aborted) {
         this.vaultSyncRetry?.clear();
       } else if (result.failed > 0 && result.failureMessages?.some(isRetryableVaultSyncError)) {
@@ -1152,6 +1163,30 @@ export default class WeTongbuPlugin extends Plugin {
 
   private openVaultSafetyModal(result: SyncResult) {
     new VaultSafetyModal(this.app, this, result).open();
+  }
+
+  get pendingDeletionCount() {
+    return this.pendingDeletionReview?.pendingDeletions?.length ?? 0;
+  }
+
+  private openVaultDeletionReviewModal(result: SyncResult) {
+    new VaultDeletionReviewModal(this.app, this, result).open();
+  }
+
+  async openPendingDeletionReview() {
+    if (!this.pendingDeletionReview?.deletionPlanFingerprint) {
+      await this.runVaultSync(false);
+      return;
+    }
+    this.openVaultDeletionReviewModal(this.pendingDeletionReview);
+  }
+
+  async resolveVaultDeletions(
+    fingerprint: string,
+    decisions: Record<string, DeletionAction>,
+  ) {
+    if (!fingerprint) return;
+    await this.runVaultSync(false, { fingerprint, decisions });
   }
 
   async allowVaultSafetyOnce(fingerprint: string) {
@@ -1385,6 +1420,72 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       console.warn("WeTongbu note saved but could not be opened");
     }
+  }
+}
+
+class VaultDeletionReviewModal extends Modal {
+  private readonly decisions: Record<string, DeletionAction> = {};
+
+  constructor(
+    app: App,
+    private plugin: WeTongbuPlugin,
+    private result: SyncResult,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.titleEl.setText("确认文件删除或恢复");
+    const { contentEl } = this;
+    contentEl.empty();
+    const pending = this.result.pendingDeletions ?? [];
+    contentEl.createEl("p", {
+      text: "为避免误删，下面的跨设备删除不会自动执行。请逐项选择：确认删除、恢复文件，或暂不处理。",
+    });
+    for (const item of pending) {
+      this.decisions[item.path] = "keep";
+      const isLocalDeletion = item.direction === "local_to_remote";
+      const setting = new Setting(contentEl)
+        .setName(item.path)
+        .setDesc(isLocalDeletion
+          ? "检测到本机文件已删除，其他设备/云端仍有此文件。"
+          : "检测到其他设备已删除此文件，本机仍保留。")
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption("keep", "暂不处理（保留现状）")
+            .addOption("delete", isLocalDeletion ? "确认同步删除到其他设备" : "确认在本机删除")
+            .addOption("restore", isLocalDeletion ? "从云端恢复到本机" : "保留本机文件并恢复到云端")
+            .setValue("keep")
+            .onChange((value) => {
+              this.decisions[item.path] = value as DeletionAction;
+            });
+        });
+      setting.settingEl.addClass("wetongbu-deletion-review-item");
+    }
+
+    new Setting(contentEl)
+      .addButton((button) => button
+        .setButtonText("暂不处理")
+        .setCta()
+        .onClick(() => {
+          this.close();
+          new Notice("已保留待处理删除，下次手动同步时可继续处理", 6000);
+        }))
+      .addButton((button) => button
+        .setButtonText("执行所选操作")
+        .onClick(() => {
+          this.close();
+          void this.plugin.resolveVaultDeletions(
+            this.result.deletionPlanFingerprint ?? "",
+            this.decisions,
+          ).catch((error) => {
+            new Notice(`删除处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+          });
+        }));
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -1635,6 +1736,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
               this.secretKeyInput ?? "",
             );
             this.display();
+            new Notice("对象存储测试成功，配置已保存", 8000);
           } catch (error) {
             this.display();
             new Notice(`对象存储测试失败：${error instanceof Error ? error.message : String(error)}`, 10000);
@@ -1682,6 +1784,15 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
       );
+
+    if (this.plugin.pendingDeletionCount > 0) {
+      new Setting(containerEl)
+        .setName("待确认的删除")
+        .setDesc(`有 ${this.plugin.pendingDeletionCount} 个文件等待你确认删除或恢复；微同步不会自动执行。`)
+        .addButton((button) => button
+          .setButtonText("查看并处理")
+          .onClick(() => { void this.plugin.openPendingDeletionReview(); }));
+    }
 
     new Setting(containerEl)
       .setName("自动获取剪藏笔记")

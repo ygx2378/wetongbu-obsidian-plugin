@@ -29,6 +29,10 @@ import {
   type LocalIndex, type PrevSyncState, type PrevSyncStore,
   scanLocalFiles, prevSyncAsMap, advancePrevSync,
 } from "./vault-sync-local.ts";
+import {
+  actionFor, deletionPlanFingerprint, isDeletionDecision, pendingDeletions,
+  type DeletionResolution, type PendingDeletion,
+} from "./vault-sync-deletion.ts";
 import type { VaultSyncStorage } from "./vault-sync-storage";
 import { sha256Hex as computeHash } from "./shared/hash.ts";
 import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
@@ -68,6 +72,8 @@ export interface VaultSyncOrchestratorDeps {
   safetyRatio?: number;
   /** 仅允许与该 fingerprint 完全一致的一次计划执行。 */
   safetyOverrideFingerprint?: string;
+  /** 仅允许与该删除计划完全一致的一次明确用户决策。 */
+  deletionResolution?: DeletionResolution;
 }
 
 export interface SyncResult {
@@ -86,6 +92,10 @@ export interface SyncResult {
   safetyRatio?: number;
   safetyCounts?: DiffPlan["counts"];
   safetyPlanFingerprint?: string;
+  /** 有删除待用户明确选择，未确认前不会执行删除。 */
+  deletionReviewRequired?: boolean;
+  deletionPlanFingerprint?: string;
+  pendingDeletions?: PendingDeletion[];
   /** 冲突文件的本地副本路径（供 UI 提示）。 */
   conflictPaths?: string[];
 }
@@ -168,6 +178,9 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         ? remoteMap
         : prevMap;
     const plan = planSync(localIndex, remoteMap, bootstrapBaseline);
+    const deletionFingerprint = deletionPlanFingerprint(plan);
+    const deletionItems = pendingDeletions(plan);
+    const hasPendingDeletion = deletionItems.length > 0;
 
     // 5. 安全阀。首次同步只有一侧有内容时可安全建立基线；两侧同时
     // 有内容而没有 prevSync 时，无法判断覆盖方向，必须先让用户确认。
@@ -196,6 +209,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
     const conflictPaths: string[] = [];
     let hadFailures = false;
+    let hasUnresolvedDeletion = false;
     const prevUpdates: Array<{ path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean }> = [];
 
     // 6. 执行：按决策分派。顺序：先冲突副本（避免覆盖），再上传/下载/删除。
@@ -203,7 +217,17 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
     for (const op of sorted) {
       try {
-        const applied = await apply(op);
+        const deletionAction = isDeletionDecision(op.decision)
+          ? actionFor(op, deps.deletionResolution, deletionFingerprint)
+          : undefined;
+        if (isDeletionDecision(op.decision) && deletionAction === "keep") {
+          hasUnresolvedDeletion = true;
+          continue;
+        }
+        const applied = await apply(
+          op,
+          deletionAction === "delete" || deletionAction === "restore" ? deletionAction : undefined,
+        );
         if (applied.prevUpdate) prevUpdates.push(applied.prevUpdate);
         if (applied.counts.uploaded) result.uploaded += applied.counts.uploaded;
         if (applied.counts.downloaded) result.downloaded += applied.counts.downloaded;
@@ -229,11 +253,18 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     // 7. 推进 prevSync
-    const cursor = hadFailures ? (prev?.lastCursor ?? 0) : Math.max(manifest.maxRevision, prev?.lastCursor ?? 0);
+    const cursor = hadFailures || hasUnresolvedDeletion
+      ? (prev?.lastCursor ?? 0)
+      : Math.max(manifest.maxRevision, prev?.lastCursor ?? 0);
     const nextState = advancePrevSync(prev, deviceId, prevUpdates, cursor);
     await store.save(nextState);
 
     result.conflictPaths = conflictPaths;
+    if (hasPendingDeletion && hasUnresolvedDeletion) {
+      result.deletionReviewRequired = true;
+      result.deletionPlanFingerprint = deletionFingerprint;
+      result.pendingDeletions = deletionItems;
+    }
     return result;
   }
 
@@ -243,7 +274,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     return 1;
   }
 
-  async function apply(op: PlannedOp): Promise<{
+  async function apply(op: PlannedOp, deletionAction?: "delete" | "restore"): Promise<{
     counts: Partial<SyncResult>;
     prevUpdate?: { path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean };
     conflictPath?: string;
@@ -290,6 +321,17 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     if (decision === VAULT_SYNC_DECISION.LOCAL_DELETED_PROPAGATE) {
+      if (deletionAction === "restore") {
+        const remoteEnt = op.remote;
+        if (!remoteEnt?.contentHash) throw new Error(`待恢复的远端条目缺 contentHash：${path}`);
+        const body = await storage.get(remoteEnt.contentHash);
+        await writeVaultFile(app, path, body);
+        return {
+          counts: { downloaded: 1 },
+          prevUpdate: { path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength, mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false },
+        };
+      }
+      if (deletionAction !== "delete") return empty;
       // 本地已删 → 远端 tombstone。内容寻址存储的 block 不直接删（由服务端 GC），
       // 这里只清理本地可能残留的旧 hash 副本（Free 场景，hash 从 prev 取）。
       if (op.prev?.contentHash) {
@@ -304,6 +346,29 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     if (decision === VAULT_SYNC_DECISION.REMOTE_DELETED_PROPAGATE) {
+      if (deletionAction === "restore") {
+        const local = op.local;
+        if (!local) throw new Error(`待恢复的本地条目不存在：${path}`);
+        const body = await app.vault.readBinary(fileByPath(app, path));
+        const bytes = new Uint8Array(body);
+        const hash = await computeHash(bytes);
+        await storage.put(hash, bytes);
+        const resp = await remote.commit([{
+          path,
+          contentHash: hash,
+          byteSize: bytes.byteLength,
+          mtimeMs: local.mtimeMs,
+          isDeleted: false,
+          expectedRevision: op.remote?.revision,
+        }]);
+        const r = resp.results[0];
+        if (r.status === "conflict") throw new Error(`恢复失败：远端条目已被其他设备更新：${path}`);
+        return {
+          counts: { uploaded: 1 },
+          prevUpdate: { path, contentHash: hash, byteSize: bytes.byteLength, mtimeMs: local.mtimeMs, revision: r.revision, isDeleted: false },
+        };
+      }
+      if (deletionAction !== "delete") return empty;
       // 远端已删 → 本地 trash。
       await trashVaultFile(app, path);
       return {
