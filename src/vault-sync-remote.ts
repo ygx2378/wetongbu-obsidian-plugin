@@ -45,6 +45,10 @@ export interface VaultSyncStatus {
   storage_type: string;
   quota_bytes: number;
   used_bytes: number;
+  storage_credential_version?: string | null;
+  storage_manager_device_name?: string | null;
+  storage_credentials_updated_at?: string | null;
+  storage_manager_is_current_device?: boolean;
   can_write: boolean;
   can_read: boolean;
   encryption?: {

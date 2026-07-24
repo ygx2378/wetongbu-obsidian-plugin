@@ -54,6 +54,10 @@ interface WeTongbuSettings {
   prefix: string;
   accessKeySecretId: string;
   secretKeySecretId: string;
+  storageCredentialVersion: string;
+  storageManagerDeviceName: string;
+  storageManagerIsCurrentDevice: boolean;
+  storageCredentialsUpdatedAt: string;
   rootFolder: string;
   processedTaskIds: string[];
   processedSourceUrls: string[];
@@ -93,6 +97,10 @@ function currentDeviceName() {
   if (Platform.isLinux) return "Linux";
   if (Platform.isMacOS) return "macOS";
   return "Obsidian";
+}
+
+function currentDeviceClass(): "desktop" | "mobile" {
+  return Platform.isIosApp || Platform.isAndroidApp ? "mobile" : "desktop";
 }
 type PersistedSettings = Partial<WeTongbuSettings> & {
   noteFolder?: string;
@@ -184,6 +192,10 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   prefix: "WeTongbu",
   accessKeySecretId: "",
   secretKeySecretId: "",
+  storageCredentialVersion: "",
+  storageManagerDeviceName: "",
+  storageManagerIsCurrentDevice: false,
+  storageCredentialsUpdatedAt: "",
   rootFolder: "微同步",
   processedTaskIds: [],
   processedSourceUrls: [],
@@ -412,6 +424,7 @@ export default class WeTongbuPlugin extends Plugin {
       body: JSON.stringify({
         targetName: this.app.vault.getName(),
         deviceName: currentDeviceName(),
+        device_class: currentDeviceClass(),
       }),
       throw: false,
     });
@@ -434,6 +447,7 @@ export default class WeTongbuPlugin extends Plugin {
       body: JSON.stringify({
         recovery_token: recoveryToken.trim(),
         device_name: currentDeviceName(),
+        device_class: currentDeviceClass(),
       }),
       throw: false,
     });
@@ -461,6 +475,10 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.region = storage.region ?? this.settings.region;
       this.settings.bucket = storage.bucket ?? "";
       this.settings.prefix = storage.prefix ?? "WeTongbu";
+      this.settings.storageCredentialVersion = storage.credential_version ?? storage.id ?? "";
+      this.settings.storageManagerDeviceName = storage.manager_device_name ?? "";
+      this.settings.storageManagerIsCurrentDevice = Boolean(storage.manager_is_current_device);
+      this.settings.storageCredentialsUpdatedAt = storage.storage_credentials_updated_at ?? storage.last_verified_at ?? "";
       this.storageStatus = `已恢复 · ${providerLabel(storage.provider)} · ${storage.bucket}`;
     }
     await this.saveSettings();
@@ -875,6 +893,7 @@ export default class WeTongbuPlugin extends Plugin {
         bucket: this.settings.bucket,
         prefix: this.settings.prefix,
         remote_vault_name: this.app.vault.getName(),
+        device_class: currentDeviceClass(),
         access_key_id: accessKeyId,
         secret_access_key: secretAccessKey,
       }),
@@ -894,6 +913,10 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.secretKeySecretId = secretKeySecretId;
     this.app.secretStorage.setSecret(accessKeySecretId, accessKeyId);
     this.app.secretStorage.setSecret(secretKeySecretId, secretAccessKey);
+    this.settings.storageCredentialVersion = resolved?.credential_version ?? resolved?.id ?? "";
+    this.settings.storageManagerDeviceName = resolved?.manager_device_name ?? "";
+    this.settings.storageManagerIsCurrentDevice = Boolean(resolved?.manager_is_current_device);
+    this.settings.storageCredentialsUpdatedAt = resolved?.storage_credentials_updated_at ?? resolved?.last_verified_at ?? "";
     await this.saveSettings();
     this.storageStatus = resolved?.resolution === "adopted"
       ? `已找到远程 Vault · ${resolved.target_name ?? this.settings.syncTargetName}`
@@ -947,6 +970,36 @@ export default class WeTongbuPlugin extends Plugin {
         deviceToken,
       });
       const status = await remote.getStatus();
+      if (this.accountPlanType !== "pro" && status.storage_type === "user_s3") {
+        const remoteCredentialVersion = status.storage_credential_version ?? "";
+        const localCredentialVersion = this.settings.storageCredentialVersion;
+        this.settings.storageManagerDeviceName = status.storage_manager_device_name ?? this.settings.storageManagerDeviceName;
+        this.settings.storageManagerIsCurrentDevice = Boolean(status.storage_manager_is_current_device);
+        this.settings.storageCredentialsUpdatedAt = status.storage_credentials_updated_at ?? this.settings.storageCredentialsUpdatedAt;
+        if (remoteCredentialVersion && localCredentialVersion !== remoteCredentialVersion) {
+          this.lastSafeErrorCode = "storage_credential_mismatch";
+          this.storageStatus = localCredentialVersion
+            ? `对象存储密钥已由${this.settings.storageManagerDeviceName || "主设备"}更新，请在本机填写最新密钥并测试保存`
+            : `请先在本机测试并保存对象存储密钥，再开始 Vault 同步`;
+          this.vaultSyncRetry?.clear();
+          if (!quiet) new Notice(this.storageStatus, 12000);
+          await this.saveSettings();
+          return;
+        }
+        if (!remoteCredentialVersion) {
+          this.lastSafeErrorCode = "storage_credential_unverified";
+          this.storageStatus = "请先在电脑上测试并保存对象存储密钥，再开始 Vault 同步";
+          this.vaultSyncRetry?.clear();
+          if (!quiet) new Notice(this.storageStatus, 12000);
+          await this.saveSettings();
+          return;
+        }
+        if (this.settings.storageCredentialVersion !== remoteCredentialVersion
+          || this.settings.storageCredentialsUpdatedAt !== (status.storage_credentials_updated_at ?? "")) {
+          this.settings.storageCredentialVersion = remoteCredentialVersion;
+          await this.saveSettings();
+        }
+      }
       if (status.encryption?.enabled && status.encryption.salt_hex) {
         this.settings.vaultEncryptionEnabled = true;
         this.settings.vaultEncryptionSaltHex = status.encryption.salt_hex;
@@ -1573,7 +1626,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("测试验证")
-      .setDesc(this.plugin.storageStatus || "保存上面的配置，并验证对象存储是否通畅；测试会写入、读取并删除一个临时文件")
+      .setDesc(this.plugin.storageStatus || "测试会写入、读取并删除一个临时文件；只有测试成功且与主设备密钥一致时才会保存")
       .addButton((button) =>
         button.setButtonText("测试并保存").onClick(async () => {
           try {
@@ -1588,6 +1641,18 @@ class WeTongbuSettingTab extends PluginSettingTab {
           }
         }),
       );
+
+    if (this.plugin.settings.storageProvider !== "cloudflare_r2"
+      || this.plugin.settings.bucket
+      || this.plugin.settings.storageCredentialVersion) {
+      const manager = this.plugin.settings.storageManagerDeviceName || "尚未确定（请先在电脑上测试并保存）";
+      const state = this.plugin.settings.storageCredentialVersion
+        ? (this.plugin.settings.storageManagerIsCurrentDevice ? "本机是存储管理设备" : "本机已记录当前密钥版本")
+        : "本机尚未确认当前密钥版本";
+      new Setting(containerEl)
+        .setName("多端密钥状态")
+        .setDesc(`存储管理设备：${manager}；${state}。如果其他设备更新了密钥，请先在电脑上测试并保存，再在本机填写相同密钥。`);
+    }
 
     new Setting(containerEl)
       .setName("连接 Chrome 扩展")
