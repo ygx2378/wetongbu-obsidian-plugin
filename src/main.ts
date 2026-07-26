@@ -56,6 +56,21 @@ interface WeTongbuSettings {
   accessKeySecretId: string;
   secretKeySecretId: string;
   storageCredentialVersion: string;
+  storageGeneration: number;
+  /** Last activated provider/location. Form fields may contain a pending switch. */
+  activeStorageProvider: StorageProvider;
+  activeStorageEndpoint: string;
+  activeStorageRegion: string;
+  activeStorageBucket: string;
+  activeStoragePrefix: string;
+  pendingStorageSwitchJobId: string;
+  pendingStorageProvider: StorageProvider | "";
+  pendingStorageEndpoint: string;
+  pendingStorageRegion: string;
+  pendingStorageBucket: string;
+  pendingStoragePrefix: string;
+  pendingStorageAccessKeySecretId: string;
+  pendingStorageSecretKeySecretId: string;
   storageManagerDeviceName: string;
   storageManagerIsCurrentDevice: boolean;
   storageCredentialsUpdatedAt: string;
@@ -89,7 +104,7 @@ interface WeTongbuSettings {
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
 type VaultSyncScope = "whole_vault" | "root_folder";
-type VaultFirstSyncDirection = "ask" | "remote" | "local";
+type VaultFirstSyncDirection = "ask" | "auto" | "remote" | "local";
 
 function currentDeviceName() {
   if (Platform.isIosApp) return "iOS";
@@ -194,6 +209,20 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   accessKeySecretId: "",
   secretKeySecretId: "",
   storageCredentialVersion: "",
+  storageGeneration: 1,
+  activeStorageProvider: "cloudflare_r2",
+  activeStorageEndpoint: "",
+  activeStorageRegion: "auto",
+  activeStorageBucket: "",
+  activeStoragePrefix: "WeTongbu",
+  pendingStorageSwitchJobId: "",
+  pendingStorageProvider: "",
+  pendingStorageEndpoint: "",
+  pendingStorageRegion: "",
+  pendingStorageBucket: "",
+  pendingStoragePrefix: "",
+  pendingStorageAccessKeySecretId: "",
+  pendingStorageSecretKeySecretId: "",
   storageManagerDeviceName: "",
   storageManagerIsCurrentDevice: false,
   storageCredentialsUpdatedAt: "",
@@ -207,7 +236,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   vaultSyncScope: "whole_vault",
   vaultSafetyEnabled: true,
   vaultSafetyRatio: 0.5,
-  vaultFirstSyncDirection: "ask",
+  vaultFirstSyncDirection: "auto",
   vaultDeviceTokenSecretId: "",
   vaultInstallationId: "",
   vaultDeviceId: "",
@@ -284,6 +313,7 @@ export default class WeTongbuPlugin extends Plugin {
   private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
   private vaultSafetyOverrideFingerprint = "";
   private pendingDeletionReview: SyncResult | null = null;
+  private storageSwitching = false;
   vaultEncryptionInput = "";
 
   async onload() {
@@ -296,6 +326,16 @@ export default class WeTongbuPlugin extends Plugin {
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
+    // Versions before provider-switch migrations did not keep an immutable
+    // active location. Backfill it once from the last saved form values.
+    if (!Object.prototype.hasOwnProperty.call(currentSettings, "activeStorageProvider")
+      && this.settings.storageCredentialVersion) {
+      this.settings.activeStorageProvider = this.settings.storageProvider;
+      this.settings.activeStorageEndpoint = this.settings.endpoint;
+      this.settings.activeStorageRegion = this.settings.region;
+      this.settings.activeStorageBucket = this.settings.bucket;
+      this.settings.activeStoragePrefix = this.settings.prefix;
+    }
     if (!Object.prototype.hasOwnProperty.call(currentSettings, "vaultSyncAutoEnablePending")) {
       this.settings.vaultSyncAutoEnablePending = freshInstall;
     }
@@ -313,6 +353,7 @@ export default class WeTongbuPlugin extends Plugin {
     });
     void this.refreshAccountStatus();
     void this.resumeAccountLogin().catch(() => undefined);
+    if (this.settings.pendingStorageSwitchJobId) void this.runStorageSwitch(true);
     this.registerDomEvent(window, "focus", () => {
       void this.resumeAccountLogin().catch(() => undefined);
       this.vaultSyncRetry?.wake();
@@ -865,7 +906,7 @@ export default class WeTongbuPlugin extends Plugin {
     return { notes, images };
   }
 
-  async configureUserStorage(accessKeyInput: string, secretKeyInput: string) {
+  async configureUserStorage(accessKeyInput: string, secretKeyInput: string): Promise<"verified" | "migration_pending"> {
     const accessKeyId = accessKeyInput.trim();
     const secretAccessKey = secretKeyInput;
     if (!accessKeyId || !secretAccessKey) throw new Error("请先输入 Access Key 和 Secret Key");
@@ -901,8 +942,26 @@ export default class WeTongbuPlugin extends Plugin {
       }),
       throw: false,
     });
-    if (response.status !== 200) throw new Error(response.json?.error ?? "对象存储测试失败");
+    if (response.status !== 200 && response.status !== 202) throw new Error(response.json?.error ?? "对象存储测试失败");
     const resolved = response.json?.storage;
+    if (response.status === 202 && resolved?.resolution === "migration_pending") {
+      const pendingAccessKeySecretId = `wetongbu-pending-access-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+      const pendingSecretKeySecretId = `wetongbu-pending-secret-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+      await this.app.secretStorage.setSecret(pendingAccessKeySecretId, accessKeyId);
+      await this.app.secretStorage.setSecret(pendingSecretKeySecretId, secretAccessKey);
+      this.settings.pendingStorageSwitchJobId = resolved.switch_job_id;
+      this.settings.pendingStorageProvider = this.settings.storageProvider;
+      this.settings.pendingStorageEndpoint = this.settings.endpoint;
+      this.settings.pendingStorageRegion = this.settings.region;
+      this.settings.pendingStorageBucket = this.settings.bucket;
+      this.settings.pendingStoragePrefix = this.settings.prefix;
+      this.settings.pendingStorageAccessKeySecretId = pendingAccessKeySecretId;
+      this.settings.pendingStorageSecretKeySecretId = pendingSecretKeySecretId;
+      await this.saveSettings();
+      this.storageStatus = "对象存储已验证，正在迁移 Vault 内容；迁移完成前不会切换活动存储";
+      await this.runStorageSwitch(false);
+      return "migration_pending";
+    }
     if (resolved?.target_id && resolved.target_id !== this.settings.syncTargetId) {
       await this.adoptVaultTarget(
         resolved.user_id ?? this.settings.userId,
@@ -916,6 +975,12 @@ export default class WeTongbuPlugin extends Plugin {
     this.app.secretStorage.setSecret(accessKeySecretId, accessKeyId);
     this.app.secretStorage.setSecret(secretKeySecretId, secretAccessKey);
     this.settings.storageCredentialVersion = resolved?.credential_version ?? resolved?.id ?? "";
+    this.settings.storageGeneration = Number(resolved?.storage_generation ?? this.settings.storageGeneration ?? 1);
+    this.settings.activeStorageProvider = this.settings.storageProvider;
+    this.settings.activeStorageEndpoint = this.settings.endpoint;
+    this.settings.activeStorageRegion = this.settings.region;
+    this.settings.activeStorageBucket = this.settings.bucket;
+    this.settings.activeStoragePrefix = this.settings.prefix;
     this.settings.storageManagerDeviceName = resolved?.manager_device_name ?? "";
     this.settings.storageManagerIsCurrentDevice = Boolean(resolved?.manager_is_current_device);
     this.settings.storageCredentialsUpdatedAt = resolved?.storage_credentials_updated_at ?? resolved?.last_verified_at ?? "";
@@ -924,6 +989,201 @@ export default class WeTongbuPlugin extends Plugin {
       ? `已找到远程 Vault · ${resolved.target_name ?? this.settings.syncTargetName}`
       : `连接正常 · ${providerLabel(resolved?.provider ?? this.settings.storageProvider)} · ${resolved?.bucket ?? this.settings.bucket}`;
     await this.maybeEnableVaultSyncAfterSetup(true);
+    return "verified";
+  }
+
+  /** Copy the content-addressed Vault blocks before activating a new Free
+   * provider. Browser tasks keep using their snapshotted old config until the
+   * server-side completion call atomically changes the active config. */
+  async runStorageSwitch(quiet = false) {
+    if (this.storageSwitching || !this.settings.pendingStorageSwitchJobId) return;
+    this.storageSwitching = true;
+    const jobId = this.settings.pendingStorageSwitchJobId;
+    let completionAttempted = false;
+    try {
+      const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+      if (!pluginToken) throw new Error("Vault 连接已失效，请重新连接后重试对象存储切换");
+      const activeProvider = this.settings.activeStorageProvider || this.settings.storageProvider;
+      const activeEndpoint = this.settings.activeStorageEndpoint || this.settings.endpoint;
+      const activeRegion = this.settings.activeStorageRegion || this.settings.region;
+      const activeBucket = this.settings.activeStorageBucket || this.settings.bucket;
+      const activePrefix = this.settings.activeStoragePrefix || this.settings.prefix;
+      const activeAccess = await this.app.secretStorage.getSecret(this.settings.accessKeySecretId || "wetongbu-storage-access-key-id");
+      const activeSecret = await this.app.secretStorage.getSecret(this.settings.secretKeySecretId || "wetongbu-storage-secret-access-key");
+      const pendingAccess = await this.app.secretStorage.getSecret(this.settings.pendingStorageAccessKeySecretId);
+      const pendingSecret = await this.app.secretStorage.getSecret(this.settings.pendingStorageSecretKeySecretId);
+      if (!activeAccess || !activeSecret || !pendingAccess || !pendingSecret) {
+        throw new Error("对象存储切换凭证不完整，请重新在电脑上测试并保存");
+      }
+      const createStorage = (provider: StorageProvider, endpoint: string, region: string, bucket: string, prefix: string, accessKeyId: string, secretAccessKey: string) => {
+        const s3cfg = deriveS3Config(provider, endpoint, region, bucket, prefix);
+        let storage: VaultSyncStorage = createFreeS3Storage({
+          endpoint: s3cfg.endpoint, region: s3cfg.region, bucket, prefix,
+          accessKeyId, secretAccessKey, forcePathStyle: s3cfg.forcePathStyle,
+          targetId: this.settings.syncTargetId, verifyHash: !this.settings.vaultEncryptionEnabled,
+        });
+        return storage;
+      };
+      let sourceStorage = createStorage(activeProvider, activeEndpoint, activeRegion, activeBucket, activePrefix, activeAccess, activeSecret);
+      let targetStorage = createStorage(
+        this.settings.pendingStorageProvider as StorageProvider,
+        this.settings.pendingStorageEndpoint,
+        this.settings.pendingStorageRegion,
+        this.settings.pendingStorageBucket,
+        this.settings.pendingStoragePrefix,
+        pendingAccess,
+        pendingSecret,
+      );
+      if (this.settings.vaultEncryptionEnabled) {
+        const passphrase = this.settings.vaultEncryptionSecretId
+          ? await this.app.secretStorage.getSecret(this.settings.vaultEncryptionSecretId)
+          : "";
+        if (!passphrase) throw new Error("缺少 Vault 加密密码，无法迁移加密内容");
+        const vaultCrypto = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex);
+        sourceStorage = createEncryptedVaultStorage(sourceStorage, vaultCrypto);
+        targetStorage = createEncryptedVaultStorage(targetStorage, vaultCrypto);
+      }
+
+      let copied = 0;
+      const hashes = new Set<string>();
+      const verifiedHashes = new Set<string>();
+      let switchRemote: VaultSyncRemoteClient | undefined;
+      if (this.settings.vaultSyncEnabled) {
+        let deviceToken = this.vaultDeviceTokenCache
+          || (this.settings.vaultDeviceTokenSecretId
+            ? (await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) ?? "")
+            : "");
+        const registerRemote = new VaultSyncRemoteClient({
+          apiBaseUrl: this.settings.apiBaseUrl,
+          targetId: this.settings.syncTargetId,
+          pluginToken,
+          deviceToken,
+        });
+        if (!deviceToken) {
+          const reg = await registerRemote.registerDevice(currentDeviceName(), this.settings.vaultInstallationId);
+          deviceToken = reg.token;
+          const secretId = `wetongbu-vault-device-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+          await this.app.secretStorage.setSecret(secretId, deviceToken);
+          this.settings.vaultDeviceTokenSecretId = secretId;
+          this.settings.vaultDeviceId = reg.deviceId;
+          this.vaultDeviceTokenCache = deviceToken;
+          await this.saveSettings();
+        }
+        const remote = new VaultSyncRemoteClient({
+          apiBaseUrl: this.settings.apiBaseUrl,
+          targetId: this.settings.syncTargetId,
+          pluginToken,
+          deviceToken,
+        });
+        let switchStatus: Awaited<ReturnType<VaultSyncRemoteClient["getStorageSwitchStatus"]>> | null = null;
+        try {
+          switchStatus = await remote.getStorageSwitchStatus(jobId);
+        } catch {
+          // Older servers did not expose itemized migration status. The
+          // manifest fallback is safe because commits are blocked while the
+          // storage switch is in progress.
+        }
+        if (switchStatus?.storage?.items) {
+          for (const item of switchStatus.storage.items) {
+            if (item.status === "verified") verifiedHashes.add(item.contentHash);
+            if (item.status !== "verified") hashes.add(item.contentHash);
+          }
+          copied = verifiedHashes.size;
+        } else {
+          let cursor = 0;
+          for (;;) {
+            const page = await remote.getManifest(cursor);
+            for (const item of page.items) if (!item.isDeleted && item.contentHash) hashes.add(item.contentHash);
+            const next = Number(page.nextCursor ?? page.maxRevision ?? cursor);
+            if (!page.hasMore || next <= cursor) break;
+            cursor = next;
+          }
+        }
+        switchRemote = remote;
+      }
+      for (const hash of hashes) {
+        const body = await sourceStorage.get(hash);
+        await targetStorage.put(hash, body);
+        // Read-back verifies the candidate credentials, endpoint and object
+        // bytes before the server promotes the pending configuration.
+        await targetStorage.get(hash);
+        copied += 1;
+        if (switchRemote) await switchRemote.markStorageSwitchProgress(jobId, hash);
+      }
+      completionAttempted = true;
+      const complete = await requestUrl({
+        url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/storage/switch/complete`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${pluginToken}` },
+        contentType: "application/json",
+        body: JSON.stringify({ switch_job_id: jobId, copied_objects: copied, total_objects: hashes.size }),
+        throw: false,
+      });
+      if (complete.status !== 200) throw new Error(complete.json?.error ?? "对象存储切换提交失败");
+      this.settings.activeStorageProvider = this.settings.pendingStorageProvider as StorageProvider;
+      this.settings.activeStorageEndpoint = this.settings.pendingStorageEndpoint;
+      this.settings.activeStorageRegion = this.settings.pendingStorageRegion;
+      this.settings.activeStorageBucket = this.settings.pendingStorageBucket;
+      this.settings.activeStoragePrefix = this.settings.pendingStoragePrefix;
+      this.settings.storageProvider = this.settings.activeStorageProvider;
+      this.settings.endpoint = this.settings.activeStorageEndpoint;
+      this.settings.region = this.settings.activeStorageRegion;
+      this.settings.bucket = this.settings.activeStorageBucket;
+      this.settings.prefix = this.settings.activeStoragePrefix;
+      this.settings.accessKeySecretId = this.settings.pendingStorageAccessKeySecretId;
+      this.settings.secretKeySecretId = this.settings.pendingStorageSecretKeySecretId;
+      this.settings.storageCredentialVersion = complete.json?.storage?.storageConfigId ?? this.settings.storageCredentialVersion;
+      this.settings.storageGeneration = Number(complete.json?.storage?.storageGeneration ?? this.settings.storageGeneration ?? 1);
+      this.settings.pendingStorageSwitchJobId = "";
+      this.settings.pendingStorageProvider = "";
+      this.settings.pendingStorageEndpoint = "";
+      this.settings.pendingStorageRegion = "";
+      this.settings.pendingStorageBucket = "";
+      this.settings.pendingStoragePrefix = "";
+      this.settings.pendingStorageAccessKeySecretId = "";
+      this.settings.pendingStorageSecretKeySecretId = "";
+      await this.saveSettings();
+      this.storageStatus = `对象存储切换完成 · 已迁移 ${copied} 个内容块`;
+      if (!quiet) new Notice(this.storageStatus, 10000);
+    } catch (error) {
+      let pluginToken = "";
+      let failureRecorded = false;
+      try { pluginToken = (await this.app.secretStorage.getSecret(this.pluginTokenSecretId())) ?? ""; } catch { /* report below */ }
+      if (pluginToken && !completionAttempted) {
+        const failureResponse = await requestUrl({
+          url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/storage/switch/fail`,
+          method: "POST",
+          headers: { Authorization: `Bearer ${pluginToken}` },
+          contentType: "application/json",
+          body: JSON.stringify({
+            switch_job_id: jobId,
+            error_code: "migration_failed",
+            error_message: error instanceof Error ? error.message.slice(0, 160) : "对象存储迁移失败",
+          }),
+          throw: false,
+        }).catch(() => null);
+        failureRecorded = failureResponse?.status === 200;
+      }
+      this.storageStatus = `对象存储切换失败：${error instanceof Error ? error.message : String(error)}`;
+      if (failureRecorded) {
+        // The server marks this candidate invalid. Keep the form values visible
+        // for correction, but do not retry a failed job on every plugin start.
+        this.settings.pendingStorageSwitchJobId = "";
+        this.settings.pendingStorageProvider = "";
+        this.settings.pendingStorageEndpoint = "";
+        this.settings.pendingStorageRegion = "";
+        this.settings.pendingStorageBucket = "";
+        this.settings.pendingStoragePrefix = "";
+        this.settings.pendingStorageAccessKeySecretId = "";
+        this.settings.pendingStorageSecretKeySecretId = "";
+        await this.saveSettings();
+      } else {
+        this.storageStatus += "；未能记录失败状态，请保持此 Vault 连接后重试";
+      }
+      if (!quiet) new Notice(this.storageStatus, 12000);
+    } finally {
+      this.storageSwitching = false;
+    }
   }
 
   /**
@@ -972,8 +1232,15 @@ export default class WeTongbuPlugin extends Plugin {
         deviceToken,
       });
       const status = await remote.getStatus();
+      if (status.storage_switch_state && status.storage_switch_state !== "active") {
+        this.storageStatus = "对象存储正在切换，Vault 同步已暂停；请等待存储管理电脑完成迁移";
+        this.vaultSyncRetry?.clear();
+        if (!quiet) new Notice(this.storageStatus, 10000);
+        return;
+      }
       if (this.accountPlanType !== "pro" && status.storage_type === "user_s3") {
         const remoteCredentialVersion = status.storage_credential_version ?? "";
+        const remoteStorageGeneration = Number(status.storage_generation ?? this.settings.storageGeneration ?? 1);
         const localCredentialVersion = this.settings.storageCredentialVersion;
         this.settings.storageManagerDeviceName = status.storage_manager_device_name ?? this.settings.storageManagerDeviceName;
         this.settings.storageManagerIsCurrentDevice = Boolean(status.storage_manager_is_current_device);
@@ -983,6 +1250,14 @@ export default class WeTongbuPlugin extends Plugin {
           this.storageStatus = localCredentialVersion
             ? `对象存储密钥已由${this.settings.storageManagerDeviceName || "主设备"}更新，请在本机填写最新密钥并测试保存`
             : `请先在本机测试并保存对象存储密钥，再开始 Vault 同步`;
+          this.vaultSyncRetry?.clear();
+          if (!quiet) new Notice(this.storageStatus, 12000);
+          await this.saveSettings();
+          return;
+        }
+        if (this.settings.storageGeneration && remoteStorageGeneration !== this.settings.storageGeneration) {
+          this.lastSafeErrorCode = "storage_generation_changed";
+          this.storageStatus = `对象存储已切换到新版本（第 ${remoteStorageGeneration} 代），请在本机填写新配置并测试保存`;
           this.vaultSyncRetry?.clear();
           if (!quiet) new Notice(this.storageStatus, 12000);
           await this.saveSettings();
@@ -999,6 +1274,7 @@ export default class WeTongbuPlugin extends Plugin {
         if (this.settings.storageCredentialVersion !== remoteCredentialVersion
           || this.settings.storageCredentialsUpdatedAt !== (status.storage_credentials_updated_at ?? "")) {
           this.settings.storageCredentialVersion = remoteCredentialVersion;
+          this.settings.storageGeneration = remoteStorageGeneration;
           await this.saveSettings();
         }
       }
@@ -1014,7 +1290,7 @@ export default class WeTongbuPlugin extends Plugin {
         storage = createProHostedStorage({
           prepareUpload: async (hash, byteSize) => {
             const r = await remote.prepareUpload(hash, byteSize);
-            return { uploadUrl: r.upload_url ?? null, deduped: !!r.deduped };
+            return { uploadUrl: r.upload_url ?? null, uploadId: r.upload_id ?? null, deduped: !!r.deduped };
           },
           prepareDownload: async (hash) => {
             const r = await remote.prepareDownload(hash);
@@ -1033,14 +1309,17 @@ export default class WeTongbuPlugin extends Plugin {
           throw new Error("缺少对象存储凭证，请先在插件设置中验证并保存存储配置");
         }
         const s3cfg = deriveS3Config(
-          this.settings.storageProvider, this.settings.endpoint, this.settings.region,
-          this.settings.bucket, this.settings.prefix,
+          this.settings.activeStorageProvider || this.settings.storageProvider,
+          this.settings.activeStorageEndpoint || this.settings.endpoint,
+          this.settings.activeStorageRegion || this.settings.region,
+          this.settings.activeStorageBucket || this.settings.bucket,
+          this.settings.activeStoragePrefix || this.settings.prefix,
         );
         storage = createFreeS3Storage({
           endpoint: s3cfg.endpoint,
           region: s3cfg.region,
-          bucket: this.settings.bucket,
-          prefix: this.settings.prefix,
+          bucket: this.settings.activeStorageBucket || this.settings.bucket,
+          prefix: this.settings.activeStoragePrefix || this.settings.prefix,
           accessKeyId: accessKey,
           secretAccessKey: secretKey,
           forcePathStyle: s3cfg.forcePathStyle,
@@ -1067,9 +1346,11 @@ export default class WeTongbuPlugin extends Plugin {
         store,
         deviceId: this.settings.vaultDeviceId || this.settings.vaultInstallationId,
         rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
-        bootstrapDirection: this.settings.vaultFirstSyncDirection === "ask"
+        bootstrapDirection: this.settings.vaultFirstSyncDirection === "ask" || this.settings.vaultFirstSyncDirection === "auto"
           ? undefined
           : this.settings.vaultFirstSyncDirection,
+        bootstrapMode: this.settings.vaultFirstSyncDirection === "auto" ? "auto" : "manual",
+        isStorageManagerDevice: this.settings.storageManagerIsCurrentDevice,
         notify: quiet ? undefined : (msg) => new Notice(msg, 10000),
         safetyEnabled: this.settings.vaultSafetyEnabled,
         safetyRatio: this.settings.vaultSafetyRatio,
@@ -1731,12 +2012,14 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("测试并保存").onClick(async () => {
           try {
-            await this.plugin.configureUserStorage(
+            const result = await this.plugin.configureUserStorage(
               this.accessKeyInput ?? "",
               this.secretKeyInput ?? "",
             );
             this.display();
-            new Notice("对象存储测试成功，配置已保存", 8000);
+            new Notice(result === "migration_pending"
+              ? "对象存储测试成功，正在迁移 Vault 内容；完成前继续使用原存储"
+              : "对象存储测试成功，配置已保存", 8000);
           } catch (error) {
             this.display();
             new Notice(`对象存储测试失败：${error instanceof Error ? error.message : String(error)}`, 10000);
@@ -1852,9 +2135,10 @@ class WeTongbuSettingTab extends PluginSettingTab {
 
       new Setting(containerEl)
         .setName("首次同步方向")
-        .setDesc("仅在此设备第一次同步且本机已有文件时生效。选择从电脑下载到本机，或从本机上传到电脑；已有同步基线后不再使用。")
+        .setDesc("仅在此设备第一次同步时生效。推荐自动判断：电脑先建立空云端基线，新设备与云端非破坏性合并；已有同步基线后不再使用。")
         .addDropdown((dropdown) =>
           dropdown
+            .addOption("auto", "自动判断（推荐）")
             .addOption("ask", "首次遇到时提醒我")
             .addOption("remote", "从电脑/云端下载到本机")
             .addOption("local", "从本机上传到电脑/云端")
