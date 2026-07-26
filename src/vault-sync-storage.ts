@@ -18,13 +18,19 @@ export { deriveS3Config } from "./vault-sync-storage-config";
 
 export interface VaultSyncStorage {
   /** 写入内容（按 hash 寻址）。上传 Pro 需先 prepare。 */
-  put(hash: string, body: Uint8Array, plaintextByteSize?: number): Promise<void>;
+  put(hash: string, body: Uint8Array, plaintextByteSize?: number): Promise<UploadReceipt | void>;
   /** 读取内容（按 hash 寻址）。 */
   get(hash: string): Promise<Uint8Array>;
   /** 删除（按 hash）。幂等。 */
   delete(hash: string): Promise<void>;
   /** 连通性探针。 */
   probe?(): Promise<void>;
+}
+
+export interface UploadReceipt {
+  uploadId?: string;
+  /** 实际写入对象存储的字节数；加密 Vault 与明文 revision 大小可能不同。 */
+  storageByteSize?: number;
 }
 
 // ---- Free：直连用户 S3，手写 SigV4 ----
@@ -132,7 +138,7 @@ export function createFreeS3Storage(config: FreeStorageConfig, request: typeof r
 
 export interface ProStorageConfig {
   /** 由调用方注入的 prepare/download 客户端（通常是 VaultSyncRemoteClient）。 */
-  prepareUpload(hash: string, byteSize: number): Promise<{ uploadUrl: string | null; deduped: boolean }>;
+  prepareUpload(hash: string, byteSize: number): Promise<{ uploadUrl: string | null; uploadId?: string | null; deduped: boolean }>;
   prepareDownload(hash: string): Promise<{ downloadUrl: string | null }>;
   verifyHash?: boolean;
 }
@@ -140,7 +146,7 @@ export interface ProStorageConfig {
 export function createProHostedStorage(remote: ProStorageConfig): VaultSyncStorage {
   return {
     async put(hash, body, plaintextByteSize = body.byteLength) {
-      const prep = await remote.prepareUpload(hash, plaintextByteSize);
+      const prep = await remote.prepareUpload(hash, body.byteLength);
       if (prep.deduped) return; // 服务端已有同 hash 块，无需重复上传。
       if (!prep.uploadUrl) throw new Error("Pro 上传未获得预签名 URL");
       // 直接 PUT 到预签名 URL（S3 预签名 URL 已含签名，不要再加 Authorization 头）。
@@ -150,7 +156,7 @@ export function createProHostedStorage(remote: ProStorageConfig): VaultSyncStora
         body: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer,
         throw: false,
       });
-      if (resp.status >= 200 && resp.status < 300) return;
+      if (resp.status >= 200 && resp.status < 300) return { uploadId: prep.uploadId ?? undefined, storageByteSize: body.byteLength };
       throw new Error(`Pro 上传失败：HTTP ${resp.status}`);
     },
     async get(hash) {
@@ -179,7 +185,8 @@ export function createProHostedStorage(remote: ProStorageConfig): VaultSyncStora
 export function createEncryptedVaultStorage(base: VaultSyncStorage, crypto: VaultSyncCrypto): VaultSyncStorage {
   return {
     async put(hash, body) {
-      await base.put(hash, await crypto.encrypt(hash, body), body.byteLength);
+      const encrypted = await crypto.encrypt(hash, body);
+      return base.put(hash, encrypted, encrypted.byteLength);
     },
     async get(hash) {
       return crypto.decrypt(hash, await base.get(hash));

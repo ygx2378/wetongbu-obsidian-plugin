@@ -46,6 +46,8 @@ export interface VaultSyncStatus {
   quota_bytes: number;
   used_bytes: number;
   storage_credential_version?: string | null;
+  storage_generation?: number | null;
+  storage_switch_state?: "active" | "migrating" | string | null;
   storage_manager_device_name?: string | null;
   storage_credentials_updated_at?: string | null;
   storage_manager_is_current_device?: boolean;
@@ -145,7 +147,7 @@ export class VaultSyncRemoteClient {
     });
   }
 
-  async commit(commits: Array<{ path: string; contentHash?: string | null; byteSize: number; mtimeMs: number; isDeleted?: boolean; expectedRevision?: number }>): Promise<{ results: CommitResult[] }> {
+  async commit(commits: Array<{ path: string; contentHash?: string | null; byteSize: number; storageByteSize?: number; uploadId?: string; mtimeMs: number; isDeleted?: boolean; expectedRevision?: number }>): Promise<{ results: CommitResult[] }> {
     // 服务端会再 normalize 一次，这里先做一遍确保 key 一致。
     const normalized = commits.map((c) => ({ ...c, path: normalizeVaultPath(c.path) ?? c.path }));
     return this.request(`/api/sync-targets/${this.targetId}/vault/files/commit`, {
@@ -158,7 +160,7 @@ export class VaultSyncRemoteClient {
    * Free 返回 { uploadUrl: null }（插件直连自有 bucket）。
    * deduped=true 表示服务端已有同 hash 块，无需上传。
    */
-  async prepareUpload(contentHash: string, byteSize: number): Promise<{ storage_type: string; upload_url: string | null; deduped: boolean }> {
+  async prepareUpload(contentHash: string, byteSize: number): Promise<{ storage_type: string; upload_url: string | null; upload_id?: string | null; upload_expires_at?: string | null; deduped: boolean }> {
     return this.request(`/api/sync-targets/${this.targetId}/vault/files/prepare`, {
       method: "POST", token: "device",
       body: { content_hash: contentHash, byte_size: byteSize },
@@ -172,6 +174,18 @@ export class VaultSyncRemoteClient {
   async prepareDownload(contentHash: string): Promise<{ storage_type: string; download_url: string | null; byte_size?: number }> {
     return this.request(`/api/sync-targets/${this.targetId}/vault/files/${contentHash}`, {
       method: "GET", token: "device",
+    });
+  }
+
+  async getStorageSwitchStatus(jobId: string): Promise<{ storage: { items: Array<{ contentHash: string; status: string }>; expectedObjects: number; verifiedObjects: number } }> {
+    return this.request("/api/plugin/storage/switch/status", {
+      method: "GET", token: "plugin", query: { switch_job_id: jobId },
+    });
+  }
+
+  async markStorageSwitchProgress(jobId: string, contentHash: string): Promise<void> {
+    await this.request("/api/plugin/storage/switch/progress", {
+      method: "POST", token: "plugin", body: { switch_job_id: jobId, content_hash: contentHash },
     });
   }
 }

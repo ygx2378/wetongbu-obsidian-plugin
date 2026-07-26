@@ -65,6 +65,10 @@ export interface VaultSyncOrchestratorDeps {
   rootFolder?: string | undefined;
   /** 首次双侧都有内容时的明确方向；未提供则安全暂停等待用户选择。 */
   bootstrapDirection?: "remote" | "local";
+  /** 自动首次同步：电脑仅负责建立空云端基线，之后两端平等双向同步。 */
+  bootstrapMode?: "auto" | "manual";
+  /** 当前设备是否是用户指定的存储管理电脑。 */
+  isStorageManagerDevice?: boolean;
   /** 是否在 UI 弹 Notice。后台静默同步传 false。 */
   notify?: (msg: string) => void;
   /** 大比例变更保护；默认启用并使用 50%。 */
@@ -108,6 +112,8 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
   const { app, storage, remote, store, deviceId } = deps;
   const rootFolder = deps.rootFolder;
   const bootstrapDirection = deps.bootstrapDirection;
+  const bootstrapMode = deps.bootstrapMode ?? "manual";
+  const isStorageManagerDevice = deps.isStorageManagerDevice === true;
   const notify = deps.notify ?? DEFAULT_NOTIFY;
 
   async function runOnce(): Promise<SyncResult> {
@@ -172,11 +178,23 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
     // 4. diff。首次双侧都有内容时，用用户明确选择的一侧作为基线：
     // remote 表示把电脑端内容下载到本机，local 表示把本机内容上传到远端。
-    const bootstrapBaseline = isBootstrap && bootstrapDirection === "remote"
-      ? localIndex
-      : isBootstrap && bootstrapDirection === "local"
-        ? remoteMap
-        : prevMap;
+    const remoteHasLiveFiles = [...remoteMap.values()].some((entry) => !entry.isDeleted);
+    const localHasFiles = localIndex.size > 0;
+    const autoBootstrap = isBootstrap && bootstrapMode === "auto";
+    if (autoBootstrap && !isStorageManagerDevice && !remoteHasLiveFiles && localHasFiles) {
+      notify("首次同步已暂停：请先在存储管理电脑完成一次同步，建立 Vault 基线后再连接此设备。为避免误删，本机内容暂不上传。");
+      return { ...result, aborted: true, needsBootstrapDecision: true };
+    }
+    // With no baseline, an automatic merge uses an empty base. Local-only and
+    // remote-only files are preserved; same-path differences become conflict
+    // copies instead of silently overwriting either side.
+    const bootstrapBaseline = autoBootstrap
+      ? new Map<string, FileEntity>()
+      : isBootstrap && bootstrapDirection === "remote"
+        ? localIndex
+        : isBootstrap && bootstrapDirection === "local"
+          ? remoteMap
+          : prevMap;
     const plan = planSync(localIndex, remoteMap, bootstrapBaseline);
     const deletionFingerprint = deletionPlanFingerprint(plan);
     const deletionItems = pendingDeletions(plan);
@@ -185,7 +203,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     // 5. 安全阀。首次同步只有一侧有内容时可安全建立基线；两侧同时
     // 有内容而没有 prevSync 时，无法判断覆盖方向，必须先让用户确认。
     const oneSidedBootstrap = isBootstrap && (localIndex.size === 0 || remoteMap.size === 0);
-    if (isBootstrap && shouldAbortForBootstrap(localIndex.size, remoteMap.size, plan)
+    if (isBootstrap && !autoBootstrap && shouldAbortForBootstrap(localIndex.size, remoteMap.size, plan)
       && !bootstrapDirection) {
       notify("首次同步发现本机和电脑端都有内容，请在设置中选择“从电脑同步到本机”或“从本机上传到电脑”后重试。\n选择会决定首次同步方向，不会自动覆盖内容。");
       return { ...result, aborted: true, needsBootstrapDecision: true };
@@ -292,9 +310,10 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const body = await app.vault.readBinary(fileByPath(app, path));
       const bytes = new Uint8Array(body);
       const hash = await computeHash(bytes);
-      await storage.put(hash, bytes);
+      const upload = await storage.put(hash, bytes);
       const resp = await remote.commit([{
-        path, contentHash: hash, byteSize: bytes.byteLength, mtimeMs: local.mtimeMs,
+        path, contentHash: hash, byteSize: bytes.byteLength, storageByteSize: upload?.storageByteSize,
+        uploadId: upload?.uploadId, mtimeMs: local.mtimeMs,
         expectedRevision: op.prev?.revision,
       }]);
       const r = resp.results[0];
@@ -352,11 +371,13 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         const body = await app.vault.readBinary(fileByPath(app, path));
         const bytes = new Uint8Array(body);
         const hash = await computeHash(bytes);
-        await storage.put(hash, bytes);
+        const upload = await storage.put(hash, bytes);
         const resp = await remote.commit([{
           path,
           contentHash: hash,
           byteSize: bytes.byteLength,
+          storageByteSize: upload?.storageByteSize,
+          uploadId: upload?.uploadId,
           mtimeMs: local.mtimeMs,
           isDeleted: false,
           expectedRevision: op.remote?.revision,
@@ -398,9 +419,10 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const localBytes = new Uint8Array(localBody);
       const localHash = await computeHash(localBytes);
       // 上传冲突副本到 storage（按 hash 寻址，新 path 指向同 hash）+ commit 为新文件。
-      await storage.put(localHash, localBytes);
+      const upload = await storage.put(localHash, localBytes);
       await remote.commit([{
-        path: conflictPath, contentHash: localHash, byteSize: localBytes.byteLength, mtimeMs: local.mtimeMs,
+        path: conflictPath, contentHash: localHash, byteSize: localBytes.byteLength,
+        storageByteSize: upload?.storageByteSize, uploadId: upload?.uploadId, mtimeMs: local.mtimeMs,
       }]);
     }
     if (remoteEnt) {
