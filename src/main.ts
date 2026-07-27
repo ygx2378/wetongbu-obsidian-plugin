@@ -142,13 +142,13 @@ const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
 const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9] as const;
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <path d="M23 36a10 10 0 0 1 10-10h27l12 12v46a10 10 0 0 1-10 10H33a10 10 0 0 1-10-10z" fill="currentColor" opacity=".18"/>
-  <path d="M60 26v15a7 7 0 0 0 7 7h15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="5" opacity=".72"/>
-  <path d="M34 59h25M34 70h25M34 81h17" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="5"/>
-  <path d="M51 35a28 28 0 0 1 38 8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="8"/>
-  <path d="m87 33 8 10-13 1" fill="currentColor"/>
-  <path d="M77 93a28 28 0 0 1-38-8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="8" opacity=".72"/>
-  <path d="m41 95-8-10 13-1" fill="currentColor" opacity=".72"/>
+  <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="10" y="10" width="108" height="108" rx="30" stroke-width="10"/>
+    <path d="M64 57 43 94 28 42" stroke-width="12"/>
+    <path d="M64 57 85 94 100 42" stroke-width="12"/>
+  </g>
+  <path d="M19 25 42 31 25 47Z" fill="currentColor"/>
+  <path d="M109 25 86 31 103 47Z" fill="currentColor"/>
 </svg>`;
 
 function normalizeArticleSyncInterval(value: unknown) {
