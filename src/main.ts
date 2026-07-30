@@ -1594,7 +1594,9 @@ export default class WeTongbuPlugin extends Plugin {
       const imageLinks = item.image_delivery_mode === "hosted_link"
         ? await this.publishHostedImages(base, token, item.task_id)
         : {};
-      const written = await this.writeTask(task, imageLinks);
+      const written = task.manifest.operation === "complete_capture"
+        ? await this.completeCaptureTask(task)
+        : await this.writeTask(task, imageLinks);
       await this.captureHandoffs.save({
         version: 1,
         taskId: item.task_id,
@@ -1702,6 +1704,8 @@ export default class WeTongbuPlugin extends Plugin {
         title: manifest.title,
         sourceUrl: manifest.source_url,
         capturedAt: manifest.created_at,
+        operation: manifest.operation ?? "create_new",
+        captureId: manifest.capture_id ?? null,
       },
         markdown: new TextDecoder().decode(files.get(manifest.entry_file)!),
       assets: manifest.files
@@ -1729,6 +1733,99 @@ export default class WeTongbuPlugin extends Plugin {
       if (!this.app.vault.getAbstractFileByPath(target)) {
         await this.app.vault.create(target, content);
       }
+    }
+  }
+
+  private async completeCaptureTask(task: any) {
+    const captureId = task.manifest.captureId;
+    if (typeof captureId !== "string" || !captureId) throw new Error("补全任务缺少 capture_id");
+    const capturePattern = new RegExp(`^wetongbu_capture_id:\\s*["']?${captureId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(["']?)\\s*$`, "im");
+    const matched: TFile[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const content = await this.app.vault.cachedRead(file);
+      if (capturePattern.test(content)) matched.push(file);
+    }
+    if (matched.length !== 1) {
+      const fallback = await this.writeTask(task, {});
+      new Notice(matched.length === 0
+        ? "原笔记已找不到，已新建完整笔记"
+        : "原笔记标识不唯一，已新建完整笔记，未覆盖原文件", 8000);
+      return fallback;
+    }
+    const note = matched[0];
+    const original = await this.app.vault.adapter.read(note.path);
+    const start = "<!-- wetongbu:generated:start -->";
+    const end = "<!-- wetongbu:generated:end -->";
+    const incomingBody = task.markdown.replace(/^---\n[\s\S]*?\n---\n\n?/, "").trim();
+    if (!original.includes(start) || !original.includes(end)) {
+      const fallback = await this.writeTask(task, {});
+      new Notice("原笔记没有可安全更新的微同步区块，已新建完整笔记", 8000);
+      return fallback;
+    }
+    const layout = buildVaultPaths({
+      rootFolder: normalizePath(this.settings.rootFolder),
+      title: task.manifest.title,
+      capturedAt: task.manifest.capturedAt,
+      taskId: task.manifest.taskId,
+      assets: task.assets,
+    });
+    const noteFolder = normalizePath(note.parent?.path || layout.noteFolder);
+    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    let body = incomingBody;
+    const localAssets: Array<{ asset: any; targetPath: string }> = [];
+    for (const [index, asset] of task.assets.entries()) {
+      const filename = layout.assetNames[index];
+      const targetPath = normalizePath(`${attachmentFolder}/${filename}`);
+      const relativePath = relativeVaultPath(noteFolder, targetPath);
+      body = body.split(`<${asset.relativePath}>`).join(relativePath).split(asset.relativePath).join(relativePath);
+      localAssets.push({ asset, targetPath });
+    }
+    if (localAssets.length) await ensureFolder(this, attachmentFolder);
+    const createdAssets: string[] = [];
+    try {
+      for (const { asset, targetPath } of localAssets) {
+        if (!(await this.app.vault.adapter.exists(targetPath))) createdAssets.push(targetPath);
+        await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
+        const stat = await this.app.vault.adapter.stat(targetPath);
+        if (!stat || stat.type !== "file" || stat.size !== asset.body.length) throw new Error(`附件写入校验失败：${targetPath}`);
+      }
+      const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const updated = original.replace(
+        new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`),
+        `${start}\n${body}\n${end}`,
+      );
+      const temporary = `${note.path}.wetongbu-complete-${task.manifest.taskId}.tmp`;
+      await this.app.vault.adapter.write(temporary, updated);
+      if ((await this.app.vault.adapter.read(temporary)) !== updated) throw new Error("原笔记写入校验失败");
+      const backup = `${note.path}.wetongbu-complete-${task.manifest.taskId}.bak`;
+      let backupMoved = false;
+      try {
+        await this.app.vault.adapter.rename(note.path, backup);
+        backupMoved = true;
+        await this.app.vault.adapter.rename(temporary, note.path);
+        const persisted = await this.app.vault.adapter.read(note.path);
+        if (persisted !== updated) throw new Error("原笔记更新校验失败");
+        await this.app.vault.adapter.remove(backup);
+      } catch (error) {
+        if (backupMoved && await this.app.vault.adapter.exists(note.path)) await this.app.vault.adapter.remove(note.path).catch(() => {});
+        if (backupMoved && await this.app.vault.adapter.exists(backup)) await this.app.vault.adapter.rename(backup, note.path).catch(() => {});
+        throw error;
+      } finally {
+        if (await this.app.vault.adapter.exists(temporary)) await this.app.vault.adapter.remove(temporary).catch(() => {});
+        if (await this.app.vault.adapter.exists(backup)) await this.app.vault.adapter.remove(backup).catch(() => {});
+      }
+      const persisted = await this.app.vault.adapter.read(note.path);
+      const encoded = new TextEncoder().encode(persisted);
+      const files = [{ path: note.path, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }];
+      for (const { asset, targetPath } of localAssets) {
+        files.push({ path: targetPath, contentHash: await sha256Hex(new Uint8Array(asset.body)), byteSize: asset.body.length });
+      }
+      return { notePath: note.path, files };
+    } catch (error) {
+      for (const targetPath of createdAssets) {
+        if (await this.app.vault.adapter.exists(targetPath)) await this.app.vault.adapter.remove(targetPath).catch(() => {});
+      }
+      throw error;
     }
   }
 

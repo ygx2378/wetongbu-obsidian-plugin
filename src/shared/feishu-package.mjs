@@ -1,5 +1,6 @@
 export const WEBCLIP_PACKAGE_VERSION = 1;
 export const FEISHU_PACKAGE_VERSION = WEBCLIP_PACKAGE_VERSION;
+export const WEBCLIP_COMPLETION_PACKAGE_VERSION = 2;
 
 const TASK_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -35,7 +36,7 @@ export function validateWebclipManifest(manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw new Error("manifest must be an object");
   }
-  if (manifest.version !== WEBCLIP_PACKAGE_VERSION) {
+  if (![WEBCLIP_PACKAGE_VERSION, WEBCLIP_COMPLETION_PACKAGE_VERSION].includes(manifest.version)) {
     throw new Error("unsupported Webclip package version");
   }
   if (!["feishu", "web"].includes(manifest.source)) {
@@ -49,8 +50,15 @@ export function validateWebclipManifest(manifest) {
   requireString(manifest.title, "title");
   const sourceUrl = new URL(requireString(manifest.source_url, "source_url"));
   if (sourceUrl.protocol !== "https:") throw new Error("source_url must use HTTPS");
-  if (manifest.sync_mode !== "create_new") {
+  if (manifest.version === WEBCLIP_PACKAGE_VERSION && manifest.sync_mode !== "create_new") {
     throw new Error("sync_mode must be create_new");
+  }
+  if (manifest.version === WEBCLIP_COMPLETION_PACKAGE_VERSION) {
+    if (manifest.sync_mode !== "complete_capture") throw new Error("sync_mode must be complete_capture");
+    if (manifest.operation !== "complete_capture") throw new Error("operation must be complete_capture");
+    if (typeof manifest.capture_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(manifest.capture_id)) {
+      throw new Error("invalid capture_id");
+    }
   }
   if (manifest.asset_mode !== "local") throw new Error("asset_mode must be local");
   if (Number.isNaN(Date.parse(requireString(manifest.created_at, "created_at")))) {
