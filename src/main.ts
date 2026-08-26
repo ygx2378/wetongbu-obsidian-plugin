@@ -22,6 +22,8 @@ import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorag
 import { VaultSyncRemoteClient } from "./vault-sync-remote";
 import { createPrevSyncStore } from "./vault-sync-local";
 import { createCaptureHandoffStore, type CaptureHandoffStore } from "./capture-handoff";
+import { selectCompletionNote, updateCompletionNoteMetadata } from "./completion-note";
+import { assertCompletionTaskIdentity } from "./completion-task-validation";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import type { DeletionAction, DeletionResolution } from "./vault-sync-deletion";
 import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
@@ -49,6 +51,7 @@ interface WeTongbuSettings {
   syncTargetId: string;
   syncTargetName: string;
   authSecretSuffix: string;
+  accountPlanType: "free" | "pro";
   storageProvider: StorageProvider;
   endpoint: string;
   region: string;
@@ -202,6 +205,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   syncTargetId: "",
   syncTargetName: "",
   authSecretSuffix: "",
+  accountPlanType: "free",
   storageProvider: "cloudflare_r2",
   endpoint: "",
   region: "auto",
@@ -301,7 +305,7 @@ export default class WeTongbuPlugin extends Plugin {
   storageStatus = "";
   accountStatus = "未登录";
   accountLoggedIn = false;
-  accountPlanType = "free";
+  accountPlanType: "free" | "pro" = "free";
   canHostImages = false;
   hostedMediaQuotaBytes = 0;
   hostedMediaUsedBytes = 0;
@@ -318,6 +322,7 @@ export default class WeTongbuPlugin extends Plugin {
   private captureHandoffs!: CaptureHandoffStore;
   captureReceiverStatus: { device_name: string | null; is_current_device: boolean } | null = null;
   vaultEncryptionInput = "";
+  private pluginTokenMissingNoticeShown = false;
 
   async onload() {
     this.captureHandoffs = createCaptureHandoffStore(this.app);
@@ -330,6 +335,7 @@ export default class WeTongbuPlugin extends Plugin {
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
+    this.accountPlanType = this.settings.accountPlanType === "pro" ? "pro" : "free";
     // Versions before provider-switch migrations did not keep an immutable
     // active location. Backfill it once from the last saved form values.
     if (!Object.prototype.hasOwnProperty.call(currentSettings, "activeStorageProvider")
@@ -466,6 +472,10 @@ export default class WeTongbuPlugin extends Plugin {
     return `wetongbu-plugin-${this.settings.authSecretSuffix}`;
   }
 
+  hasPluginToken() {
+    return Boolean(this.app.secretStorage.getSecret(this.pluginTokenSecretId()));
+  }
+
   private async registerCurrentVault() {
     if (this.settings.syncTargetId) throw new Error("当前 Vault 已注册");
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
@@ -493,7 +503,7 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async recoverFreeVault(recoveryToken: string) {
-    if (this.settings.syncTargetId) throw new Error("当前 Vault 已连接，无需恢复");
+    if (this.settings.syncTargetId && this.hasPluginToken()) throw new Error("当前 Vault 已连接，无需恢复");
     const response = await requestUrl({
       url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/recover`,
       method: "POST",
@@ -513,6 +523,7 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.syncTargetName = response.json.target_name;
     this.app.secretStorage.setSecret(`wetongbu-plugin-${suffix}`, response.json.plugin_token);
     this.recoveryToken = response.json.recovery_token;
+    this.pluginTokenMissingNoticeShown = false;
 
     const storageResponse = await requestUrl({
       url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/storage`,
@@ -639,16 +650,40 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async startAccountLogin() {
-    const token = await this.ensureCurrentVaultRegistered();
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
-    const response = await requestUrl({
-      url: `${base}/api/device-authorizations`,
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      contentType: "application/json",
-      body: "{}",
-      throw: false,
-    });
+    const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const response = token && this.settings.syncTargetId
+      ? await requestUrl({
+        url: `${base}/api/device-authorizations`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        contentType: "application/json",
+        body: "{}",
+        throw: false,
+      })
+      : !token && this.settings.syncTargetId
+        ? await requestUrl({
+          url: `${base}/api/device-authorizations/reconnect`,
+          method: "POST",
+          contentType: "application/json",
+          body: JSON.stringify({
+            target_id: this.settings.syncTargetId,
+            device_name: currentDeviceName(),
+            device_class: currentDeviceClass(),
+          }),
+          throw: false,
+        })
+        : await (async () => {
+          const registeredToken = await this.ensureCurrentVaultRegistered();
+          return requestUrl({
+            url: `${base}/api/device-authorizations`,
+            method: "POST",
+            headers: { Authorization: `Bearer ${registeredToken}` },
+            contentType: "application/json",
+            body: "{}",
+            throw: false,
+          });
+        })();
     if (response.status !== 201) throw new Error(response.json?.error ?? "登录授权申请失败");
     const authorization = response.json;
     if (!isTrustedAuthorizationUrl(authorization.verification_uri)) {
@@ -721,7 +756,7 @@ export default class WeTongbuPlugin extends Plugin {
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!this.settings.syncTargetId || !token) {
       this.accountLoggedIn = false;
-      this.accountPlanType = "free";
+      this.accountPlanType = this.settings.accountPlanType = "free";
       this.canHostImages = false;
       this.accountStatus = "未登录";
       return;
@@ -735,7 +770,7 @@ export default class WeTongbuPlugin extends Plugin {
       });
       if (response.status !== 200) {
         this.accountLoggedIn = false;
-        this.accountPlanType = "free";
+        this.accountPlanType = this.settings.accountPlanType = "free";
         this.canHostImages = false;
         this.accountStatus = "未登录（Free 可继续使用）";
         return;
@@ -743,10 +778,12 @@ export default class WeTongbuPlugin extends Plugin {
       const account = response.json?.account ?? {};
       this.accountLoggedIn = Boolean(account.email);
       this.accountPlanType = account.planType === "pro" ? "pro" : "free";
+      this.settings.accountPlanType = this.accountPlanType;
       this.accountStatus = this.accountLoggedIn
         ? `当前账号：${account.email} · ${account.planType === "pro" ? "Pro 托管版" : "Free 自有存储"}`
         : "未登录（Free 可继续使用）";
       await this.refreshImageDeliveryPreference(token);
+      await this.saveSettings();
     } catch {
       this.accountStatus = this.accountLoggedIn ? "已登录（账号状态暂时无法读取）" : "未登录（Free 可继续使用）";
     }
@@ -1450,7 +1487,14 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.lastSafeErrorCode = "sync_failed";
-      if (!quiet) new Notice(`微同步失败：${message}`, 10000);
+      if (error instanceof Error && (error as Error & { code?: string }).code === "plugin_token_missing") {
+        if (!this.pluginTokenMissingNoticeShown) {
+          this.pluginTokenMissingNoticeShown = true;
+          new Notice(message, 15000);
+        }
+      } else if (!quiet) {
+        new Notice(`微同步失败：${message}`, 10000);
+      }
       console.error("WeTongbu sync failed");
       return 0;
     } finally {
@@ -1522,6 +1566,10 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   private async refreshCaptureReceiverStatus() {
+    if (this.accountPlanType === "pro") {
+      this.captureReceiverStatus = null;
+      return;
+    }
     const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!token || !this.settings.syncTargetId) return;
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -1535,6 +1583,7 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async setCurrentDeviceAsCaptureReceiver() {
+    if (this.accountPlanType === "pro") throw new Error("Pro 托管版不需要设置剪藏接收设备");
     const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!token || !this.settings.syncTargetId) throw new Error("请先连接 Obsidian Vault");
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -1553,7 +1602,14 @@ export default class WeTongbuPlugin extends Plugin {
 
   private async syncApiTasks(quiet = false) {
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    if (!this.settings.syncTargetId || !token) return 0;
+    if (!this.settings.syncTargetId) return 0;
+    if (!token) {
+      throw Object.assign(
+        new Error("Obsidian 插件凭证已丢失，请在设置中使用之前保存的恢复码重新连接当前 Vault"),
+        { code: "plugin_token_missing" },
+      );
+    }
+    this.pluginTokenMissingNoticeShown = false;
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
     const listed = await requestUrl({
       url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/claim`,
@@ -1572,50 +1628,62 @@ export default class WeTongbuPlugin extends Plugin {
     }
     let synced = 0;
     for (const item of listed.json.tasks ?? []) {
-      const existingHandoff = await this.captureHandoffs.get(item.task_id);
-      if (existingHandoff && await this.captureHandoffFilesMatch(existingHandoff)) {
+      let completedOnServer = false;
+      try {
+        const existingHandoff = await this.captureHandoffs.get(item.task_id);
+        if (existingHandoff && await this.captureHandoffFilesMatch(existingHandoff)) {
+          await this.completeHostedTask(base, token, item.task_id);
+          completedOnServer = true;
+          if (!existingHandoff.requiresVaultSync) await this.captureHandoffs.remove(item.task_id);
+          synced += 1;
+          continue;
+        }
+        // processedTaskIds is only a local history. It is not proof that this
+        // Vault still contains the written file, so never acknowledge a task
+        // solely because its id was persisted in settings. The handoff check
+        // above is the only fast path that has local file evidence.
+        const downloaded = await requestUrl({ url: item.download_url, method: "GET", throw: false });
+        if (downloaded.status !== 200) throw new Error(`任务下载失败（${downloaded.status}）`);
+        const zipBytes = new Uint8Array(downloaded.arrayBuffer);
+        const packageHash = await sha256Hex(zipBytes);
+        if (packageHash !== item.content_hash) throw new Error("ZIP 校验失败：任务包哈希不一致");
+        if (zipBytes.length !== item.file_size) throw new Error("ZIP 校验失败：任务包大小不一致");
+        const task = await this.unpackWebclipTask(zipBytes);
+        assertCompletionTaskIdentity(item, task.manifest, {
+          userId: this.settings.userId,
+          targetId: this.settings.syncTargetId,
+        });
+        const imageLinks = item.image_delivery_mode === "hosted_link"
+          ? await this.publishHostedImages(base, token, item.task_id)
+          : {};
+        const written = task.manifest.operation === "complete_capture"
+          ? await this.completeCaptureTask(task)
+          : await this.writeTask(task, imageLinks);
+        await this.captureHandoffs.save({
+          version: 1,
+          taskId: item.task_id,
+          notePath: written.notePath,
+          files: written.files,
+          requiresVaultSync: this.settings.vaultSyncEnabled,
+          createdAt: new Date().toISOString(),
+        });
+        this.settings.processedTaskIds.push(item.task_id);
+        this.settings.processedTaskIds = this.settings.processedTaskIds.slice(-1000);
+        await this.saveSettings();
         await this.completeHostedTask(base, token, item.task_id);
-        if (!existingHandoff.requiresVaultSync) await this.captureHandoffs.remove(item.task_id);
+        completedOnServer = true;
+        if (!this.settings.vaultSyncEnabled) await this.captureHandoffs.remove(item.task_id);
         synced += 1;
-        continue;
+      } catch (error) {
+        if (!completedOnServer) await this.failHostedTask(base, token, item.task_id, error);
+        throw error;
       }
-      if (this.settings.processedTaskIds.includes(item.task_id)) {
-        await this.completeHostedTask(base, token, item.task_id);
-        continue;
-      }
-      const downloaded = await requestUrl({ url: item.download_url, method: "GET", throw: false });
-      if (downloaded.status !== 200) throw new Error(`任务下载失败（${downloaded.status}）`);
-      const zipBytes = new Uint8Array(downloaded.arrayBuffer);
-      const packageHash = await sha256Hex(zipBytes);
-      if (packageHash !== item.content_hash) throw new Error("ZIP 校验失败：任务包哈希不一致");
-      if (zipBytes.length !== item.file_size) throw new Error("ZIP 校验失败：任务包大小不一致");
-      const task = await this.unpackWebclipTask(zipBytes);
-      if (task.manifest.taskId !== item.task_id) throw new Error("manifest task_id 与服务器任务不一致");
-      const imageLinks = item.image_delivery_mode === "hosted_link"
-        ? await this.publishHostedImages(base, token, item.task_id)
-        : {};
-      const written = task.manifest.operation === "complete_capture"
-        ? await this.completeCaptureTask(task)
-        : await this.writeTask(task, imageLinks);
-      await this.captureHandoffs.save({
-        version: 1,
-        taskId: item.task_id,
-        notePath: written.notePath,
-        files: written.files,
-        requiresVaultSync: this.settings.vaultSyncEnabled,
-        createdAt: new Date().toISOString(),
-      });
-      this.settings.processedTaskIds.push(item.task_id);
-      this.settings.processedTaskIds = this.settings.processedTaskIds.slice(-1000);
-      await this.saveSettings();
-      await this.completeHostedTask(base, token, item.task_id);
-      if (!this.settings.vaultSyncEnabled) await this.captureHandoffs.remove(item.task_id);
-      synced += 1;
     }
     return synced;
   }
 
-  private async captureHandoffFilesMatch(handoff: { files: Array<{ path: string; contentHash: string; byteSize: number }> }) {
+  private async captureHandoffFilesMatch(handoff: { notePath: string; files: Array<{ path: string; contentHash: string; byteSize: number }> }) {
+    if (!handoff.notePath || handoff.files.length === 0 || !handoff.files.some((record) => record.path === handoff.notePath)) return false;
     for (const record of handoff.files) {
       const file = this.app.vault.getAbstractFileByPath(record.path);
       if (!(file instanceof TFile)) return false;
@@ -1667,6 +1735,25 @@ export default class WeTongbuPlugin extends Plugin {
     if (response.status !== 200) throw new Error(response.json?.error ?? "云端任务清理失败");
   }
 
+  private async failHostedTask(base: string, token: string, taskId: string, error: unknown) {
+    try {
+      const response = await requestUrl({
+        url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/${taskId}/fail`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        contentType: "application/json",
+        body: JSON.stringify({
+          error_code: "client_download_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        }),
+        throw: false,
+      });
+      if (response.status !== 200) console.warn("WeTongbu task failure report failed", response.status);
+    } catch (reportError) {
+      console.warn("WeTongbu task failure report unavailable", reportError);
+    }
+  }
+
   private async publishHostedImages(base: string, token: string, taskId: string) {
     const response = await requestUrl({
       url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/${taskId}/media/publish`,
@@ -1706,6 +1793,8 @@ export default class WeTongbuPlugin extends Plugin {
         capturedAt: manifest.created_at,
         operation: manifest.operation ?? "create_new",
         captureId: manifest.capture_id ?? null,
+        userId: manifest.user_id ?? null,
+        targetId: manifest.target_id ?? null,
       },
         markdown: new TextDecoder().decode(files.get(manifest.entry_file)!),
       assets: manifest.files
@@ -1740,23 +1829,28 @@ export default class WeTongbuPlugin extends Plugin {
     const captureId = task.manifest.captureId;
     if (typeof captureId !== "string" || !captureId) throw new Error("补全任务缺少 capture_id");
     const capturePattern = new RegExp(`^wetongbu_capture_id:\\s*["']?${captureId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(["']?)\\s*$`, "im");
-    const matched: TFile[] = [];
+    const candidates: Array<{ file: TFile; content: string }> = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
       const content = await this.app.vault.cachedRead(file);
-      if (capturePattern.test(content)) matched.push(file);
+      candidates.push({ file, content });
     }
-    if (matched.length !== 1) {
+    const selected = selectCompletionNote(
+      candidates.map(({ file, content }) => ({ path: file.path, content })),
+      captureId,
+      task.manifest.sourceUrl,
+    );
+    const note = selected ? candidates.find(({ file }) => file.path === selected.path)?.file : undefined;
+    if (!selected || !note) {
       const fallback = await this.writeTask(task, {});
-      new Notice(matched.length === 0
+      new Notice(candidates.filter(({ content }) => capturePattern.test(content)).length === 0
         ? "原笔记已找不到，已新建完整笔记"
         : "原笔记标识不唯一，已新建完整笔记，未覆盖原文件", 8000);
       return fallback;
     }
-    const note = matched[0];
-    const original = await this.app.vault.adapter.read(note.path);
+    const original = selected.content;
     const start = "<!-- wetongbu:generated:start -->";
     const end = "<!-- wetongbu:generated:end -->";
-    const incomingBody = task.markdown.replace(/^---\n[\s\S]*?\n---\n\n?/, "").trim();
+    const incomingBody = task.markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n?/, "").trim();
     if (!original.includes(start) || !original.includes(end)) {
       const fallback = await this.writeTask(task, {});
       new Notice("原笔记没有可安全更新的微同步区块，已新建完整笔记", 8000);
@@ -1771,7 +1865,8 @@ export default class WeTongbuPlugin extends Plugin {
     });
     const noteFolder = normalizePath(note.parent?.path || layout.noteFolder);
     const attachmentFolder = normalizePath(layout.attachmentFolder);
-    let body = incomingBody;
+    const newline = original.includes("\r\n") ? "\r\n" : "\n";
+    let body = incomingBody.replace(/\r?\n/g, newline);
     const localAssets: Array<{ asset: any; targetPath: string }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
@@ -1790,37 +1885,46 @@ export default class WeTongbuPlugin extends Plugin {
         if (!stat || stat.type !== "file" || stat.size !== asset.body.length) throw new Error(`附件写入校验失败：${targetPath}`);
       }
       const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const updated = original.replace(
+      const withMetadata = updateCompletionNoteMetadata(original, {
+        captureId,
+        title: task.manifest.title,
+        sourceUrl: task.manifest.sourceUrl,
+      });
+      const updated = withMetadata.replace(
         new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`),
-        `${start}\n${body}\n${end}`,
+        `${start}${newline}${body}${newline}${end}`,
       );
-      const temporary = `${note.path}.wetongbu-complete-${task.manifest.taskId}.tmp`;
+      const transactionId = `${task.manifest.taskId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const temporary = `${note.path}.wetongbu-complete-${transactionId}.tmp`;
       await this.app.vault.adapter.write(temporary, updated);
       if ((await this.app.vault.adapter.read(temporary)) !== updated) throw new Error("原笔记写入校验失败");
-      const backup = `${note.path}.wetongbu-complete-${task.manifest.taskId}.bak`;
-      let backupMoved = false;
+      const backup = `${note.path}.wetongbu-complete-${transactionId}.bak`;
+      await this.app.vault.adapter.write(backup, original);
+      if ((await this.app.vault.adapter.read(backup)) !== original) throw new Error("原笔记备份校验失败");
       try {
-        await this.app.vault.adapter.rename(note.path, backup);
-        backupMoved = true;
-        await this.app.vault.adapter.rename(temporary, note.path);
+        await this.app.vault.adapter.write(note.path, updated);
         const persisted = await this.app.vault.adapter.read(note.path);
         if (persisted !== updated) throw new Error("原笔记更新校验失败");
-        await this.app.vault.adapter.remove(backup);
       } catch (error) {
-        if (backupMoved && await this.app.vault.adapter.exists(note.path)) await this.app.vault.adapter.remove(note.path).catch(() => {});
-        if (backupMoved && await this.app.vault.adapter.exists(backup)) await this.app.vault.adapter.rename(backup, note.path).catch(() => {});
+        await this.app.vault.adapter.write(note.path, original).catch(() => {});
         throw error;
       } finally {
         if (await this.app.vault.adapter.exists(temporary)) await this.app.vault.adapter.remove(temporary).catch(() => {});
         if (await this.app.vault.adapter.exists(backup)) await this.app.vault.adapter.remove(backup).catch(() => {});
       }
-      const persisted = await this.app.vault.adapter.read(note.path);
+      let finalPath = note.path;
+      const desiredPath = normalizePath(`${noteFolder}/${layout.noteFilename}`);
+      if (desiredPath !== note.path && !(await this.app.vault.adapter.exists(desiredPath))) {
+        await this.app.fileManager.renameFile(note, desiredPath);
+        finalPath = desiredPath;
+      }
+      const persisted = await this.app.vault.adapter.read(finalPath);
       const encoded = new TextEncoder().encode(persisted);
-      const files = [{ path: note.path, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }];
+      const files = [{ path: finalPath, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }];
       for (const { asset, targetPath } of localAssets) {
         files.push({ path: targetPath, contentHash: await sha256Hex(new Uint8Array(asset.body)), byteSize: asset.body.length });
       }
-      return { notePath: note.path, files };
+      return { notePath: finalPath, files };
     } catch (error) {
       for (const targetPath of createdAssets) {
         if (await this.app.vault.adapter.exists(targetPath)) await this.app.vault.adapter.remove(targetPath).catch(() => {});
@@ -2283,30 +2387,32 @@ class WeTongbuSettingTab extends PluginSettingTab {
         }),
       );
 
-    const receiverName = this.plugin.captureReceiverStatus?.device_name;
-    const canSetCaptureReceiver = !Platform.isIosApp && !Platform.isAndroidApp;
-    new Setting(containerEl)
-      .setName("剪藏接收设备")
-      .setDesc(this.plugin.captureReceiverStatus?.is_current_device
-        ? `本机（${receiverName || "当前电脑"}）会先接收飞书、网页和微信剪藏，再同步到其他设备。`
-        : receiverName
-          ? `当前由 ${receiverName} 接收剪藏；手机和其他设备通过 Vault 同步获得内容。`
-          : "默认由第一台电脑接收剪藏；手机和其他设备通过 Vault 同步获得内容。")
-      .addButton((button) => button
-        .setButtonText("设为本机接收")
-        .setDisabled(!canSetCaptureReceiver)
-        .onClick(async () => {
-          try {
-            button.setDisabled(true);
-            await this.plugin.setCurrentDeviceAsCaptureReceiver();
-            new Notice("已将本机设为剪藏接收设备", 6000);
-            this.display();
-          } catch (error) {
-            new Notice(`设置剪藏接收设备失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-          } finally {
-            button.setDisabled(false);
-          }
-        }));
+    if (this.plugin.accountPlanType !== "pro") {
+      const receiverName = this.plugin.captureReceiverStatus?.device_name;
+      const canSetCaptureReceiver = !Platform.isIosApp && !Platform.isAndroidApp;
+      new Setting(containerEl)
+        .setName("剪藏接收设备（Free）")
+        .setDesc(this.plugin.captureReceiverStatus?.is_current_device
+          ? `本机（${receiverName || "当前电脑"}）会先接收飞书、网页和微信剪藏，再同步到其他设备。`
+          : receiverName
+            ? `当前由 ${receiverName} 接收剪藏；手机和其他设备通过 Vault 同步获得内容。`
+            : "默认由第一台电脑接收剪藏；手机和其他设备通过 Vault 同步获得内容。")
+        .addButton((button) => button
+          .setButtonText("设为本机接收")
+          .setDisabled(!canSetCaptureReceiver)
+          .onClick(async () => {
+            try {
+              button.setDisabled(true);
+              await this.plugin.setCurrentDeviceAsCaptureReceiver();
+              new Notice("已将本机设为 Free 剪藏接收设备", 6000);
+              this.display();
+            } catch (error) {
+              new Notice(`设置 Free 剪藏接收设备失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            } finally {
+              button.setDisabled(false);
+            }
+          }));
+    }
 
     this.textSetting("微同步目录", "文章、附件和 AI 说明文件的根目录", "rootFolder");
 
@@ -2458,10 +2564,17 @@ class WeTongbuSettingTab extends PluginSettingTab {
           }));
     }
 
-    if (!this.plugin.settings.syncTargetId) {
+    const hasPluginToken = this.plugin.hasPluginToken();
+    if (this.plugin.accountPlanType === "pro") {
       new Setting(containerEl)
-        .setName("更换设备与恢复（低频）")
-        .setDesc("仅在更换电脑或重装插件后，使用之前保存的 Free 恢复码恢复原 Vault")
+        .setName("Pro 账号恢复")
+        .setDesc("Pro 不使用本地恢复码。更换设备或重装插件后，点击上方“登录 Pro 账号”，登录后会自动恢复当前账号和 Vault。");
+    } else if (!this.plugin.settings.syncTargetId || !hasPluginToken) {
+      new Setting(containerEl)
+        .setName(hasPluginToken ? "更换设备与恢复（低频）" : "恢复当前 Vault")
+        .setDesc(hasPluginToken
+          ? "仅在更换电脑或重装插件后，使用之前保存的 Free 恢复码恢复原 Vault"
+          : "Pro 用户请点击上方“登录 Pro 账号”，登录后会自动恢复插件凭证；Free 用户可使用之前保存的恢复码，不会删除本地文章")
         .addText((text) => {
           text.inputEl.type = "password";
           text
@@ -2470,7 +2583,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
             .onChange((value) => { this.recoveryTokenInput = value; });
         })
         .addButton((button) => button
-          .setButtonText("恢复 Free Vault")
+          .setButtonText(hasPluginToken ? "恢复 Free Vault" : "使用 Free 恢复码")
           .onClick(async () => {
             try {
               await this.plugin.recoverFreeVault(this.recoveryTokenInput);
