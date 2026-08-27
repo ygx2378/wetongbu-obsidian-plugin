@@ -1,6 +1,6 @@
 const TRACKING_QUERY_KEYS = new Set(["fbclid", "gclid", "mc_cid", "mc_eid", "ref", "ref_src"]);
 
-function normalizedSourceUrl(value: string) {
+export function normalizeCompletionSourceUrl(value: string) {
   const url = new URL(value);
   url.hash = "";
   for (const key of [...url.searchParams.keys()]) {
@@ -39,7 +39,7 @@ export function assertCompletionTaskIdentity(
     throw new Error("任务包身份与当前 Vault 不一致");
   }
   if (packageTask.title !== serverTask.title) throw new Error("任务包标题与服务器任务不一致");
-  if (normalizedSourceUrl(packageTask.sourceUrl) !== normalizedSourceUrl(serverTask.source_url)) {
+  if (normalizeCompletionSourceUrl(packageTask.sourceUrl) !== normalizeCompletionSourceUrl(serverTask.source_url)) {
     throw new Error("任务包原文链接与服务器任务不一致");
   }
   const serverOperation = serverTask.operation ?? "create_new";

@@ -1,4 +1,3 @@
-import { unzipSync } from "fflate";
 import {
   addIcon,
   Modal,
@@ -13,17 +12,15 @@ import {
   type App,
 } from "obsidian";
 import { buildVaultPaths } from "./shared/vault-layout.mjs";
-import {
-  isSafePackagePath,
-  validateWebclipManifest,
-  verifyWebclipPackageFiles,
-} from "./shared/feishu-package.mjs";
+import { validateWebclipManifest, verifyWebclipPackageFiles } from "./shared/feishu-package.mjs";
 import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
 import { VaultSyncRemoteClient } from "./vault-sync-remote";
 import { createPrevSyncStore } from "./vault-sync-local";
 import { createCaptureHandoffStore, type CaptureHandoffStore } from "./capture-handoff";
 import { selectCompletionNote, updateCompletionNoteMetadata } from "./completion-note";
-import { assertCompletionTaskIdentity } from "./completion-task-validation";
+import { assertCompletionTaskIdentity, normalizeCompletionSourceUrl } from "./completion-task-validation";
+import { resolveAssetTarget } from "./asset-target";
+import { unzipWebclipArchive } from "./webclip-zip";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import type { DeletionAction, DeletionResolution } from "./vault-sync-deletion";
 import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
@@ -38,10 +35,6 @@ import {
   isTrustedApiUrl,
   isTrustedAuthorizationUrl,
   isTrustedStorageUrl,
-  MAX_MANIFEST_BYTES,
-  MAX_TASK_ENTRY_BYTES,
-  MAX_TASK_PACKAGE_BYTES,
-  MAX_TASK_PACKAGE_ENTRIES,
   normalizeApiBaseUrl,
 } from "./shared/security";
 
@@ -1642,6 +1635,13 @@ export default class WeTongbuPlugin extends Plugin {
         // Vault still contains the written file, so never acknowledge a task
         // solely because its id was persisted in settings. The handoff check
         // above is the only fast path that has local file evidence.
+        if (!isTrustedStorageUrl(
+          item.download_url,
+          this.settings.activeStorageEndpoint || this.settings.endpoint,
+          base,
+        )) {
+          throw new Error("任务下载地址不受信任");
+        }
         const downloaded = await requestUrl({ url: item.download_url, method: "GET", throw: false });
         if (downloaded.status !== 200) throw new Error(`任务下载失败（${downloaded.status}）`);
         const zipBytes = new Uint8Array(downloaded.arrayBuffer);
@@ -1770,15 +1770,14 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   private async unpackWebclipTask(zipBytes: Uint8Array) {
-    const entries = unzipSync(zipBytes);
-    const entryNames = Object.keys(entries).filter((entry) => !entry.endsWith("/"));
-    if (entryNames.some((entry) => !isSafePackagePath(entry))) throw new Error("ZIP 包含不安全路径");
-    const manifestEntry = entries["manifest.json"];
+    const entries = unzipWebclipArchive(zipBytes);
+    const entryNames = [...entries.keys()];
+    const manifestEntry = entries.get("manifest.json");
     if (!manifestEntry) throw new Error("manifest.json 缺失");
     const manifest = validateWebclipManifest(JSON.parse(new TextDecoder().decode(manifestEntry)));
     const files = new Map<string, Uint8Array>();
     for (const record of manifest.files) {
-      const entry = entries[record.path];
+      const entry = entries.get(record.path);
       if (!entry) throw new Error(`任务文件缺失：${record.path}`);
       files.set(record.path, entry);
     }
@@ -1829,16 +1828,48 @@ export default class WeTongbuPlugin extends Plugin {
     const captureId = task.manifest.captureId;
     if (typeof captureId !== "string" || !captureId) throw new Error("补全任务缺少 capture_id");
     const capturePattern = new RegExp(`^wetongbu_capture_id:\\s*["']?${captureId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(["']?)\\s*$`, "im");
-    const candidates: Array<{ file: TFile; content: string }> = [];
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      const content = await this.app.vault.cachedRead(file);
-      candidates.push({ file, content });
-    }
-    const selected = selectCompletionNote(
+    const allMarkdownFiles = this.app.vault.getMarkdownFiles();
+    const rootFolder = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
+    const inboxPrefix = `${rootFolder}/00_收件箱/`;
+    const exactMarkerFiles = allMarkdownFiles.filter((file) =>
+      String(this.app.metadataCache.getFileCache(file)?.frontmatter?.wetongbu_capture_id ?? "") === captureId,
+    );
+    const inboxFiles = allMarkdownFiles.filter((file) => file.path.startsWith(inboxPrefix));
+    const legacyUrlFiles = inboxFiles.filter((file) => {
+      const url = this.app.metadataCache.getFileCache(file)?.frontmatter?.url;
+      if (typeof url !== "string" || !url.trim()) return false;
+      try {
+        return normalizeCompletionSourceUrl(url) === normalizeCompletionSourceUrl(task.manifest.sourceUrl);
+      } catch {
+        return false;
+      }
+    });
+    const prioritizedFiles = exactMarkerFiles.length
+      ? exactMarkerFiles
+      : legacyUrlFiles.length
+        ? legacyUrlFiles
+        : inboxFiles.length
+          ? inboxFiles
+          : allMarkdownFiles;
+    const readCandidates = async (files: TFile[]) => {
+      const result: Array<{ file: TFile; content: string }> = [];
+      for (const file of files) result.push({ file, content: await this.app.vault.cachedRead(file) });
+      return result;
+    };
+    let candidates = await readCandidates(prioritizedFiles);
+    let selected = selectCompletionNote(
       candidates.map(({ file, content }) => ({ path: file.path, content })),
       captureId,
       task.manifest.sourceUrl,
     );
+    if (!selected && prioritizedFiles.length !== allMarkdownFiles.length) {
+      candidates = await readCandidates(allMarkdownFiles);
+      selected = selectCompletionNote(
+        candidates.map(({ file, content }) => ({ path: file.path, content })),
+        captureId,
+        task.manifest.sourceUrl,
+      );
+    }
     const note = selected ? candidates.find(({ file }) => file.path === selected.path)?.file : undefined;
     if (!selected || !note) {
       const fallback = await this.writeTask(task, {});
@@ -1867,19 +1898,22 @@ export default class WeTongbuPlugin extends Plugin {
     const attachmentFolder = normalizePath(layout.attachmentFolder);
     const newline = original.includes("\r\n") ? "\r\n" : "\n";
     let body = incomingBody.replace(/\r?\n/g, newline);
-    const localAssets: Array<{ asset: any; targetPath: string }> = [];
+    const localAssets: Array<{ asset: any; targetPath: string; writeLocal: boolean }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
-      const targetPath = normalizePath(`${attachmentFolder}/${filename}`);
+      const desiredPath = normalizePath(`${attachmentFolder}/${filename}`);
+      const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
+      const targetPath = resolved.targetPath;
       const relativePath = relativeVaultPath(noteFolder, targetPath);
       body = body.split(`<${asset.relativePath}>`).join(relativePath).split(asset.relativePath).join(relativePath);
-      localAssets.push({ asset, targetPath });
+      localAssets.push({ asset, targetPath, writeLocal: resolved.writeLocal });
     }
-    if (localAssets.length) await ensureFolder(this, attachmentFolder);
+    if (localAssets.some(({ writeLocal }) => writeLocal)) await ensureFolder(this, attachmentFolder);
     const createdAssets: string[] = [];
     try {
-      for (const { asset, targetPath } of localAssets) {
-        if (!(await this.app.vault.adapter.exists(targetPath))) createdAssets.push(targetPath);
+      for (const { asset, targetPath, writeLocal } of localAssets) {
+        if (!writeLocal) continue;
+        createdAssets.push(targetPath);
         await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
         const stat = await this.app.vault.adapter.stat(targetPath);
         if (!stat || stat.type !== "file" || stat.size !== asset.body.length) throw new Error(`附件写入校验失败：${targetPath}`);
@@ -1946,20 +1980,24 @@ export default class WeTongbuPlugin extends Plugin {
     await ensureFolder(this, noteFolder);
 
     let markdown = task.markdown;
-    const assetPlans = task.assets.map((asset: any, index: number) => {
+    const assetPlans: Array<{ asset: any; filename: string; targetPath: string; writeLocal: boolean }> = [];
+    for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
       const remoteLink = asset.kind === "image" ? imageLinks[asset.relativePath] : undefined;
       if (remoteLink) {
         markdown = markdown.split(`<${asset.relativePath}>`).join(`<${remoteLink}>`);
         markdown = markdown.split(asset.relativePath).join(remoteLink);
-        return { asset, filename, targetPath: "", writeLocal: false };
+        assetPlans.push({ asset, filename, targetPath: "", writeLocal: false });
+        continue;
       }
-      const targetPath = normalizePath(`${taskAttachmentFolder}/${filename}`);
+      const desiredPath = normalizePath(`${taskAttachmentFolder}/${filename}`);
+      const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
+      const targetPath = resolved.targetPath;
       const relativePath = relativeVaultPath(noteFolder, targetPath);
       markdown = markdown.split(`<${asset.relativePath}>`).join(relativePath);
       markdown = markdown.split(asset.relativePath).join(relativePath);
-      return { asset, filename, targetPath, writeLocal: true };
-    });
+      assetPlans.push({ asset, filename, targetPath, writeLocal: resolved.writeLocal });
+    }
     const localAssetPlans = assetPlans.filter((plan: { writeLocal: boolean }) => plan.writeLocal);
     if (localAssetPlans.length) await ensureFolder(this, taskAttachmentFolder);
     markdown = markdown.replace(/^[\t ]+(?=(?:!\[|\[!\[))/gm, "");
@@ -1975,9 +2013,7 @@ export default class WeTongbuPlugin extends Plugin {
     let persistedMarkdown = "";
     try {
       for (const { asset, filename, targetPath } of localAssetPlans) {
-        if (!(await this.app.vault.adapter.exists(targetPath))) {
-          assetsCreatedByThisAttempt.push(targetPath);
-        }
+        assetsCreatedByThisAttempt.push(targetPath);
         await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
         const writtenAsset = await this.app.vault.adapter.stat(targetPath);
         if (!writtenAsset || writtenAsset.type !== "file" || writtenAsset.size !== asset.body.length) {

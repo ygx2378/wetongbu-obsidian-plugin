@@ -1,3 +1,5 @@
+import { normalizeCompletionSourceUrl } from "./completion-task-validation.ts";
+
 const GENERATED_START = "<!-- wetongbu:generated:start -->";
 const GENERATED_END = "<!-- wetongbu:generated:end -->";
 
@@ -12,9 +14,7 @@ function escapeRegExp(value: string) {
 
 function normalizeSourceUrl(value: string) {
   try {
-    const url = new URL(value);
-    url.hash = "";
-    return url.toString();
+    return normalizeCompletionSourceUrl(value);
   } catch {
     return value.trim();
   }
@@ -25,7 +25,8 @@ function noteSourceUrls(content: string) {
   const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   const urlField = frontmatter?.[1].match(/^url:\s*(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/im);
   if (urlField) values.push(urlField[1] ?? urlField[2] ?? urlField[3]);
-  for (const match of content.matchAll(/\]\((https?:\/\/[^)\s]+)\)/gi)) values.push(match[1]);
+  const generated = content.match(/<!-- wetongbu:generated:start -->[\s\S]*?<!-- wetongbu:generated:end -->/i)?.[0] ?? "";
+  for (const match of generated.matchAll(/\]\((https?:\/\/[^)\s]+)\)/gi)) values.push(match[1]);
   return values;
 }
 
