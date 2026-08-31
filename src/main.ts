@@ -135,7 +135,7 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
 };
 
 const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
-const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9] as const;
+const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -176,20 +176,6 @@ function formatBytes(value: number) {
   const units = ["B", "KB", "MB", "GB", "TB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-const HOSTED_MEDIA_LINK = /https:\/\/api\.wetongbu\.com\/m\/[0-9a-f]{8}-[0-9a-f-]{27}\/[a-f0-9]{64}/gi;
-
-function imageExtension(body: Uint8Array, contentType: string) {
-  const startsWith = (values: number[], offset = 0) => values.every((value, index) => body[offset + index] === value);
-  const ascii = (offset: number, length: number) => new TextDecoder().decode(body.slice(offset, offset + length));
-  if (startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "png";
-  if (startsWith([0xff, 0xd8, 0xff])) return "jpg";
-  if (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a") return "gif";
-  if (ascii(8, 4) === "WEBP") return "webp";
-  if (/image\/svg\+xml/i.test(contentType)) return "svg";
-  if (/image\/avif/i.test(contentType)) return "avif";
-  return "img";
 }
 
 const DEFAULT_SETTINGS: WeTongbuSettings = {
@@ -296,7 +282,7 @@ export default class WeTongbuPlugin extends Plugin {
   vaultPairingExpiresAt = "";
   recoveryToken = "";
   storageStatus = "";
-  accountStatus = "未登录";
+  accountStatus = "当前账号：未登录，自助版";
   accountLoggedIn = false;
   accountPlanType: "free" | "pro" = "free";
   canHostImages = false;
@@ -454,7 +440,7 @@ export default class WeTongbuPlugin extends Plugin {
       if (!this.settings.vaultSyncEnabled) return;
       this.settings.vaultSyncAutoEnablePending = false;
       await this.saveSettings();
-      if (announce) new Notice("电脑和手机同步已自动开启", 6000);
+      if (announce) new Notice("多端同步已自动开启", 6000);
       void this.runVaultSync(false);
     } catch (error) {
       console.warn("WeTongbu default Vault sync enable deferred", error instanceof Error ? error.message : String(error));
@@ -751,7 +737,7 @@ export default class WeTongbuPlugin extends Plugin {
       this.accountLoggedIn = false;
       this.accountPlanType = this.settings.accountPlanType = "free";
       this.canHostImages = false;
-      this.accountStatus = "未登录";
+      this.accountStatus = "当前账号：未登录，自助版";
       return;
     }
     try {
@@ -765,7 +751,7 @@ export default class WeTongbuPlugin extends Plugin {
         this.accountLoggedIn = false;
         this.accountPlanType = this.settings.accountPlanType = "free";
         this.canHostImages = false;
-        this.accountStatus = "未登录（Free 可继续使用）";
+        this.accountStatus = "当前账号：未登录，自助版";
         return;
       }
       const account = response.json?.account ?? {};
@@ -773,12 +759,12 @@ export default class WeTongbuPlugin extends Plugin {
       this.accountPlanType = account.planType === "pro" ? "pro" : "free";
       this.settings.accountPlanType = this.accountPlanType;
       this.accountStatus = this.accountLoggedIn
-        ? `当前账号：${account.email} · ${account.planType === "pro" ? "Pro 托管版" : "Free 自有存储"}`
-        : "未登录（Free 可继续使用）";
+        ? `当前账号：${account.email}，${account.planType === "pro" ? "托管版 Plus" : "自助版"}`
+        : "当前账号：未登录，自助版";
       await this.refreshImageDeliveryPreference(token);
       await this.saveSettings();
     } catch {
-      this.accountStatus = this.accountLoggedIn ? "已登录（账号状态暂时无法读取）" : "未登录（Free 可继续使用）";
+      this.accountStatus = this.accountLoggedIn ? this.accountStatus : "当前账号：未登录，自助版";
     }
   }
 
@@ -905,52 +891,6 @@ export default class WeTongbuPlugin extends Plugin {
 
   openAccountCenter() {
     window.open("https://app.wetongbu.com/account/", "_blank");
-  }
-
-  async migrateHostedImagesToLocal() {
-    const root = normalizePath(this.settings.rootFolder);
-    const assetFolder = normalizePath(`${root}/90_附件/云端图片`);
-    let notes = 0;
-    let images = 0;
-    for (const note of this.app.vault.getMarkdownFiles()) {
-      if (note.path !== root && !note.path.startsWith(`${root}/`)) continue;
-      const original = await this.app.vault.cachedRead(note);
-      const links = [...new Set(original.match(HOSTED_MEDIA_LINK) ?? [])];
-      if (!links.length) continue;
-      let markdown = original;
-      for (const link of links) {
-        if (!isTrustedApiUrl(link, this.settings.apiBaseUrl)) {
-          throw new Error("云端图片链接不受信任");
-        }
-        const downloaded = await requestUrl({ url: link, method: "GET", throw: false });
-        if (downloaded.status !== 200) throw new Error(`图片下载失败（${downloaded.status}）`);
-        const body = new Uint8Array(downloaded.arrayBuffer);
-        if (!body.length) throw new Error("图片下载为空");
-        const headers = downloaded.headers ?? {};
-        const contentType = String(headers["content-type"] ?? headers["Content-Type"] ?? "");
-        const filename = `${(await sha256Hex(new TextEncoder().encode(link))).slice(0, 24)}.${imageExtension(body, contentType)}`;
-        const targetPath = normalizePath(`${assetFolder}/${filename}`);
-        await ensureFolder(this, assetFolder);
-        if (!(await this.app.vault.adapter.exists(targetPath))) {
-          await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(body));
-          const written = await this.app.vault.adapter.stat(targetPath);
-          if (!written || written.type !== "file" || written.size !== body.length) {
-            throw new Error("本地图片写入校验失败");
-          }
-        }
-        const localPath = relativeVaultPath(note.parent?.path ?? "", targetPath);
-        markdown = markdown.split(link).join(localPath);
-        images += 1;
-      }
-      if (markdown !== original) {
-        await this.app.vault.modify(note, markdown);
-        if (await this.app.vault.adapter.read(note.path) !== markdown) {
-          throw new Error("本地 Markdown 写入校验失败");
-        }
-        notes += 1;
-      }
-    }
-    return { notes, images };
   }
 
   async configureUserStorage(accessKeyInput: string, secretKeyInput: string): Promise<"verified" | "migration_pending"> {
@@ -1331,7 +1271,7 @@ export default class WeTongbuPlugin extends Plugin {
         await this.saveSettings();
       }
 
-      // Pro 走托管存储（预签名 URL）；Free 直连用户自有 bucket（SigV4）。
+      // Pro 走托管存储（预签名 URL）；自助版直连用户自有 bucket（SigV4）。
       let storage: VaultSyncStorage;
       if (this.accountPlanType === "pro") {
         storage = createProHostedStorage({
@@ -1576,7 +1516,7 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async setCurrentDeviceAsCaptureReceiver() {
-    if (this.accountPlanType === "pro") throw new Error("Pro 托管版不需要设置剪藏接收设备");
+    if (this.accountPlanType === "pro") throw new Error("托管版不需要设置剪藏接收设备");
     const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!token || !this.settings.syncTargetId) throw new Error("请先连接 Obsidian Vault");
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -2186,6 +2126,7 @@ class VaultSafetyModal extends Modal {
           .addOption("0.5", "50%（默认）")
           .addOption("0.7", "70%")
           .addOption("0.9", "90%")
+          .addOption("1", "100%")
           .addOption("off", "关闭保护（有风险）")
           .setValue(selected)
           .onChange((value) => { selected = value; });
@@ -2233,6 +2174,19 @@ class WeTongbuSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  private displayPreservingScroll() {
+    const scrollEl = this.containerEl.closest(".vertical-tab-content") as HTMLElement | null;
+    const scrollTop = scrollEl?.scrollTop ?? 0;
+    const scrollLeft = scrollEl?.scrollLeft ?? 0;
+    this.display();
+    if (scrollEl) {
+      window.requestAnimationFrame(() => {
+        scrollEl.scrollTop = scrollTop;
+        scrollEl.scrollLeft = scrollLeft;
+      });
+    }
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
@@ -2244,17 +2198,17 @@ class WeTongbuSettingTab extends PluginSettingTab {
       : "";
 
     new Setting(containerEl)
-      .setName("账号与 Pro")
-      .setDesc(`${this.plugin.accountStatus}。登录 Pro 会在浏览器中完成账号登录和授权；Free 使用绑定码，不需要登录。`)
+      .setName("账号与登录")
+      .setDesc(this.plugin.accountStatus)
       .addButton((button) =>
-        button.setButtonText(this.plugin.accountLoggedIn ? "更换账号" : "登录 Pro 账号")
+        button.setButtonText(this.plugin.accountLoggedIn ? "更换账号" : "登录账号")
           .onClick(async () => {
             try {
               button.setDisabled(true);
               await this.plugin.startAccountLogin();
               this.display();
               new Notice(this.plugin.accountLoggedIn
-                ? "登录成功，可开始使用 Pro 试用"
+                ? "登录成功，可开始使用 Plus 试用"
                 : "已打开授权页面，完成授权后插件会自动登录");
             } catch (error) {
               new Notice(`登录失败：${error instanceof Error ? error.message : String(error)}`, 10000);
@@ -2272,12 +2226,14 @@ class WeTongbuSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("图片保存位置")
         .setDesc(this.plugin.canHostImages
-          ? `本地下载保持默认；云端图片会写入稳定链接，不下载到本地。已使用 ${formatBytes(this.plugin.hostedMediaUsedBytes)} / ${formatBytes(this.plugin.hostedMediaQuotaBytes)}。请勿公开分享包含云端图片链接的笔记。`
-          : "云端图片目前处于只读和转存宽限期：可以将已有图片下载回本地，但不能创建新的云端图片。")
+          ? this.plugin.settings.imageDeliveryMode === "hosted_link"
+            ? `图片会保存到微同步云端，以图片链接形式插入到笔记中。已使用：${formatBytes(this.plugin.hostedMediaUsedBytes)} / ${formatBytes(this.plugin.hostedMediaQuotaBytes)}。`
+            : "图片会下载到 Obsidian 本地 vault 中。"
+          : "云端图片目前处于只读宽限期：不能创建新的云端图片。")
         .addDropdown((dropdown) =>
           dropdown
-            .addOption("local", "下载到 Obsidian 本地（默认）")
-            .addOption("hosted_link", "保存在微同步云端，以链接插入笔记")
+            .addOption("local", "保存到本地")
+            .addOption("hosted_link", "保存到微同步云端")
             .setValue(this.plugin.settings.imageDeliveryMode)
             .onChange(async (value) => {
               try {
@@ -2288,26 +2244,13 @@ class WeTongbuSettingTab extends PluginSettingTab {
                 this.display();
               }
             }),
-        )
-        .addButton((button) =>
-          button.setButtonText("将云端图片转存到本地").onClick(async () => {
-            try {
-              button.setDisabled(true);
-              const result = await this.plugin.migrateHostedImagesToLocal();
-              new Notice(`已转存 ${result.images} 张图片，更新 ${result.notes} 篇笔记`);
-            } catch (error) {
-              new Notice(`转存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-            } finally {
-              button.setDisabled(false);
-            }
-          }),
         );
     } else {
       new Setting(containerEl)
         .setName("图片保存位置")
         .setDesc(this.plugin.accountLoggedIn
-          ? "当前套餐使用本地下载。开通有效 Pro 后，可选择将图片保存在微同步云端，并在笔记中插入稳定链接。"
-          : "图片会下载到 Obsidian 本地。登录并开通 Pro 后，可选择云端图片链接。");
+          ? "当前套餐使用本地下载。开通有效 Plus 后，可选择将图片保存在微同步云端，并在笔记中插入稳定链接。"
+          : "图片会下载到 Obsidian 本地。登录并开通 Plus 后，可选择云端图片链接。");
     }
 
     new Setting(containerEl)
@@ -2410,7 +2353,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .setDesc(
         this.plugin.pairingCode
           ? `绑定码 ${this.plugin.pairingCode}，有效至 ${new Date(this.plugin.pairingExpiresAt).toLocaleTimeString()}`
-          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成连接；Free 无需登录账号",
+          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成连接；自助版无需登录账号",
       )
       .addButton((button) =>
         button.setButtonText("生成 6 位绑定码").onClick(async () => {
@@ -2456,7 +2399,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
       .setName("立即同步")
       .setDesc(this.plugin.settings.vaultSyncEnabled
         ? "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除"
-        : "检查飞书、网页和微信剪藏任务；开启电脑和手机同步后也会同步 Vault 文件")
+        : "检查飞书、网页和微信剪藏任务；开启多端同步后也会同步 Vault 文件")
       .addButton((button) =>
         button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
       );
@@ -2486,8 +2429,8 @@ class WeTongbuSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("电脑和手机同步")
-      .setDesc(`在多台设备间双向同步整个 Vault（类 Remotely Save）。${this.plugin.settings.vaultSyncAutoEnablePending && !this.plugin.settings.vaultSyncEnabled ? "完成对象存储测试或账号授权后会自动开启。" : "同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"}`)
+      .setName("多端同步")
+      .setDesc(`在多台设备间双向同步整个 Vault。${this.plugin.settings.vaultSyncAutoEnablePending && !this.plugin.settings.vaultSyncEnabled ? "完成对象存储测试或账号授权后会自动开启。" : "同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"}`)
       .addToggle((toggle) =>
       toggle
           .setValue(this.plugin.settings.vaultSyncEnabled)
@@ -2501,7 +2444,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
               } else {
                 new Notice("Vault 多端同步已暂停");
               }
-              this.display();
+              this.displayPreservingScroll();
             } catch (error) {
               new Notice(`Vault 同步设置失败：${error instanceof Error ? error.message : String(error)}`, 10000);
               toggle.setValue(this.plugin.settings.vaultSyncEnabled);
@@ -2562,6 +2505,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
           .addOption("0.5", "50%（默认）")
           .addOption("0.7", "70%")
           .addOption("0.9", "90%")
+          .addOption("1", "100%")
           .setValue(String(this.plugin.settings.vaultSafetyRatio))
           .setDisabled(!this.plugin.settings.vaultSafetyEnabled)
           .onChange(async (value) => {
@@ -2601,54 +2545,74 @@ class WeTongbuSettingTab extends PluginSettingTab {
     }
 
     const hasPluginToken = this.plugin.hasPluginToken();
-    if (this.plugin.accountPlanType === "pro") {
+    if (this.plugin.accountPlanType === "pro" && !this.plugin.accountLoggedIn) {
       new Setting(containerEl)
-        .setName("Pro 账号恢复")
-        .setDesc("Pro 不使用本地恢复码。更换设备或重装插件后，点击上方“登录 Pro 账号”，登录后会自动恢复当前账号和 Vault。");
-    } else if (!this.plugin.settings.syncTargetId || !hasPluginToken) {
-      new Setting(containerEl)
-        .setName(hasPluginToken ? "更换设备与恢复（低频）" : "恢复当前 Vault")
-        .setDesc(hasPluginToken
-          ? "仅在更换电脑或重装插件后，使用之前保存的 Free 恢复码恢复原 Vault"
-          : "Pro 用户请点击上方“登录 Pro 账号”，登录后会自动恢复插件凭证；Free 用户可使用之前保存的恢复码，不会删除本地文章")
-        .addText((text) => {
-          text.inputEl.type = "password";
-          text
-            .setPlaceholder("请输入恢复码")
-            .setValue(this.recoveryTokenInput)
-            .onChange((value) => { this.recoveryTokenInput = value; });
-        })
-        .addButton((button) => button
-          .setButtonText(hasPluginToken ? "恢复 Free Vault" : "使用 Free 恢复码")
-          .onClick(async () => {
-            try {
-              await this.plugin.recoverFreeVault(this.recoveryTokenInput);
-              this.recoveryTokenInput = "";
-              this.display();
-              new Notice("Free Vault 已恢复，请保存新的恢复码");
-            } catch (error) {
-              new Notice(`恢复失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-            }
-          }));
-    } else {
+        .setName("账号恢复")
+        .setDesc("Plus 用户请点击上方“登录账号”，登录后会自动恢复当前账号和 Vault。");
+    }
+    if (this.plugin.accountPlanType !== "pro") {
+      const needsRecoveryInput = !this.plugin.settings.syncTargetId || !hasPluginToken;
       const recoverySetting = new Setting(containerEl)
-        .setName("更换设备与恢复（低频）")
+        .setName("恢复当前 Vault")
+        .setDesc(needsRecoveryInput
+          ? "自助版用户可使用之前保存的恢复码恢复当前 Vault，不会删除本地文章。"
+          : "当前 Vault 已连接；更换设备时请使用下方保存的恢复码恢复。");
+      if (needsRecoveryInput) {
+        recoverySetting
+          .addText((text) => {
+            text.inputEl.type = "password";
+            text
+              .setPlaceholder("请输入恢复码")
+              .setValue(this.recoveryTokenInput)
+              .onChange((value) => { this.recoveryTokenInput = value; });
+          })
+          .addButton((button) => button
+            .setButtonText(hasPluginToken ? "恢复 Free Vault" : "使用 Free 恢复码")
+            .onClick(async () => {
+              try {
+                await this.plugin.recoverFreeVault(this.recoveryTokenInput);
+                this.recoveryTokenInput = "";
+                this.display();
+                new Notice("Free Vault 已恢复，请保存新的恢复码");
+              } catch (error) {
+                new Notice(`恢复失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              }
+            }));
+      }
+
+      const recoveryTokenSetting = new Setting(containerEl)
+        .setName("更换设备与恢复（重要）")
         .setDesc(
           this.plugin.recoveryToken
             ? `请保存到安全位置，用于更换设备或重装插件：${this.plugin.recoveryToken}`
-            : "仅在更换设备或重装插件后使用；重新生成后旧恢复码立即失效",
+            : "连接当前 Vault 后可在这里生成恢复码；重新生成后旧恢复码立即失效",
         );
-      recoverySetting.addButton((button) => button
-        .setButtonText(this.plugin.recoveryToken ? "重新生成恢复码" : "生成恢复码")
-        .onClick(async () => {
-          try {
-            await this.plugin.rotateRecoveryToken();
-            this.display();
-            new Notice("已生成新的恢复码，旧恢复码已失效");
-          } catch (error) {
-            new Notice(`恢复码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-          }
-        }));
+      if (this.plugin.recoveryToken) {
+        recoveryTokenSetting.addButton((button) => button
+          .setButtonText("复制恢复码")
+          .onClick(async () => {
+            try {
+              if (!navigator.clipboard?.writeText) throw new Error("当前环境不支持复制");
+              await navigator.clipboard.writeText(this.plugin.recoveryToken);
+              new Notice("恢复码已复制，请保存到安全位置");
+            } catch (error) {
+              new Notice(`复制恢复码失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            }
+          }));
+      }
+      if (this.plugin.settings.syncTargetId && hasPluginToken) {
+        recoveryTokenSetting.addButton((button) => button
+          .setButtonText(this.plugin.recoveryToken ? "重新生成恢复码" : "生成恢复码")
+          .onClick(async () => {
+            try {
+              await this.plugin.rotateRecoveryToken();
+              this.display();
+              new Notice("已生成新的恢复码，旧恢复码已失效");
+            } catch (error) {
+              new Notice(`恢复码生成失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            }
+          }));
+      }
     }
 
     new Setting(containerEl)
