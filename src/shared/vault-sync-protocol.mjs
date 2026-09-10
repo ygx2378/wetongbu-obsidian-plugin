@@ -31,7 +31,7 @@ export const VAULT_FILE_BLOCK_STATUS = Object.freeze({
  */
 export function normalizeVaultPath(rawPath) {
   if (typeof rawPath !== "string" || rawPath.length === 0 || rawPath.length > 1024) return null;
-  let p = rawPath.replace(/\\/g, "/");
+  let p = rawPath.replace(/\\/g, "/").normalize("NFC");
   if (p.startsWith("/")) p = p.slice(1);
   if (p.endsWith("/")) p = p.slice(0, -1);
   if (p.length === 0) return null;
@@ -40,12 +40,23 @@ export function normalizeVaultPath(rawPath) {
   for (const part of parts) {
     if (part === "" || part === "." || part === "..") return null;
     if (/[\x00-\x1f]/.test(part)) return null;
+    // The Vault can be opened on Windows, macOS, iOS, and Android. Reject
+    // names that cannot round-trip on Windows, including reserved device
+    // names and trailing dots/spaces.
+    if (/[<>:"|?*]/.test(part) || /[. ]$/.test(part)
+      || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(part)) return null;
   }
   // 命中跳过前缀（.obsidian/ 等）则不同步。
   for (const skip of VAULT_SYNC_SKIP_PREFIXES) {
     if (p === skip.slice(0, -1) || p.startsWith(skip)) return null;
   }
   return p;
+}
+
+/** A collision key for filesystems that are case-insensitive or NFD-based. */
+export function portableVaultPathKey(rawPath) {
+  const normalized = normalizeVaultPath(rawPath);
+  return normalized ? normalized.normalize("NFC").toLocaleLowerCase("en-US") : null;
 }
 
 /**

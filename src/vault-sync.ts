@@ -13,7 +13,7 @@
 //      b. 远端新增/修改 → 从 storage 下载 + 写入 vault
 //      c. 本地删除 → storage delete + commit tombstone
 //      d. 远端删除 → vault trash
-//      e. 冲突 → 本地改名（冲突副本）+ 重新上传
+//      e. 冲突 → 先比较内容；仅内容不同才本地改名为唯一冲突副本并重新上传
 //   7. 推进 prevSync
 //
 // 前向保证：每个文件成功后立即更新内存中的 prevSync；整体成功后一次持久化。
@@ -35,14 +35,22 @@ import {
 } from "./vault-sync-deletion.ts";
 import type { VaultSyncStorage } from "./vault-sync-storage";
 import { sha256Hex as computeHash } from "./shared/hash.ts";
-import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
+import { normalizeMarkdownForCompare } from "./article-dedupe.ts";
+import { normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
 import type { VaultSyncRemoteClient, ManifestItem } from "./vault-sync-remote";
 
 function manifestAsMap(items: ManifestItem[]): Map<string, FileEntity> {
   const map = new Map<string, FileEntity>();
+  const portablePaths = new Map<string, string>();
   for (const item of items) {
     const path = normalizeVaultPath(item.path);
-    if (!path) continue;
+    if (!path) throw new Error(`远端存在非法路径：${String(item.path)}`);
+    const portableKey = portableVaultPathKey(path)!;
+    const previousPath = portablePaths.get(portableKey);
+    if (previousPath && previousPath !== path) {
+      throw new Error(`远端存在跨平台路径冲突：${previousPath} 与 ${path}`);
+    }
+    portablePaths.set(portableKey, path);
     map.set(path, {
       path,
       contentHash: item.contentHash,
@@ -128,6 +136,15 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     // 2. 扫描本地
     const scan = await scanLocalFiles(app, rootFolder);
     const localIndex = scan.index;
+    if (scan.pathCollisions.length > 0) {
+      const examples = scan.pathCollisions.slice(0, 3).map((paths) => paths.join(" / ")).join("；");
+      notify(`Vault 同步暂停：发现跨平台路径冲突（${examples}），请先重命名其中一个文件`);
+      return { ...result, aborted: true };
+    }
+    if (scan.invalidPaths.length > 0) {
+      notify(`Vault 同步暂停：有 ${scan.invalidPaths.length} 个文件名不兼容跨平台同步（${scan.invalidPaths.slice(0, 3).join("、")}）`);
+      return { ...result, aborted: true };
+    }
     if (scan.unreadablePaths.length > 0) {
       notify(`Vault 同步暂停：有 ${scan.unreadablePaths.length} 个文件暂时无法读取，未传播删除`);
       return { ...result, aborted: true };
@@ -161,12 +178,12 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       for (const [p, ent] of prevMap) {
         remoteMap.set(p, { ...ent, revision: ent.revision ?? 0 });
       }
-      for (const item of manifest.items) {
-        const n = item.path;
-        remoteMap.set(n, {
-          path: n, contentHash: item.contentHash, byteSize: item.byteSize,
-          mtimeMs: item.mtimeMs, revision: item.revision, isDeleted: item.isDeleted,
-        });
+      for (const [path, entry] of manifestAsMap(manifest.items)) {
+        const portableKey = portableVaultPathKey(path)!;
+        const collision = [...remoteMap.keys()].find((existingPath) =>
+          existingPath !== path && portableVaultPathKey(existingPath) === portableKey);
+        if (collision) throw new Error(`远端存在跨平台路径冲突：${collision} 与 ${path}`);
+        remoteMap.set(path, entry);
       }
     }
 
@@ -226,6 +243,8 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     const conflictPaths: string[] = [];
+    const conflictUpdates: Array<{ path: string; originalPath: string; createdAt: string; localHash: string | null; remoteHash: string | null }> = [];
+    const conflictAssetAliases = new Map<string, string>();
     let hadFailures = false;
     let hasUnresolvedDeletion = false;
     const prevUpdates: Array<{ path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean }> = [];
@@ -245,14 +264,17 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         const applied = await apply(
           op,
           deletionAction === "delete" || deletionAction === "restore" ? deletionAction : undefined,
+          conflictAssetAliases,
         );
         if (applied.prevUpdate) prevUpdates.push(applied.prevUpdate);
+        if (applied.prevUpdates) prevUpdates.push(...applied.prevUpdates);
         if (applied.counts.uploaded) result.uploaded += applied.counts.uploaded;
         if (applied.counts.downloaded) result.downloaded += applied.counts.downloaded;
         if (applied.counts.deletedLocal) result.deletedLocal += applied.counts.deletedLocal;
         if (applied.counts.deletedRemote) result.deletedRemote += applied.counts.deletedRemote;
         if (applied.counts.conflicts) result.conflicts += applied.counts.conflicts;
         if (applied.conflictPath) conflictPaths.push(applied.conflictPath);
+        if (applied.conflictUpdate) conflictUpdates.push(applied.conflictUpdate);
       } catch (error) {
         // 单文件失败不阻塞整体；该文件下次同步会重试（prevSync 未推进）。
         hadFailures = true;
@@ -274,7 +296,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     const cursor = hadFailures || hasUnresolvedDeletion
       ? (prev?.lastCursor ?? 0)
       : Math.max(manifest.maxRevision, prev?.lastCursor ?? 0);
-    const nextState = advancePrevSync(prev, deviceId, prevUpdates, cursor);
+    const nextState = advancePrevSync(prev, deviceId, prevUpdates, cursor, conflictUpdates);
     await store.save(nextState);
 
     result.conflictPaths = conflictPaths;
@@ -292,10 +314,16 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     return 1;
   }
 
-  async function apply(op: PlannedOp, deletionAction?: "delete" | "restore"): Promise<{
+  async function apply(
+    op: PlannedOp,
+    deletionAction?: "delete" | "restore",
+    conflictAssetAliases: Map<string, string> = new Map(),
+  ): Promise<{
     counts: Partial<SyncResult>;
     prevUpdate?: { path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean };
+    prevUpdates?: Array<{ path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean }>;
     conflictPath?: string;
+    conflictUpdate?: { path: string; originalPath: string; createdAt: string; localHash: string | null; remoteHash: string | null };
   }> {
     const { decision, path } = op;
     const empty = { counts: {} };
@@ -319,7 +347,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const r = resp.results[0];
       if (r.status === "conflict") {
         // commit 被判冲突（别的设备刚写了）：走冲突副本路径。
-        return await applyConflict(op);
+        return await applyConflict(op, r.head ?? op.remote, conflictAssetAliases);
       }
       return {
         counts: { uploaded: 1 },
@@ -358,9 +386,12 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       }
       const resp = await remote.commit([{ path, byteSize: 0, mtimeMs: Date.now(), isDeleted: true, expectedRevision: op.prev?.revision }]);
       const r = resp.results[0];
+      if (r.status !== "committed") {
+        throw new Error(`删除提交未完成：${path}`);
+      }
       return {
         counts: { deletedRemote: 1 },
-        prevUpdate: r.status === "committed" ? { path, contentHash: null, byteSize: 0, mtimeMs: Date.now(), revision: r.revision, isDeleted: true } : undefined,
+        prevUpdate: { path, contentHash: null, byteSize: 0, mtimeMs: Date.now(), revision: r.revision, isDeleted: true },
       };
     }
 
@@ -399,71 +430,220 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     if (decision === VAULT_SYNC_DECISION.CONFLICT) {
-      return await applyConflict(op);
+      return await applyConflict(op, op.remote, conflictAssetAliases);
     }
 
     return empty;
   }
 
-  async function applyConflict(op: PlannedOp): Promise<{
+  async function applyConflict(
+    op: PlannedOp,
+    latestHead?: FileEntity | {
+    contentHash: string | null;
+    byteSize: number;
+    mtimeMs: number;
+    isDeleted: boolean;
+    revision: number;
+    lastWriterDeviceId: string | null;
+    } | null,
+    conflictAssetAliases: Map<string, string> = new Map(),
+  ): Promise<{
     counts: Partial<SyncResult>;
     prevUpdate?: { path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean };
+    prevUpdates?: Array<{ path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean }>;
     conflictPath?: string;
+    conflictUpdate?: { path: string; originalPath: string; createdAt: string; localHash: string | null; remoteHash: string | null };
   }> {
-    // 双方都改：本地版本改名为冲突副本并上传，远端版本下载覆盖本地原路径。
+    // 双方都改：先读取远端 head。若只是换行/BOM 等文本格式差异，直接
+    // 采用远端版本，不生成冲突副本；真正不同才保留可追溯的本地副本。
     const local = op.local;
-    const remoteEnt = op.remote;
-    const conflictPath = conflictCopyName(op.path);
-    if (local) {
-      const localBody = await app.vault.readBinary(fileByPath(app, op.path));
-      const localBytes = new Uint8Array(localBody);
-      const localHash = await computeHash(localBytes);
-      // 上传冲突副本到 storage（按 hash 寻址，新 path 指向同 hash）+ commit 为新文件。
-      const upload = await storage.put(localHash, localBytes);
-      await remote.commit([{
-        path: conflictPath, contentHash: localHash, byteSize: localBytes.byteLength,
-        storageByteSize: upload?.storageByteSize, uploadId: upload?.uploadId, mtimeMs: local.mtimeMs,
-      }]);
-    }
+    const remoteEnt = latestHead ?? op.remote;
+    const localBody = local ? new Uint8Array(await app.vault.readBinary(fileByPath(app, op.path))) : null;
+    const conflictBody = localBody && isMarkdownPath(op.path) && conflictAssetAliases.size > 0
+      ? new TextEncoder().encode(rewriteMarkdownAssetReferences(
+        op.path,
+        new TextDecoder().decode(localBody),
+        conflictAssetAliases,
+      ))
+      : localBody;
+    const localHash = conflictBody ? await computeHash(conflictBody) : null;
     if (remoteEnt) {
       if (!remoteEnt.contentHash) throw new Error(`冲突的远端条目缺 contentHash：${op.path}`);
       const body = await storage.get(remoteEnt.contentHash);
+      if (localBody && isMarkdownPath(op.path)
+        && normalizeMarkdownForCompare(new TextDecoder().decode(localBody)) === normalizeMarkdownForCompare(new TextDecoder().decode(body))) {
+        await writeVaultFile(app, op.path, body);
+        return {
+          counts: { downloaded: 1 },
+          prevUpdate: { path: op.path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength, mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false },
+        };
+      }
+      let conflictPath = await allocateConflictPath(op.path);
+      let conflictRevision: number | undefined;
+      if (localBody) {
+        // 上传冲突副本到 storage（按 hash 寻址，新 path 指向同 hash）+ commit。
+        const upload = await storage.put(localHash!, conflictBody!);
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const response = await remote.commit([{
+            path: conflictPath, contentHash: localHash!, byteSize: conflictBody!.byteLength,
+            storageByteSize: upload?.storageByteSize, uploadId: upload?.uploadId, mtimeMs: local!.mtimeMs,
+            expectedRevision: 0,
+          }]);
+          const committed = response.results[0];
+          if (committed?.status === "committed") {
+            conflictRevision = committed.revision;
+            break;
+          }
+          if (attempt === 2) throw new Error(`冲突副本路径也发生冲突：${conflictPath}`);
+          conflictPath = addConflictSuffix(conflictPath, attempt + 2);
+        }
+      }
       // 把远端版本写到原路径（覆盖本地旧内容）。为安全：先把本地原文件改名成冲突副本，
       // 再写远端版本到原路径。Obsidian 的 vault.rename 实现原子改名。
       if (local) {
         await renameVaultFile(app, op.path, conflictPath);
+        if (conflictBody) await writeVaultFile(app, conflictPath, conflictBody);
+        if (!isMarkdownPath(op.path)) {
+          conflictAssetAliases.set(op.path, conflictPath);
+          await rewriteExistingConflictMarkdownReferences(app, op.path, conflictPath);
+        }
       }
       await writeVaultFile(app, op.path, body);
+      const conflictFiles = conflictBody && conflictRevision !== undefined
+        ? [{ path: conflictPath, contentHash: localHash, byteSize: conflictBody.byteLength, mtimeMs: local!.mtimeMs, revision: conflictRevision, isDeleted: false }]
+        : [];
+      return {
+        counts: { conflicts: 1 },
+        conflictPath,
+        prevUpdates: conflictFiles,
+        conflictUpdate: {
+          path: conflictPath,
+          originalPath: op.path,
+          createdAt: new Date().toISOString(),
+          localHash,
+          remoteHash: remoteEnt.contentHash,
+        },
+        // 原路径以远端为准；冲突副本也写入 prevSync，避免下一轮再次上传。
+        prevUpdate: {
+          path: op.path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength,
+          mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false,
+        },
+      };
     }
-    return {
-      counts: { conflicts: 1 },
-      conflictPath,
-      // 冲突路径的 prevSync 不推进，让用户手动处理；原路径以远端为准。
-      prevUpdate: remoteEnt ? {
-        path: op.path, contentHash: remoteEnt.contentHash, byteSize: remoteEnt.byteSize,
-        mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false,
-      } : undefined,
-    };
+    return { counts: { conflicts: 1 } };
+  }
+
+  async function allocateConflictPath(originalPath: string): Promise<string> {
+    const now = new Date();
+    const base = conflictCopyName(originalPath, now);
+    let candidate = base;
+    let suffix = 2;
+    while (app.vault.getAbstractFileByPath(candidate)) {
+      const dot = base.lastIndexOf(".");
+      candidate = dot > 0 ? `${base.slice(0, dot)}-${suffix}${base.slice(dot)}` : `${base}-${suffix}`;
+      suffix += 1;
+    }
+    return candidate;
   }
 
   return { runOnce };
 }
 
+function isMarkdownPath(path: string): boolean {
+  return /\.(?:md|markdown)$/i.test(path);
+}
+
+function addConflictSuffix(path: string, suffix: number): string {
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  if (dot > slash) return `${path.slice(0, dot)}-${suffix}${path.slice(dot)}`;
+  return `${path}-${suffix}`;
+}
+
+function relativeVaultPathForSync(from: string, to: string): string {
+  const fromParts = from.split("/").filter(Boolean);
+  const toParts = to.split("/").filter(Boolean);
+  let common = 0;
+  while (common < fromParts.length && common < toParts.length && fromParts[common] === toParts[common]) common += 1;
+  return [...fromParts.slice(common).map(() => ".."), ...toParts.slice(common)].join("/") || toParts.at(-1) || "";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Repoint generated Markdown image links after their binary conflict copy is renamed. */
+function rewriteMarkdownAssetReferences(
+  notePath: string,
+  body: string,
+  aliases: Map<string, string>,
+): string {
+  const folder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+  let rewritten = body;
+  for (const [originalPath, conflictPath] of aliases) {
+    const from = relativeVaultPathForSync(folder, originalPath);
+    const to = relativeVaultPathForSync(folder, conflictPath);
+    if (!from || !to) continue;
+    const markdownLink = new RegExp(`(!\\[[^\\]]*\\]\\(\\s*<?)${escapeRegExp(from)}(?=[>\\s)])`, "g");
+    rewritten = rewritten.replace(markdownLink, `$1${to}`);
+    const wikiLink = new RegExp(`(!?\\[\\[)${escapeRegExp(from)}(?=[#|\\]])`, "g");
+    rewritten = rewritten.replace(wikiLink, `$1${to}`);
+  }
+  return rewritten;
+}
+
+async function rewriteExistingConflictMarkdownReferences(app: App, originalPath: string, conflictPath: string) {
+  const aliases = new Map([[originalPath, conflictPath]]);
+  if (typeof (app.vault as any).getMarkdownFiles !== "function") return;
+  for (const file of app.vault.getMarkdownFiles()) {
+    if (!file.path.includes(".sync-conflict-")) continue;
+    const body = await app.vault.cachedRead(file);
+    const rewritten = rewriteMarkdownAssetReferences(file.path, body, aliases);
+    if (rewritten === body) continue;
+    const adapter = app.vault.adapter as any;
+    const temporary = `${file.path}.wetongbu-conflict-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+    await adapter.write(temporary, rewritten);
+    if ((await adapter.read(temporary)) !== rewritten) {
+      await adapter.remove(temporary).catch(() => {});
+      throw new Error(`冲突副本引用更新校验失败：${file.path}`);
+    }
+    try {
+      if (typeof adapter.rename === "function") await adapter.rename(temporary, file.path);
+      else {
+        await adapter.write(file.path, rewritten);
+        if ((await adapter.read(file.path)) !== rewritten) throw new Error(`冲突副本引用替换校验失败：${file.path}`);
+        await adapter.remove(temporary).catch(() => {});
+      }
+    } catch (error) {
+      await adapter.remove(temporary).catch(() => {});
+      throw error;
+    }
+  }
+}
+
 // ---- Obsidian Vault 操作辅助 ----
 
 function fileByPath(app: App, path: string) {
-  const file = app.vault.getAbstractFileByPath(path);
+  const file = fileByPathOrNull(app, path);
   if (!file) throw new Error(`vault file not found: ${path}`);
   return file as any;
+}
+
+function fileByPathOrNull(app: App, path: string) {
+  const direct = app.vault.getAbstractFileByPath(path);
+  if (direct) return direct;
+  const normalized = normalizeVaultPath(path);
+  if (!normalized || typeof (app.vault as any).getFiles !== "function") return null;
+  return app.vault.getFiles().find((file: any) => normalizeVaultPath(file.path) === normalized) ?? null;
 }
 
 async function writeVaultFile(app: App, path: string, body: Uint8Array) {
   // writeBinary 需要 ArrayBuffer；Uint8Array 的 buffer 可能是更大 ArrayBuffer 的视图，
   // 用 slice 切出精确范围。
   const arrayBuffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
-  const existing = app.vault.getAbstractFileByPath(path);
+  const existing = fileByPathOrNull(app, path);
   if (existing) {
-    await app.vault.adapter.writeBinary(path, arrayBuffer);
+    await app.vault.adapter.writeBinary((existing as any).path, arrayBuffer);
   } else {
     // 确保父目录存在。
     const slash = path.lastIndexOf("/");
@@ -479,14 +659,14 @@ async function writeVaultFile(app: App, path: string, body: Uint8Array) {
 }
 
 async function trashVaultFile(app: App, path: string) {
-  const file = app.vault.getAbstractFileByPath(path);
+  const file = fileByPathOrNull(app, path);
   if (file) {
     await app.fileManager.trashFile(file as any);
   }
 }
 
 async function renameVaultFile(app: App, oldPath: string, newPath: string) {
-  const file = app.vault.getAbstractFileByPath(oldPath);
+  const file = fileByPathOrNull(app, oldPath);
   if (!file) return;
   const slash = newPath.lastIndexOf("/");
   if (slash > 0) {

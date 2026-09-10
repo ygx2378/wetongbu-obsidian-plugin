@@ -9,7 +9,10 @@ export interface VaultSyncRetrySchedulerOptions {
 
 export function isRetryableVaultSyncError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /(?:tls|network|offline|failed to fetch|request failed|timed?\s*out|timeout|econn|enotfound|temporar|请求过于频繁|网络|连接[^，。]*失败|http\s+(?:408|425|429|5\d\d))/i.test(message);
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code ?? "") : "";
+  return code === "block_reclamation_in_progress"
+    || /(?:tls|network|offline|failed to fetch|request failed|timed?\s*out|timeout|econn|enotfound|temporar|请求过于频繁|网络|连接[^，。]*失败|http\s+(?:408|425|429|5\d\d))/i.test(message);
 }
 
 export function createVaultSyncRetryScheduler(options: VaultSyncRetrySchedulerOptions) {

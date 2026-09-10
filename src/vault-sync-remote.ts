@@ -3,7 +3,7 @@
 // 用 vault device token（registerDevice 返回的一次性 token）认证。
 
 import { requestUrl } from "obsidian";
-import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
+import { normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
 import type { FileEntity } from "./vault-sync-diff";
 
 export interface ManifestItem {
@@ -28,6 +28,8 @@ export interface CommitResult {
   path: string;
   status: "committed" | "conflict";
   revision?: number;
+  /** 服务端发现当前 head 已是同一内容，安全地把重试视为成功。 */
+  alreadyApplied?: boolean;
   objectKey?: string | null;
   head?: {
     contentHash: string | null;
@@ -193,9 +195,14 @@ export class VaultSyncRemoteClient {
 /** 把 ManifestItem[] 转成 path → FileEntity 的 Map，供 diff 用。 */
 export function manifestAsMap(items: ManifestItem[]): Map<string, FileEntity> {
   const map = new Map();
+  const portablePaths = new Map<string, string>();
   for (const item of items) {
     const n = normalizeVaultPath(item.path);
-    if (!n) continue;
+    if (!n) throw new Error(`远端存在非法路径：${String(item.path)}`);
+    const portableKey = portableVaultPathKey(n)!;
+    const previous = portablePaths.get(portableKey);
+    if (previous && previous !== n) throw new Error(`远端存在跨平台路径冲突：${previous} 与 ${n}`);
+    portablePaths.set(portableKey, n);
     map.set(n, {
       path: n,
       contentHash: item.contentHash,

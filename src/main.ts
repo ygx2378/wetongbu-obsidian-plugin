@@ -22,10 +22,21 @@ import { assertCompletionTaskIdentity, normalizeCompletionSourceUrl } from "./co
 import { resolveAssetTarget } from "./asset-target";
 import { unzipWebclipArchive } from "./webclip-zip";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
-import type { DeletionAction, DeletionResolution } from "./vault-sync-deletion";
+import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
 import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
 import { sha256Hex } from "./shared/hash";
 import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
+import {
+  articleCandidate,
+  articleAssetFingerprintFromBodies,
+  articleAssetFingerprintFromVault,
+  ensureGeneratedMarkers,
+  mergeArticleMarkdown,
+  normalizeArticleBodyForCompare,
+  normalizeArticleSourceUrl,
+  splitMarkdownFrontmatter,
+  type ArticleCandidate,
+} from "./article-dedupe.ts";
 import {
   assertBucketName,
   assertR2Endpoint,
@@ -136,6 +147,50 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
 
 const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
 const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
+const WETONGBU_SETTING_LAYOUT_STYLE_ID = "wetongbu-setting-layout";
+const WETONGBU_SETTING_LAYOUT_CSS = `
+.wetongbu-setting-tab {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.wetongbu-setting-tab .setting-item,
+.wetongbu-setting-tab .setting-item-info,
+.wetongbu-setting-tab .setting-item-description,
+.wetongbu-setting-tab .setting-item-control {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.wetongbu-setting-tab .setting-item {
+  width: 100%;
+}
+.wetongbu-setting-tab .setting-item-info,
+.wetongbu-setting-tab .setting-item-description {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.wetongbu-setting-tab .setting-item-control {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+}
+.wetongbu-setting-tab .setting-item-control > * {
+  max-width: 100%;
+}
+.wetongbu-setting-tab.wetongbu-mobile-settings,
+.wetongbu-setting-scroll.wetongbu-mobile-settings {
+  overflow-x: hidden;
+  overscroll-behavior-x: none;
+  touch-action: pan-y;
+}
+.wetongbu-setting-tab.wetongbu-mobile-settings input,
+.wetongbu-setting-tab.wetongbu-mobile-settings select,
+.wetongbu-setting-tab.wetongbu-mobile-settings button {
+  min-width: 0;
+  max-width: 100%;
+}
+`;
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -355,6 +410,12 @@ export default class WeTongbuPlugin extends Plugin {
         this.vaultSyncRetry?.wake();
       }
     });
+    document.getElementById(WETONGBU_SETTING_LAYOUT_STYLE_ID)?.remove();
+    const settingsStyle = document.createElement("style");
+    settingsStyle.id = WETONGBU_SETTING_LAYOUT_STYLE_ID;
+    settingsStyle.textContent = WETONGBU_SETTING_LAYOUT_CSS;
+    document.head.appendChild(settingsStyle);
+    this.register(() => settingsStyle.remove());
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
     addIcon("wetongbu-sync", WETONGBU_RIBBON_ICON);
     this.addRibbonIcon("wetongbu-sync", "微同步：立即同步", () => {
@@ -891,6 +952,10 @@ export default class WeTongbuPlugin extends Plugin {
 
   openAccountCenter() {
     window.open("https://app.wetongbu.com/account/", "_blank");
+  }
+
+  openPromotionCenter() {
+    window.open("https://app.wetongbu.com/account/gift-cards", "_blank");
   }
 
   async configureUserStorage(accessKeyInput: string, secretKeyInput: string): Promise<"verified" | "migration_pending"> {
@@ -1469,6 +1534,19 @@ export default class WeTongbuPlugin extends Plugin {
     await this.runVaultSync(false, { fingerprint, decisions });
   }
 
+  async openVaultConflictReview() {
+    const state = await createPrevSyncStore(this.app).load();
+    new VaultConflictReviewModal(this.app, this, state?.conflicts ?? {}).open();
+  }
+
+  async resolveVaultConflict(path: string) {
+    const store = createPrevSyncStore(this.app);
+    const state = await store.load();
+    if (!state?.conflicts?.[path]) return;
+    state.conflicts[path] = { ...state.conflicts[path], status: "resolved" };
+    await store.save(state);
+  }
+
   async allowVaultSafetyOnce(fingerprint: string) {
     if (!fingerprint) return;
     this.vaultSafetyOverrideFingerprint = fingerprint;
@@ -1516,7 +1594,7 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async setCurrentDeviceAsCaptureReceiver() {
-    if (this.accountPlanType === "pro") throw new Error("托管版不需要设置剪藏接收设备");
+    if (this.accountPlanType === "pro") throw new Error("Plus 托管版不需要设置剪藏接收设备");
     const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!token || !this.settings.syncTargetId) throw new Error("请先连接 Obsidian Vault");
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -1919,7 +1997,9 @@ export default class WeTongbuPlugin extends Plugin {
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
 
-    let markdown = task.markdown;
+    // New notes carry a managed body marker. It lets later captures update
+    // the same article without replacing user-written notes around it.
+    let markdown = ensureGeneratedMarkers(task.markdown);
     const assetPlans: Array<{ asset: any; filename: string; targetPath: string; writeLocal: boolean }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
@@ -1938,20 +2018,62 @@ export default class WeTongbuPlugin extends Plugin {
       markdown = markdown.split(asset.relativePath).join(relativePath);
       assetPlans.push({ asset, filename, targetPath, writeLocal: resolved.writeLocal });
     }
-    const localAssetPlans = assetPlans.filter((plan: { writeLocal: boolean }) => plan.writeLocal);
-    if (localAssetPlans.length) await ensureFolder(this, taskAttachmentFolder);
     markdown = markdown.replace(/^[\t ]+(?=(?:!\[|\[!\[))/gm, "");
 
-    const notePath = await uniqueNotePath(
-      this,
-      noteFolder,
-      layout.noteFilename,
-    );
+    const sourceKey = normalizeArticleSourceUrl(task.manifest.sourceUrl);
+    const candidates: Array<ArticleCandidate & { file: TFile }> = [];
+    if (sourceKey) {
+      const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        const content = await this.app.vault.cachedRead(file);
+        const candidate = articleCandidate(file.path, content);
+        if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file });
+      }
+    }
+    const incomingBody = normalizeArticleBodyForCompare(splitMarkdownFrontmatter(markdown).body);
+    // Body normalization intentionally ignores generated filenames, but that
+    // alone is not enough: the same article can carry a changed image under a
+    // new generated name. Include the actual bytes of generated local assets
+    // in the no-op decision so an updated attachment is not silently lost.
+    const localIncomingAssets = task.assets.filter((asset: any) => !(asset.kind === "image" && imageLinks[asset.relativePath]));
+    const incomingAssetFingerprint = await articleAssetFingerprintFromBodies(localIncomingAssets.map((asset: any) => new Uint8Array(asset.body)));
+    if (candidates.length > 1) {
+      throw new Error("同一来源已有多个本地版本，请先在 Vault 中处理重复文章；本次未新建副本");
+    }
+    let exactCandidate: (ArticleCandidate & { file: TFile }) | undefined;
+    if (candidates.length === 1 && normalizeArticleBodyForCompare(candidates[0].body) === incomingBody) {
+      const candidateAssetFingerprint = await articleAssetFingerprintFromVault(
+        this.app.vault.adapter,
+        candidates[0].path,
+        candidates[0].body,
+      );
+      if (candidateAssetFingerprint === incomingAssetFingerprint) exactCandidate = candidates[0];
+    }
+    const existing = exactCandidate ?? candidates[0];
+    // An exact body is a successful no-op. If only the title/metadata changed,
+    // merge those fields into the authoritative note instead of making -2.
+    const metadataChanged = Boolean(existing && (
+      String(existing.frontmatter.title ?? "") !== String(task.manifest.title ?? "")
+      || String(existing.frontmatter.captured_at ?? "") !== String(task.manifest.capturedAt ?? "")
+    ));
+    if (existing && exactCandidate && !metadataChanged) {
+      const persisted = existing.content;
+      const encoded = new TextEncoder().encode(persisted);
+      try { await this.app.workspace.getLeaf(false).openFile(existing.file); } catch { /* best effort */ }
+      return {
+        notePath: existing.path,
+        files: [{ path: existing.path, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }],
+      };
+    }
+
+    const localAssetPlans = assetPlans.filter((plan: { writeLocal: boolean }) => plan.writeLocal);
     let createdNote: TFile | null = null;
     let noteCreatedByThisAttempt = false;
     const assetsCreatedByThisAttempt: string[] = [];
     let persistedMarkdown = "";
     try {
+      if (localAssetPlans.length) await ensureFolder(this, taskAttachmentFolder);
       for (const { asset, filename, targetPath } of localAssetPlans) {
         assetsCreatedByThisAttempt.push(targetPath);
         await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
@@ -1961,24 +2083,27 @@ export default class WeTongbuPlugin extends Plugin {
         }
       }
 
-      const noteBase = layout.noteFilename.replace(/\.md$/i, "");
-      const noteCandidates = this.app.vault.getFiles().filter((file) =>
-        file.parent?.path === noteFolder
-        && (file.basename === noteBase || file.basename.startsWith(`${noteBase}-`))
-      );
-      for (const candidate of noteCandidates) {
-        if (await this.app.vault.cachedRead(candidate) === markdown) {
-          createdNote = candidate;
-          break;
+      if (existing) {
+        if (!existing.managed) throw new Error("同一来源已有非微同步笔记，未覆盖也未新建；请先确认后重试");
+        const existingFolder = normalizePath(existing.file.parent?.path ?? "");
+        for (const plan of assetPlans) {
+          if (!plan.targetPath) continue;
+          const from = relativeVaultPath(noteFolder, plan.targetPath);
+          const to = relativeVaultPath(existingFolder, plan.targetPath);
+          markdown = markdown.split(`<${from}>`).join(`<${to}>`).split(from).join(to);
         }
-      }
-      if (!createdNote) {
+        const merged = mergeArticleMarkdown(existing, markdown);
+        await writeTextAtomically(this.app, existing.path, merged);
+        createdNote = existing.file;
+        persistedMarkdown = merged;
+      } else {
+        const notePath = await uniqueNotePath(this, noteFolder, layout.noteFilename);
         createdNote = await this.app.vault.create(notePath, markdown);
         noteCreatedByThisAttempt = true;
+        persistedMarkdown = await this.app.vault.adapter.read(createdNote.path);
       }
-      persistedMarkdown = await this.app.vault.adapter.read(createdNote.path);
       if (persistedMarkdown !== markdown) {
-        throw new Error("本地 Markdown 写入校验失败");
+        if (!existing) throw new Error("本地 Markdown 写入校验失败");
       }
     } catch (error) {
       if (createdNote && noteCreatedByThisAttempt) await this.app.fileManager.trashFile(createdNote);
@@ -1989,13 +2114,22 @@ export default class WeTongbuPlugin extends Plugin {
       throw error;
     }
 
+    let finalPath = createdNote.path;
+    if (existing) {
+      const desiredPath = normalizePath(`${noteFolder}/${layout.noteFilename}`);
+      if (desiredPath !== existing.path && !(await this.app.vault.adapter.exists(desiredPath))) {
+        await this.app.fileManager.renameFile(createdNote, desiredPath);
+        finalPath = desiredPath;
+        createdNote = this.app.vault.getAbstractFileByPath(desiredPath) as TFile;
+      }
+    }
     try {
       await this.app.workspace.getLeaf(false).openFile(createdNote);
     } catch (error) {
       console.warn("WeTongbu note saved but could not be opened");
     }
     const writtenFiles = [{
-      path: createdNote.path,
+      path: finalPath,
       contentHash: await sha256Hex(new TextEncoder().encode(persistedMarkdown)),
       byteSize: new TextEncoder().encode(persistedMarkdown).byteLength,
     }];
@@ -2006,7 +2140,80 @@ export default class WeTongbuPlugin extends Plugin {
         byteSize: asset.body.length,
       });
     }
-    return { notePath: createdNote.path, files: writtenFiles };
+    return { notePath: finalPath, files: writtenFiles };
+  }
+}
+
+async function writeTextAtomically(app: App, path: string, content: string) {
+  const temporary = `${path}.wetongbu-update-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  const backup = `${path}.wetongbu-update-${Date.now()}-${Math.random().toString(16).slice(2)}.bak`;
+  const adapter = app.vault.adapter as any;
+  await adapter.write(temporary, content);
+  if ((await adapter.read(temporary)) !== content) {
+    await adapter.remove(temporary).catch(() => {});
+    throw new Error("文章临时文件写入校验失败");
+  }
+  const original = await adapter.read(path);
+  await adapter.write(backup, original);
+  try {
+    if (typeof adapter.rename === "function") {
+      await adapter.rename(temporary, path);
+    } else {
+      // Older adapters cannot replace atomically. Verify the fallback and
+      // restore the original on a torn/corrupted write.
+      await adapter.write(path, content);
+      if ((await adapter.read(path)) !== content) throw new Error("文章更新替换校验失败");
+      await adapter.remove(temporary).catch(() => {});
+    }
+    if ((await adapter.read(path)) !== content) throw new Error("文章更新校验失败");
+  } catch (error) {
+    await adapter.write(path, original).catch(() => {});
+    throw error;
+  } finally {
+    if (await adapter.exists(temporary)) await adapter.remove(temporary).catch(() => {});
+    if (await adapter.exists(backup)) await adapter.remove(backup).catch(() => {});
+  }
+}
+
+class VaultConflictReviewModal extends Modal {
+  constructor(
+    app: App,
+    private plugin: WeTongbuPlugin,
+    private conflicts: Record<string, {
+      originalPath: string;
+      createdAt: string;
+      localHash: string | null;
+      remoteHash: string | null;
+      status: "pending" | "resolved";
+    }>,
+  ) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText("冲突副本记录");
+    const { contentEl } = this;
+    contentEl.empty();
+    const entries = Object.entries(this.conflicts);
+    if (!entries.length) {
+      contentEl.createEl("p", { text: "当前没有记录的同步冲突。" });
+      return;
+    }
+    contentEl.createEl("p", { text: "同内容重试不会进入这里。下面只列出内容确实不同、需要人工确认的本地冲突副本。" });
+    for (const [path, record] of entries.sort(([a], [b]) => a.localeCompare(b, "zh-Hans-CN"))) {
+      const setting = new Setting(contentEl)
+        .setName(path)
+        .setDesc(`原路径：${record.originalPath}；创建于 ${new Date(record.createdAt).toLocaleString()}`);
+      if (record.status === "pending") {
+        setting.addButton((button) => button
+          .setButtonText("标记已处理")
+          .onClick(async () => {
+            await this.plugin.resolveVaultConflict(path);
+            record.status = "resolved";
+            button.setDisabled(true).setButtonText("已处理");
+          }));
+      } else {
+        setting.addButton((button) => button.setButtonText("已处理").setDisabled(true));
+      }
+    }
   }
 }
 
@@ -2029,14 +2236,40 @@ class VaultDeletionReviewModal extends Modal {
     contentEl.createEl("p", {
       text: "为避免误删，下面的跨设备删除不会自动执行。请逐项选择：确认删除、恢复文件，或暂不处理。",
     });
+    // The deleted path is absent from the local index by definition. Reading
+    // only the current Markdown paths lets the review explain whether a
+    // same-name note remains elsewhere in this Vault, without touching file
+    // contents or changing the deletion decision.
+    const localMarkdownPaths = this.app.vault.getMarkdownFiles().map((file) => file.path);
     for (const item of pending) {
       this.decisions[item.path] = "keep";
       const isLocalDeletion = item.direction === "local_to_remote";
+      const reason = isLocalDeletion
+        ? "检测到本机文件已删除，其他设备/云端仍有此文件。"
+        : "检测到其他设备已删除此文件，本机仍保留。";
+      const duplicatePaths = findDuplicateLocalFiles(item.path, localMarkdownPaths);
+      const description = document.createDocumentFragment();
+      const reasonEl = document.createElement("div");
+      reasonEl.textContent = reason;
+      description.appendChild(reasonEl);
+      const duplicateEl = document.createElement("div");
+      duplicateEl.className = "wetongbu-duplicate-check";
+      if (duplicatePaths.length > 0) {
+        duplicateEl.textContent = `本地同名/同标题检查：发现 ${duplicatePaths.length} 个可能重复文件，请确认是否因重复而删除。`;
+        const list = document.createElement("ul");
+        for (const path of duplicatePaths) {
+          const entry = document.createElement("li");
+          entry.textContent = path;
+          list.appendChild(entry);
+        }
+        duplicateEl.appendChild(list);
+      } else {
+        duplicateEl.textContent = "本地同名/同标题检查：未发现其他匹配文件。";
+      }
+      description.appendChild(duplicateEl);
       const setting = new Setting(contentEl)
         .setName(item.path)
-        .setDesc(isLocalDeletion
-          ? "检测到本机文件已删除，其他设备/云端仍有此文件。"
-          : "检测到其他设备已删除此文件，本机仍保留。")
+        .setDesc(description)
         .addDropdown((dropdown) => {
           dropdown
             .addOption("keep", "暂不处理（保留现状）")
@@ -2189,6 +2422,11 @@ class WeTongbuSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
+    containerEl.classList.add("wetongbu-setting-tab");
+    containerEl.classList.toggle("wetongbu-mobile-settings", Platform.isMobile);
+    const scrollEl = containerEl.closest(".vertical-tab-content") as HTMLElement | null;
+    scrollEl?.classList.toggle("wetongbu-mobile-settings", Platform.isMobile);
+    scrollEl?.classList.add("wetongbu-setting-scroll");
     containerEl.empty();
     this.accessKeyInput ??= this.plugin.settings.accessKeySecretId
       ? this.app.secretStorage.getSecret(this.plugin.settings.accessKeySecretId) ?? ""
@@ -2219,6 +2457,9 @@ class WeTongbuSettingTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button.setButtonText("打开账号中心").onClick(() => this.plugin.openAccountCenter()),
+      )
+      .addButton((button) =>
+        button.setButtonText("免费月卡活动").onClick(() => this.plugin.openPromotionCenter()),
       );
 
     if ((this.plugin.accountPlanType === "pro" && this.plugin.canHostImages)
@@ -2412,6 +2653,13 @@ class WeTongbuSettingTab extends PluginSettingTab {
           .setButtonText("查看并处理")
           .onClick(() => { void this.plugin.openPendingDeletionReview(); }));
     }
+
+    new Setting(containerEl)
+      .setName("冲突副本记录")
+      .setDesc("同内容重试不会产生副本；确有差异的冲突会保留本地版本，并可在这里标记为已处理。")
+      .addButton((button) => button
+        .setButtonText("查看冲突记录")
+        .onClick(() => { void this.plugin.openVaultConflictReview(); }));
 
     new Setting(containerEl)
       .setName("自动获取剪藏笔记")
