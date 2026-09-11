@@ -147,50 +147,6 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
 
 const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
 const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
-const WETONGBU_SETTING_LAYOUT_STYLE_ID = "wetongbu-setting-layout";
-const WETONGBU_SETTING_LAYOUT_CSS = `
-.wetongbu-setting-tab {
-  width: 100%;
-  max-width: 100%;
-  min-width: 0;
-  box-sizing: border-box;
-}
-.wetongbu-setting-tab .setting-item,
-.wetongbu-setting-tab .setting-item-info,
-.wetongbu-setting-tab .setting-item-description,
-.wetongbu-setting-tab .setting-item-control {
-  min-width: 0;
-  max-width: 100%;
-  box-sizing: border-box;
-}
-.wetongbu-setting-tab .setting-item {
-  width: 100%;
-}
-.wetongbu-setting-tab .setting-item-info,
-.wetongbu-setting-tab .setting-item-description {
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-.wetongbu-setting-tab .setting-item-control {
-  flex: 0 1 auto;
-  flex-wrap: wrap;
-}
-.wetongbu-setting-tab .setting-item-control > * {
-  max-width: 100%;
-}
-.wetongbu-setting-tab.wetongbu-mobile-settings,
-.wetongbu-setting-scroll.wetongbu-mobile-settings {
-  overflow-x: hidden;
-  overscroll-behavior-x: none;
-  touch-action: pan-y;
-}
-.wetongbu-setting-tab.wetongbu-mobile-settings input,
-.wetongbu-setting-tab.wetongbu-mobile-settings select,
-.wetongbu-setting-tab.wetongbu-mobile-settings button {
-  min-width: 0;
-  max-width: 100%;
-}
-`;
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -410,12 +366,6 @@ export default class WeTongbuPlugin extends Plugin {
         this.vaultSyncRetry?.wake();
       }
     });
-    document.getElementById(WETONGBU_SETTING_LAYOUT_STYLE_ID)?.remove();
-    const settingsStyle = document.createElement("style");
-    settingsStyle.id = WETONGBU_SETTING_LAYOUT_STYLE_ID;
-    settingsStyle.textContent = WETONGBU_SETTING_LAYOUT_CSS;
-    document.head.appendChild(settingsStyle);
-    this.register(() => settingsStyle.remove());
     this.addSettingTab(new WeTongbuSettingTab(this.app, this));
     addIcon("wetongbu-sync", WETONGBU_RIBBON_ICON);
     this.addRibbonIcon("wetongbu-sync", "微同步：立即同步", () => {

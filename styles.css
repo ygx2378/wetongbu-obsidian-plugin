@@ -1,0 +1,48 @@
+.wetongbu-setting-tab {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.wetongbu-setting-tab .setting-item,
+.wetongbu-setting-tab .setting-item-info,
+.wetongbu-setting-tab .setting-item-description,
+.wetongbu-setting-tab .setting-item-control {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.wetongbu-setting-tab .setting-item {
+  width: 100%;
+}
+
+.wetongbu-setting-tab .setting-item-info,
+.wetongbu-setting-tab .setting-item-description {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.wetongbu-setting-tab .setting-item-control {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+}
+
+.wetongbu-setting-tab .setting-item-control > * {
+  max-width: 100%;
+}
+
+.wetongbu-setting-tab.wetongbu-mobile-settings,
+.wetongbu-setting-scroll.wetongbu-mobile-settings {
+  overflow-x: hidden;
+  overscroll-behavior-x: none;
+  touch-action: pan-y;
+}
+
+.wetongbu-setting-tab.wetongbu-mobile-settings input,
+.wetongbu-setting-tab.wetongbu-mobile-settings select,
+.wetongbu-setting-tab.wetongbu-mobile-settings button {
+  min-width: 0;
+  max-width: 100%;
+}
