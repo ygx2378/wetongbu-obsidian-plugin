@@ -30,11 +30,14 @@ import {
   articleCandidate,
   articleAssetFingerprintFromBodies,
   articleAssetFingerprintFromVault,
+  ensureLocalClipFrontmatter,
   ensureGeneratedMarkers,
+  isLegacyArticleCandidate,
   mergeArticleMarkdown,
   normalizeArticleBodyForCompare,
   normalizeArticleSourceUrl,
   splitMarkdownFrontmatter,
+  stripGeneratedMarkers,
   type ArticleCandidate,
 } from "./article-dedupe.ts";
 import {
@@ -348,6 +351,9 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
     await this.saveSettings();
+    this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
+      void this.handleLocalClipImport(params as Record<string, unknown>);
+    });
     this.vaultSyncRetry = createVaultSyncRetryScheduler({
       run: () => this.runVaultSync(true),
     });
@@ -405,6 +411,93 @@ export default class WeTongbuPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /**
+   * Receive a lightweight browser clip through obsidian://.  The claim token
+   * is scoped to one temporary task and never becomes a plugin credential.
+   * The note is written immediately; local image downloads happen afterwards
+   * as part of this same handler and failures leave the original URL intact.
+   */
+  private async handleLocalClipImport(params: Record<string, unknown>) {
+    const taskId = typeof params.taskId === "string" ? params.taskId : typeof params.task_id === "string" ? params.task_id : "";
+    const claimToken = typeof params.token === "string" ? params.token : typeof params.claim_token === "string" ? params.claim_token : "";
+    if (!taskId || !claimToken) {
+      new Notice("微同步剪藏链接缺少任务凭证", 8000);
+      return;
+    }
+    const base = this.settings.apiBaseUrl.replace(/\/$/, "");
+    try {
+      const response = await requestUrl({
+        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/claim`,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify({ token: claimToken }),
+        throw: false,
+      });
+      if (response.status !== 200) throw new Error(response.json?.error ?? "剪藏任务领取失败");
+      const payload = response.json as {
+        taskId: string;
+        title: string;
+        sourceUrl: string;
+        markdown: string;
+        imageMode: "original" | "local" | "hosted";
+        imageUrls?: Array<{ url: string; alt?: string }>;
+      };
+      const capturedAt = new Date().toISOString();
+      // Lightweight local clips arrive without a ZIP manifest. Persist the
+      // source metadata needed for dedupe, but keep implementation markers out
+      // of the user-visible note.
+      let markdown = ensureLocalClipFrontmatter(payload.markdown, {
+        title: payload.title,
+        sourceUrl: payload.sourceUrl,
+        capturedAt,
+      });
+      const assets: Array<{ relativePath: string; body: Uint8Array; kind: "image"; contentType: string }> = [];
+      let failedImages = 0;
+      if (payload.imageMode === "local") {
+        const urls = Array.isArray(payload.imageUrls) ? payload.imageUrls : [];
+        for (const [index, image] of urls.entries()) {
+          if (!image?.url) continue;
+          try {
+            const downloaded = await requestUrl({ url: image.url, method: "GET", throw: false });
+            if (downloaded.status < 200 || downloaded.status >= 300 || !downloaded.arrayBuffer.byteLength) throw new Error(`HTTP ${downloaded.status}`);
+            const body = new Uint8Array(downloaded.arrayBuffer);
+            const relativePath = image.url;
+            assets.push({ relativePath, body, kind: "image", contentType: downloaded.headers["content-type"] ?? "image/*" });
+          } catch {
+            failedImages += 1;
+          }
+          if (index >= 199) break;
+        }
+      }
+      const written = await this.writeTask({
+        manifest: {
+          taskId: payload.taskId,
+          title: payload.title,
+          sourceUrl: payload.sourceUrl,
+          capturedAt,
+        },
+        markdown,
+        assets,
+      }, {}, { preserveGeneratedMarkers: false, allowLegacyPathMatch: true });
+      const completed = await requestUrl({
+        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify({ token: claimToken }),
+        throw: false,
+      });
+      if (completed.status !== 200) console.warn("WeTongbu local clip completion failed", completed.status);
+      if (payload.imageMode === "local" && failedImages) {
+        new Notice(`文章已打开；${failedImages} 张图片下载失败，已保留原文地址`, 10000);
+      } else {
+        new Notice(`已打开剪藏文章：${written.notePath}`, 6000);
+      }
+    } catch (error) {
+      new Notice(`微同步剪藏失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+      console.error("WeTongbu local clip import failed", error);
+    }
   }
 
   private restartArticleSyncTimer() {
@@ -1935,7 +2028,11 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
-  private async writeTask(task: any, imageLinks: Record<string, string> = {}) {
+  private async writeTask(
+    task: any,
+    imageLinks: Record<string, string> = {},
+    options: { preserveGeneratedMarkers?: boolean; allowLegacyPathMatch?: boolean } = {},
+  ) {
     const layout = buildVaultPaths({
       rootFolder: normalizePath(this.settings.rootFolder),
       title: task.manifest.title,
@@ -1947,9 +2044,11 @@ export default class WeTongbuPlugin extends Plugin {
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
 
-    // New notes carry a managed body marker. It lets later captures update
-    // the same article without replacing user-written notes around it.
-    let markdown = ensureGeneratedMarkers(task.markdown);
+    // ZIP captures carry a managed body marker so later captures can preserve
+    // user-written notes around the generated block. Lightweight local clips
+    // use frontmatter/tags for identity and intentionally hide those markers.
+    const preserveGeneratedMarkers = options.preserveGeneratedMarkers !== false;
+    let markdown = preserveGeneratedMarkers ? ensureGeneratedMarkers(task.markdown) : stripGeneratedMarkers(task.markdown);
     const assetPlans: Array<{ asset: any; filename: string; targetPath: string; writeLocal: boolean }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
@@ -1979,6 +2078,19 @@ export default class WeTongbuPlugin extends Plugin {
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
         if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file });
+      }
+    }
+    // Older lightweight clips have generated markers but no source_url. When
+    // re-clipping the same day, migrate that exact WTB path in place instead
+    // of creating a second note. Restricting this fallback to the calculated
+    // path prevents same-title notes from unrelated sources being merged.
+    if (options.allowLegacyPathMatch && candidates.length === 0) {
+      const expectedPath = normalizePath(`${layout.noteFolder}/${layout.noteFilename}`);
+      const legacyFile = this.app.vault.getAbstractFileByPath(expectedPath);
+      if (legacyFile instanceof TFile) {
+        const content = await this.app.vault.cachedRead(legacyFile);
+        const candidate = articleCandidate(legacyFile.path, content);
+        if (isLegacyArticleCandidate(candidate, expectedPath)) candidates.push({ ...candidate, file: legacyFile });
       }
     }
     const incomingBody = normalizeArticleBodyForCompare(splitMarkdownFrontmatter(markdown).body);
@@ -2042,7 +2154,7 @@ export default class WeTongbuPlugin extends Plugin {
           const to = relativeVaultPath(existingFolder, plan.targetPath);
           markdown = markdown.split(`<${from}>`).join(`<${to}>`).split(from).join(to);
         }
-        const merged = mergeArticleMarkdown(existing, markdown);
+        const merged = mergeArticleMarkdown(existing, markdown, { preserveGeneratedMarkers });
         await writeTextAtomically(this.app, existing.path, merged);
         createdNote = existing.file;
         persistedMarkdown = merged;

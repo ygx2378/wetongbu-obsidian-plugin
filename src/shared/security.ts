@@ -1,8 +1,16 @@
 /** Security guards for values that cross the plugin/network boundary. */
 
-export const DEFAULT_API_BASE_URL = "https://api.wetongbu.com";
+declare const WETONGBU_API_BASE_URL: string | undefined;
 
-const TRUSTED_API_HOSTS = new Set(["api.wetongbu.com", "wx.wetongbu.com"]);
+export const DEFAULT_API_BASE_URL = typeof WETONGBU_API_BASE_URL === "string"
+  ? WETONGBU_API_BASE_URL
+  : "https://api.wetongbu.com";
+
+const TRUSTED_API_HOSTS = new Set([
+  "api.wetongbu.com",
+  "wx.wetongbu.com",
+  new URL(DEFAULT_API_BASE_URL).hostname.toLowerCase(),
+]);
 const TRUSTED_AUTHORIZATION_HOSTS = new Set(["app.wetongbu.com"]);
 const TRUSTED_AUTHORIZATION_PATHS = new Set(["/device", "/browser-device"]);
 const TRUSTED_STORAGE_SUFFIXES = [
