@@ -254,6 +254,37 @@ export function ensureLocalClipFrontmatter(markdown: string, input: {
   ].join(parts.newline);
 }
 
+function updateLightweightFrontmatter(frontmatter: string, metadata: ArticleFrontmatter, newline: "\n" | "\r\n") {
+  const lines = frontmatter ? frontmatter.split(/\r?\n/) : [];
+  const scalarFields: Array<[string, unknown]> = [
+    ["title", metadata.title],
+    ["source_url", metadata.sourceUrl],
+    ["captured_at", metadata.captured_at],
+    ["capture_level", metadata.capture_level],
+    ["platform", metadata.platform],
+  ];
+  for (const [key, value] of scalarFields) {
+    if (value === undefined) continue;
+    const field = new RegExp(`^${key}\\s*:`);
+    const index = lines.findIndex((line) => field.test(line));
+    const replacement = `${key}: ${JSON.stringify(String(value))}`;
+    if (index >= 0) lines[index] = replacement;
+    else lines.push(replacement);
+  }
+  if (Array.isArray(metadata.tags)) {
+    const tagLines = ["tags:", ...metadata.tags.map((tag) => `  - ${JSON.stringify(String(tag))}`)];
+    const index = lines.findIndex((line) => /^tags\s*:\s*$/.test(line));
+    if (index < 0) {
+      lines.push(...tagLines);
+    } else {
+      let end = index + 1;
+      while (end < lines.length && /^\s*-\s+/.test(lines[end])) end += 1;
+      lines.splice(index, end - index, ...tagLines);
+    }
+  }
+  return lines.join(newline);
+}
+
 export function mergeArticleMarkdown(
   existing: ArticleCandidate,
   incomingMarkdown: string,
@@ -289,5 +320,6 @@ export function mergeArticleMarkdown(
     if (field.test(frontmatter)) frontmatter = frontmatter.replace(field, `${key}: ${escaped}`);
     else frontmatter += `${frontmatter ? newline : ""}${key}: ${escaped}`;
   }
+  if (!preserveGeneratedMarkers) frontmatter = updateLightweightFrontmatter(frontmatter, incomingMeta, newline);
   return frontmatter ? `---${newline}${frontmatter}${newline}---${newline}${newline}${body.trim()}${newline}` : `${body.trim()}${newline}`;
 }
