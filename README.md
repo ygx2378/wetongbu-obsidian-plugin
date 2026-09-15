@@ -1,7 +1,5 @@
 # WeTongbu
 
-<img src="icon.png" alt="WeTongbu logo" width="128" height="128">
-
 WeTongbu saves user-selected WeChat articles, Feishu documents, and article-style web pages to the current Obsidian Vault as Markdown notes with local attachments.
 
 ## Features
