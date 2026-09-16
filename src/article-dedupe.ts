@@ -169,15 +169,6 @@ export function articleCandidate(path: string, content: string): ArticleCandidat
   return { path, content, frontmatter, body, sourceKey, managed };
 }
 
-/**
- * Identify a legacy generated note that predates source_url frontmatter.
- * Matching is deliberately restricted to the exact WTB path selected by the
- * current clip so a same-title note from another source is never merged.
- */
-export function isLegacyArticleCandidate(candidate: ArticleCandidate, expectedPath: string): boolean {
-  return candidate.path === expectedPath && candidate.managed && !candidate.sourceKey;
-}
-
 export function incomingArticleBody(markdown: string): string {
   const { body } = splitMarkdownFrontmatter(markdown);
   return body.trim();
@@ -192,106 +183,8 @@ export function ensureGeneratedMarkers(markdown: string): string {
   return frontmatter ? `---${newline}${frontmatter}${newline}---${newline}${newline}${managedBody}${newline}` : `${managedBody}${newline}`;
 }
 
-function markerlessBody(markdown: string) {
-  return markdown
-    .replace(/^[\t ]*<!--\s*wetongbu:generated:(?:start|end)\s*-->[\t ]*\r?\n?/gim, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function withoutDuplicateTitle(markdown: string, title: string) {
-  const { frontmatter, body, newline } = splitMarkdownFrontmatter(markdown);
-  const lines = body.trim().split(/\r?\n/);
-  const first = lines[0]?.trim() || "";
-  if (first.startsWith("# ") && first.slice(2).trim() === String(title || "").trim()) {
-    lines.shift();
-    if (!lines[0]?.trim()) lines.shift();
-  }
-  const cleanedBody = lines.join(newline).trim();
-  return frontmatter
-    ? `---${newline}${frontmatter}${newline}---${newline}${newline}${cleanedBody}${newline}`
-    : `${cleanedBody}${newline}`;
-}
-
-/** Remove internal generated markers before a note is shown to the user. */
-export function stripGeneratedMarkers(markdown: string): string {
-  const { frontmatter, body, newline } = splitMarkdownFrontmatter(markdown);
-  const cleanedBody = markerlessBody(body);
-  return frontmatter
-    ? `---${newline}${frontmatter}${newline}---${newline}${newline}${cleanedBody}${newline}`
-    : `${cleanedBody}${newline}`;
-}
-
-/**
- * Add the metadata needed by the article dedupe path to a lightweight local
- * clip. Local clips deliberately do not expose generated marker comments.
- */
-export function ensureLocalClipFrontmatter(markdown: string, input: {
-  title: string;
-  sourceUrl: string;
-  capturedAt: string;
-}) {
-  const cleaned = withoutDuplicateTitle(stripGeneratedMarkers(markdown), input.title);
-  const parts = splitMarkdownFrontmatter(cleaned);
-  if (parts.frontmatter.trim()) return cleaned;
-  const title = JSON.stringify(String(input.title || "未命名文档"));
-  const sourceUrl = JSON.stringify(String(input.sourceUrl || ""));
-  const capturedAt = JSON.stringify(String(input.capturedAt || new Date().toISOString()));
-  return [
-    "---",
-    `title: ${title}`,
-    `source_url: ${sourceUrl}`,
-    `captured_at: ${capturedAt}`,
-    'capture_level: "full"',
-    'platform: "generic_web"',
-    "tags:",
-    '  - "网页剪藏"',
-    '  - "微同步"',
-    "---",
-    "",
-    parts.body.trim(),
-    "",
-  ].join(parts.newline);
-}
-
-function updateLightweightFrontmatter(frontmatter: string, metadata: ArticleFrontmatter, newline: "\n" | "\r\n") {
-  const lines = frontmatter ? frontmatter.split(/\r?\n/) : [];
-  const scalarFields: Array<[string, unknown]> = [
-    ["title", metadata.title],
-    ["source_url", metadata.sourceUrl],
-    ["captured_at", metadata.captured_at],
-    ["capture_level", metadata.capture_level],
-    ["platform", metadata.platform],
-  ];
-  for (const [key, value] of scalarFields) {
-    if (value === undefined) continue;
-    const field = new RegExp(`^${key}\\s*:`);
-    const index = lines.findIndex((line) => field.test(line));
-    const replacement = `${key}: ${JSON.stringify(String(value))}`;
-    if (index >= 0) lines[index] = replacement;
-    else lines.push(replacement);
-  }
-  if (Array.isArray(metadata.tags)) {
-    const tagLines = ["tags:", ...metadata.tags.map((tag) => `  - ${JSON.stringify(String(tag))}`)];
-    const index = lines.findIndex((line) => /^tags\s*:\s*$/.test(line));
-    if (index < 0) {
-      lines.push(...tagLines);
-    } else {
-      let end = index + 1;
-      while (end < lines.length && /^\s*-\s+/.test(lines[end])) end += 1;
-      lines.splice(index, end - index, ...tagLines);
-    }
-  }
-  return lines.join(newline);
-}
-
-export function mergeArticleMarkdown(
-  existing: ArticleCandidate,
-  incomingMarkdown: string,
-  options: { preserveGeneratedMarkers?: boolean } = {},
-): string {
-  const preserveGeneratedMarkers = options.preserveGeneratedMarkers !== false;
-  const incoming = preserveGeneratedMarkers ? ensureGeneratedMarkers(incomingMarkdown) : stripGeneratedMarkers(incomingMarkdown);
+export function mergeArticleMarkdown(existing: ArticleCandidate, incomingMarkdown: string): string {
+  const incoming = ensureGeneratedMarkers(incomingMarkdown);
   const incomingParts = splitMarkdownFrontmatter(incoming);
   const existingParts = splitMarkdownFrontmatter(existing.content);
   const newline = existingParts.newline;
@@ -303,10 +196,8 @@ export function mergeArticleMarkdown(
     if (start >= 0 && end >= 0) {
       const before = existingParts.body.slice(0, start);
       const after = existingParts.body.slice(end + GENERATED_END.length);
-      body = preserveGeneratedMarkers ? `${before}${incomingBody}${after}` : markerlessBody(`${before}${incomingBody}${after}`);
+      body = `${before}${incomingBody}${after}`;
     }
-  } else if (!preserveGeneratedMarkers) {
-    body = markerlessBody(existingParts.body).trim() === incomingBody ? markerlessBody(existingParts.body) : incomingBody;
   } else {
     body = incomingBody;
   }
@@ -318,8 +209,7 @@ export function mergeArticleMarkdown(
     const escaped = JSON.stringify(String(value));
     const field = new RegExp(`^${key.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}:.*$`, "m");
     if (field.test(frontmatter)) frontmatter = frontmatter.replace(field, `${key}: ${escaped}`);
-    else frontmatter += `${frontmatter ? newline : ""}${key}: ${escaped}`;
+    else frontmatter += `${newline}${key}: ${escaped}`;
   }
-  if (!preserveGeneratedMarkers) frontmatter = updateLightweightFrontmatter(frontmatter, incomingMeta, newline);
   return frontmatter ? `---${newline}${frontmatter}${newline}---${newline}${newline}${body.trim()}${newline}` : `${body.trim()}${newline}`;
 }

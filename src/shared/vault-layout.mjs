@@ -32,59 +32,12 @@ export function buildVaultPaths({ rootFolder, title, capturedAt, taskId, assets 
   const noteFilename = `${sanitizeFilename(title)}_${year}-${month}-${day}_WTB.md`;
   const shortTaskId = taskId.replace(/-/g, "").slice(0, 8);
   const assetNames = assets.map((asset, index) => {
-    const extension = assetExtension(asset);
+    const slash = asset.relativePath.lastIndexOf("/");
+    const basename = slash >= 0 ? asset.relativePath.slice(slash + 1) : asset.relativePath;
+    const dot = basename.lastIndexOf(".");
+    const extension = dot > 0 ? basename.slice(dot).toLowerCase() : "";
     const sequence = String(index + 1).padStart(3, "0");
     return `WTB-${year}${month}${day}-${hour}${minute}${second}-${shortTaskId}-${sequence}${extension}`;
   });
   return { noteFolder, attachmentFolder, noteFilename, assetNames };
-}
-
-const CONTENT_TYPE_EXTENSIONS = {
-  "application/pdf": ".pdf",
-  "application/zip": ".zip",
-  "audio/mpeg": ".mp3",
-  "audio/ogg": ".ogg",
-  "audio/wav": ".wav",
-  "image/avif": ".avif",
-  "image/bmp": ".bmp",
-  "image/gif": ".gif",
-  "image/jpeg": ".jpg",
-  "image/jpg": ".jpg",
-  "image/png": ".png",
-  "image/svg+xml": ".svg",
-  "image/tiff": ".tif",
-  "image/webp": ".webp",
-  "image/x-icon": ".ico",
-  "text/plain": ".txt",
-  "video/mp4": ".mp4",
-  "video/webm": ".webm",
-};
-
-function extensionFromPath(value) {
-  if (typeof value !== "string" || !value.trim()) return "";
-  let path = value.trim();
-  try {
-    if (/^[a-z][a-z\d+.-]*:\/\//i.test(path)) path = new URL(path).pathname;
-  } catch {
-    // Fall back to the raw path when a source URL is malformed.
-  }
-  path = path.split(/[?#]/, 1)[0];
-  try { path = decodeURIComponent(path); } catch { /* keep the encoded path */ }
-  const basename = path.slice(path.lastIndexOf("/") + 1);
-  const match = /\.([a-z0-9]{1,8})$/i.exec(basename);
-  return match ? `.${match[1].toLowerCase()}` : "";
-}
-
-function extensionFromContentType(value) {
-  if (typeof value !== "string") return "";
-  const mediaType = value.split(";", 1)[0].trim().toLowerCase();
-  return CONTENT_TYPE_EXTENSIONS[mediaType] ?? "";
-}
-
-/**
- * Keep a reliable source suffix, otherwise use the response content type.
- * CDN URLs often put the format in a query parameter and have no suffix.
- */
-function assetExtension(asset) {
-  return extensionFromPath(asset?.relativePath) || extensionFromContentType(asset?.contentType);
 }

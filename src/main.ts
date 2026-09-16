@@ -30,14 +30,11 @@ import {
   articleCandidate,
   articleAssetFingerprintFromBodies,
   articleAssetFingerprintFromVault,
-  ensureLocalClipFrontmatter,
   ensureGeneratedMarkers,
-  isLegacyArticleCandidate,
   mergeArticleMarkdown,
   normalizeArticleBodyForCompare,
   normalizeArticleSourceUrl,
   splitMarkdownFrontmatter,
-  stripGeneratedMarkers,
   type ArticleCandidate,
 } from "./article-dedupe.ts";
 import {
@@ -287,11 +284,6 @@ function relativeVaultPath(from: string, to: string): string {
   return [...up, ...down].join("/") || toParts.at(-1) || "";
 }
 
-function generatedImageReference(value: string) {
-  const filename = value.replace(/\\/g, "/").split("/").at(-1) ?? "";
-  return /^WTB-\d{8}-\d{6}-[a-z0-9]{8}-\d{3}(?:\.[a-z0-9]+)?$/i.test(filename);
-}
-
 export default class WeTongbuPlugin extends Plugin {
   settings: WeTongbuSettings = DEFAULT_SETTINGS;
   private syncing = false;
@@ -318,7 +310,6 @@ export default class WeTongbuPlugin extends Plugin {
   private pendingDeletionReview: SyncResult | null = null;
   private storageSwitching = false;
   private captureHandoffs!: CaptureHandoffStore;
-  private localClipImageQueue: Promise<void> = Promise.resolve();
   captureReceiverStatus: { device_name: string | null; is_current_device: boolean } | null = null;
   vaultEncryptionInput = "";
   private pluginTokenMissingNoticeShown = false;
@@ -357,9 +348,6 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
     await this.saveSettings();
-    this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
-      void this.handleLocalClipImport(params as Record<string, unknown>);
-    });
     this.vaultSyncRetry = createVaultSyncRetryScheduler({
       run: () => this.runVaultSync(true),
     });
@@ -417,234 +405,6 @@ export default class WeTongbuPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
-  }
-
-  /**
-   * Receive a lightweight browser clip through obsidian://.  The claim token
-   * is scoped to one temporary task and never becomes a plugin credential.
-   * The note is written immediately; local image downloads happen afterwards
-   * as part of this same handler and failures leave the original URL intact.
-   */
-  private async handleLocalClipImport(params: Record<string, unknown>) {
-    const taskId = typeof params.taskId === "string" ? params.taskId : typeof params.task_id === "string" ? params.task_id : "";
-    const claimToken = typeof params.token === "string" ? params.token : typeof params.claim_token === "string" ? params.claim_token : "";
-    if (!taskId || !claimToken) {
-      new Notice("微同步剪藏链接缺少任务凭证", 8000);
-      return;
-    }
-    const base = this.settings.apiBaseUrl.replace(/\/$/, "");
-    try {
-      const response = await requestUrl({
-        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/claim`,
-        method: "POST",
-        contentType: "application/json",
-        body: JSON.stringify({ token: claimToken }),
-        throw: false,
-      });
-      if (response.status !== 200) throw new Error(response.json?.error ?? "剪藏任务领取失败");
-      const payload = response.json as {
-        taskId: string;
-        title: string;
-        sourceUrl: string;
-        markdown: string;
-        imageMode: "original" | "local" | "hosted";
-        imageUrls?: Array<{ url: string; alt?: string }>;
-      };
-      const capturedAt = new Date().toISOString();
-      // Lightweight local clips arrive without a ZIP manifest. Persist the
-      // source metadata needed for dedupe, but keep implementation markers out
-      // of the user-visible note.
-      let markdown = ensureLocalClipFrontmatter(payload.markdown, {
-        title: payload.title,
-        sourceUrl: payload.sourceUrl,
-        capturedAt,
-      });
-      const imageUrls = payload.imageMode === "local" && Array.isArray(payload.imageUrls)
-        ? payload.imageUrls.slice(0, 200)
-        : [];
-      // Write and open the note before touching remote images.  Image URLs are
-      // intentionally kept in the first render so a slow/expired image cannot
-      // delay the primary clipping experience.
-      const written = await this.writeTask({
-        manifest: {
-          taskId: payload.taskId,
-          title: payload.title,
-          sourceUrl: payload.sourceUrl,
-          capturedAt,
-        },
-        markdown,
-        assets: [],
-      }, {}, { preserveGeneratedMarkers: false, allowLegacyPathMatch: true });
-      const completed = await requestUrl({
-        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
-        method: "POST",
-        contentType: "application/json",
-        body: JSON.stringify({ token: claimToken }),
-        throw: false,
-      });
-      if (completed.status !== 200) console.warn("WeTongbu local clip completion failed", completed.status);
-      if (imageUrls.length) {
-        new Notice(`文章已打开；${imageUrls.length} 张图片正在后台保存`, 6000);
-        this.scheduleLocalClipImageProcessing({
-          manifest: {
-            taskId: payload.taskId,
-            title: payload.title,
-            sourceUrl: payload.sourceUrl,
-            capturedAt,
-          },
-          markdown,
-          assets: [],
-        }, imageUrls, written.notePath);
-      } else {
-        new Notice(`已打开剪藏文章：${written.notePath}`, 6000);
-      }
-    } catch (error) {
-      new Notice(`微同步剪藏失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-      console.error("WeTongbu local clip import failed", error);
-    }
-  }
-
-  /**
-   * Download local clip images after the note is visible.  Downloads within a
-   * task run in parallel, while note/asset writes are serialized across tasks
-   * to avoid two URI handoffs racing on the same source article.
-   */
-  private scheduleLocalClipImageProcessing(
-    task: any,
-    imageUrls: Array<{ url?: string; alt?: string }>,
-    notePath: string,
-  ) {
-    const run = this.localClipImageQueue.then(async () => {
-      const results = await Promise.all(imageUrls.map(async (image, index) => {
-        if (!image?.url) return { index, asset: null, failed: false };
-        try {
-          const downloaded = await requestUrl({ url: image.url, method: "GET", throw: false });
-          if (downloaded.status < 200 || downloaded.status >= 300 || !downloaded.arrayBuffer.byteLength) {
-            throw new Error(`HTTP ${downloaded.status}`);
-          }
-          return {
-            index,
-            failed: false,
-            asset: {
-              relativePath: image.url,
-              body: new Uint8Array(downloaded.arrayBuffer),
-              kind: "image" as const,
-              contentType: downloaded.headers["content-type"] ?? "image/*",
-              clipIndex: index,
-            },
-          };
-        } catch (error) {
-          return {
-            index,
-            asset: null,
-            failed: true,
-            error: error instanceof Error ? error.message : "网络错误",
-          };
-        }
-      }));
-      const assets = results.flatMap((result) => result.asset ? [result.asset] : []);
-      const failedImages = results.filter((result) => result.failed).length;
-      const failureReason = results.find((result) => result.failed)?.error;
-      if (!assets.length) {
-        if (failedImages) new Notice(`文章已打开；${failedImages} 张图片下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
-        return;
-      }
-      try {
-        await this.persistLocalClipImages(task, assets, notePath);
-        if (failedImages) {
-          new Notice(`图片已保存 ${assets.length} 张；${failedImages} 张下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
-        } else {
-          new Notice(`文章图片已保存 ${assets.length} 张`, 6000);
-        }
-      } catch (error) {
-        new Notice(`文章已打开；图片保存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-        console.error("WeTongbu local clip image processing failed", error);
-      }
-    });
-    this.localClipImageQueue = run.catch((error) => {
-      console.error("WeTongbu local clip image queue failed", error);
-    });
-  }
-
-  /**
-   * Save downloaded images and rewrite only their references in the already
-   * visible note.  Avoiding a second full article merge preserves edits the
-   * user may make while the images are downloading.
-   */
-  private async persistLocalClipImages(task: any, assets: any[], notePath: string) {
-    const note = this.app.vault.getAbstractFileByPath(notePath);
-    if (!(note instanceof TFile)) throw new Error("剪藏文章已不存在，无法更新图片");
-    const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
-    const layout = buildVaultPaths({
-      rootFolder: normalizePath(this.settings.rootFolder),
-      title: task.manifest.title,
-      capturedAt: task.manifest.capturedAt,
-      taskId: task.manifest.taskId,
-      assets,
-    });
-    const attachmentFolder = normalizePath(layout.attachmentFolder);
-    const plans: Array<{ asset: any; targetPath: string; writeLocal: boolean; relativePath: string }> = [];
-    for (const [index, asset] of assets.entries()) {
-      const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[index]}`);
-      const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
-      plans.push({
-        asset,
-        targetPath: resolved.targetPath,
-        writeLocal: resolved.writeLocal,
-        relativePath: relativeVaultPath(noteFolder, resolved.targetPath),
-      });
-    }
-    if (plans.some((plan) => plan.writeLocal)) await ensureFolder(this, attachmentFolder);
-    const created: string[] = [];
-    try {
-      for (const plan of plans) {
-        if (!plan.writeLocal) continue;
-        created.push(plan.targetPath);
-        await this.app.vault.adapter.writeBinary(plan.targetPath, toArrayBuffer(new Uint8Array(plan.asset.body)));
-        const persisted = await this.app.vault.adapter.stat(plan.targetPath);
-        if (!persisted || persisted.type !== "file" || persisted.size !== plan.asset.body.length) {
-          throw new Error(`附件写入校验失败：${plan.targetPath}`);
-        }
-      }
-      const original = await this.app.vault.cachedRead(note);
-      let updated = original;
-      const sourceReferencesReplaced = new Set<number>();
-      for (const [planIndex, plan] of plans.entries()) {
-        const imageIndex = Number.isInteger(plan.asset.clipIndex) ? plan.asset.clipIndex : planIndex;
-        const before = updated;
-        updated = updated
-          .split(`<${plan.asset.relativePath}>`).join(plan.relativePath)
-          .split(plan.asset.relativePath).join(plan.relativePath);
-        if (updated !== before) sourceReferencesReplaced.add(imageIndex);
-      }
-      // A note created by an older test plugin may already have replaced the
-      // source URL with an extensionless generated WTB path.  The article
-      // dedupe path intentionally reuses that note, so migrate only those
-      // recognizable generated image references when the source URL is no
-      // longer present.  User-authored local paths are left untouched.
-      const imageReferencePattern = /!\[[^\]]*\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
-      const legacyBySequence = new Map<number, string>();
-      for (const match of updated.matchAll(imageReferencePattern)) {
-        const raw = match[1] ?? "";
-        const reference = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
-        if (!generatedImageReference(reference)) continue;
-        const sequence = /-(\d{3})(?:\.[a-z0-9]+)?$/i.exec(reference.replace(/\\/g, "/").split("/").at(-1) ?? "");
-        if (sequence) legacyBySequence.set(Number(sequence[1]) - 1, reference);
-      }
-      for (const [planIndex, plan] of plans.entries()) {
-        const imageIndex = Number.isInteger(plan.asset.clipIndex) ? plan.asset.clipIndex : planIndex;
-        if (sourceReferencesReplaced.has(imageIndex)) continue;
-        const legacy = legacyBySequence.get(imageIndex);
-        if (!legacy) continue;
-        updated = updated.split(`<${legacy}>`).join(plan.relativePath).split(legacy).join(plan.relativePath);
-      }
-      if (updated !== original) await writeTextAtomically(this.app, notePath, updated);
-    } catch (error) {
-      for (const path of created) {
-        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path).catch(() => {});
-      }
-      throw error;
-    }
   }
 
   private restartArticleSyncTimer() {
@@ -2175,11 +1935,7 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
-  private async writeTask(
-    task: any,
-    imageLinks: Record<string, string> = {},
-    options: { preserveGeneratedMarkers?: boolean; allowLegacyPathMatch?: boolean } = {},
-  ) {
+  private async writeTask(task: any, imageLinks: Record<string, string> = {}) {
     const layout = buildVaultPaths({
       rootFolder: normalizePath(this.settings.rootFolder),
       title: task.manifest.title,
@@ -2191,11 +1947,9 @@ export default class WeTongbuPlugin extends Plugin {
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
 
-    // ZIP captures carry a managed body marker so later captures can preserve
-    // user-written notes around the generated block. Lightweight local clips
-    // use frontmatter/tags for identity and intentionally hide those markers.
-    const preserveGeneratedMarkers = options.preserveGeneratedMarkers !== false;
-    let markdown = preserveGeneratedMarkers ? ensureGeneratedMarkers(task.markdown) : stripGeneratedMarkers(task.markdown);
+    // New notes carry a managed body marker. It lets later captures update
+    // the same article without replacing user-written notes around it.
+    let markdown = ensureGeneratedMarkers(task.markdown);
     const assetPlans: Array<{ asset: any; filename: string; targetPath: string; writeLocal: boolean }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
@@ -2225,19 +1979,6 @@ export default class WeTongbuPlugin extends Plugin {
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
         if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file });
-      }
-    }
-    // Older lightweight clips have generated markers but no source_url. When
-    // re-clipping the same day, migrate that exact WTB path in place instead
-    // of creating a second note. Restricting this fallback to the calculated
-    // path prevents same-title notes from unrelated sources being merged.
-    if (options.allowLegacyPathMatch && candidates.length === 0) {
-      const expectedPath = normalizePath(`${layout.noteFolder}/${layout.noteFilename}`);
-      const legacyFile = this.app.vault.getAbstractFileByPath(expectedPath);
-      if (legacyFile instanceof TFile) {
-        const content = await this.app.vault.cachedRead(legacyFile);
-        const candidate = articleCandidate(legacyFile.path, content);
-        if (isLegacyArticleCandidate(candidate, expectedPath)) candidates.push({ ...candidate, file: legacyFile });
       }
     }
     const incomingBody = normalizeArticleBodyForCompare(splitMarkdownFrontmatter(markdown).body);
@@ -2301,7 +2042,7 @@ export default class WeTongbuPlugin extends Plugin {
           const to = relativeVaultPath(existingFolder, plan.targetPath);
           markdown = markdown.split(`<${from}>`).join(`<${to}>`).split(from).join(to);
         }
-        const merged = mergeArticleMarkdown(existing, markdown, { preserveGeneratedMarkers });
+        const merged = mergeArticleMarkdown(existing, markdown);
         await writeTextAtomically(this.app, existing.path, merged);
         createdNote = existing.file;
         persistedMarkdown = merged;
@@ -2365,16 +2106,11 @@ async function writeTextAtomically(app: App, path: string, content: string) {
   const original = await adapter.read(path);
   await adapter.write(backup, original);
   try {
-    // DataAdapter.rename intentionally rejects an existing destination on
-    // Obsidian's local adapter. Use the verified overwrite path whenever the
-    // note is still present; only use rename if a concurrent operation removed
-    // the destination between the backup and replacement steps.
-    if (typeof adapter.rename === "function" && !(await adapter.exists(path))) {
+    if (typeof adapter.rename === "function") {
       await adapter.rename(temporary, path);
     } else {
-      // Verify the overwrite and restore the original on a torn/corrupted
-      // write. The backup above still gives us a recovery copy during this
-      // non-atomic replacement window.
+      // Older adapters cannot replace atomically. Verify the fallback and
+      // restore the original on a torn/corrupted write.
       await adapter.write(path, content);
       if ((await adapter.read(path)) !== content) throw new Error("文章更新替换校验失败");
       await adapter.remove(temporary).catch(() => {});
