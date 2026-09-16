@@ -1,0 +1,50 @@
+name: Formal Obsidian marketplace channel guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-formal-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read formal manifest version
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version' manifest.json)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "main must contain a formal X.Y.Z manifest version; got $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require matching published GitHub Release
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(curl --fail --silent --show-error --retry 3 \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}")"
+          jq -e --arg version "$VERSION" '
+            .tag_name == $version and
+            .draft == false and
+            .prerelease == false and
+            ([.assets[]?.name] | index("main.js")) != null and
+            ([.assets[]?.name] | index("manifest.json")) != null and
+            ([.assets[]?.name] | index("styles.css")) != null and
+            ([.assets[]?.name] | index("icon.png")) != null
+          ' <<< "$release_json" >/dev/null
+
+      - name: Report channel
+        run: echo "Formal marketplace channel is aligned with release ${{ steps.manifest.outputs.version }}"
