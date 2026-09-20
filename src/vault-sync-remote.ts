@@ -45,6 +45,9 @@ export interface VaultSyncStatus {
   enabled: boolean;
   scope: string;
   storage_type: string;
+  managed_storage_only?: boolean;
+  can_sync?: boolean;
+  sync_storage_type?: string | null;
   quota_bytes: number;
   used_bytes: number;
   storage_credential_version?: string | null;

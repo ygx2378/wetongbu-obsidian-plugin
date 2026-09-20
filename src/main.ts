@@ -30,11 +30,14 @@ import {
   articleCandidate,
   articleAssetFingerprintFromBodies,
   articleAssetFingerprintFromVault,
+  ensureLocalClipFrontmatter,
   ensureGeneratedMarkers,
+  isLegacyArticleCandidate,
   mergeArticleMarkdown,
   normalizeArticleBodyForCompare,
   normalizeArticleSourceUrl,
   splitMarkdownFrontmatter,
+  stripGeneratedMarkers,
   type ArticleCandidate,
 } from "./article-dedupe.ts";
 import {
@@ -43,10 +46,13 @@ import {
   assertSha256,
   assertStoragePrefix,
   DEFAULT_API_BASE_URL,
+  createAuthorizationUrl,
   isTrustedApiUrl,
   isTrustedAuthorizationUrl,
   isTrustedStorageUrl,
   normalizeApiBaseUrl,
+  resolvePersistedApiBaseUrl,
+  shouldResetEnvironmentCredentials,
 } from "./shared/security";
 
 interface WeTongbuSettings {
@@ -88,8 +94,10 @@ interface WeTongbuSettings {
   imageDeliveryMode: ImageDeliveryMode;
   articleSyncIntervalSeconds: number;
   vaultSyncEnabled: boolean;
-  /** 新安装完成必要配置后自动开启；旧安装和用户手动关闭后为 false。 */
+  /** Deprecated compatibility field; automatic enablement is disabled. */
   vaultSyncAutoEnablePending: boolean;
+  /** Vault automatic sync interval in minutes; null means disabled. */
+  vaultSyncIntervalMinutes: number | null;
   vaultSyncScope: VaultSyncScope;
   vaultSafetyEnabled: boolean;
   vaultSafetyRatio: number;
@@ -146,6 +154,7 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
 };
 
 const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
+const VAULT_SYNC_INTERVAL_OPTIONS = [1, 5, 10, 20, 30] as const;
 const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
@@ -163,6 +172,14 @@ function normalizeArticleSyncInterval(value: unknown) {
   return ARTICLE_SYNC_INTERVAL_OPTIONS.includes(numeric as typeof ARTICLE_SYNC_INTERVAL_OPTIONS[number])
     ? numeric
     : 30;
+}
+
+function normalizeVaultSyncInterval(value: unknown): number | null {
+  if (value === null || value === undefined || value === "" || value === "unlimited") return null;
+  const numeric = Number(value);
+  return VAULT_SYNC_INTERVAL_OPTIONS.includes(numeric as typeof VAULT_SYNC_INTERVAL_OPTIONS[number])
+    ? numeric
+    : null;
 }
 
 function normalizeVaultSafetyRatio(value: unknown) {
@@ -228,6 +245,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   articleSyncIntervalSeconds: 30,
   vaultSyncEnabled: false,
   vaultSyncAutoEnablePending: false,
+  vaultSyncIntervalMinutes: null,
   vaultSyncScope: "whole_vault",
   vaultSafetyEnabled: true,
   vaultSafetyRatio: 0.5,
@@ -284,6 +302,11 @@ function relativeVaultPath(from: string, to: string): string {
   return [...up, ...down].join("/") || toParts.at(-1) || "";
 }
 
+function generatedImageReference(value: string) {
+  const filename = value.replace(/\\/g, "/").split("/").at(-1) ?? "";
+  return /^WTB-\d{8}-\d{6}-[a-z0-9]{8}-\d{3}(?:\.[a-z0-9]+)?$/i.test(filename);
+}
+
 export default class WeTongbuPlugin extends Plugin {
   settings: WeTongbuSettings = DEFAULT_SETTINGS;
   private syncing = false;
@@ -293,9 +316,13 @@ export default class WeTongbuPlugin extends Plugin {
   vaultPairingExpiresAt = "";
   recoveryToken = "";
   storageStatus = "";
-  accountStatus = "当前账号：未登录，自助版";
+  accountStatus = "当前账号：未登录；登录后可使用多端同步";
   accountLoggedIn = false;
   accountPlanType: "free" | "pro" = "free";
+  // User-managed object storage is retired. Keep the persisted compatibility
+  // fields for non-destructive upgrades, but never use them to enable sync.
+  accountLegacyFreeStorageCompat = false;
+  accountCanVaultSync = false;
   canHostImages = false;
   hostedMediaQuotaBytes = 0;
   hostedMediaUsedBytes = 0;
@@ -304,12 +331,15 @@ export default class WeTongbuPlugin extends Plugin {
   private vaultDeviceTokenCache = "";
   private accountPollTimer: number | null = null;
   private articleSyncTimer: number | null = null;
+  private vaultSyncTimer: number | null = null;
   private articleSyncSchedulerStarted = false;
   private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
   private vaultSafetyOverrideFingerprint = "";
   private pendingDeletionReview: SyncResult | null = null;
   private storageSwitching = false;
   private captureHandoffs!: CaptureHandoffStore;
+  private localClipImageQueue: Promise<void> = Promise.resolve();
+  private settingTab: WeTongbuSettingTab | null = null;
   captureReceiverStatus: { device_name: string | null; is_current_device: boolean } | null = null;
   vaultEncryptionInput = "";
   private pluginTokenMissingNoticeShown = false;
@@ -317,7 +347,6 @@ export default class WeTongbuPlugin extends Plugin {
   async onload() {
     this.captureHandoffs = createCaptureHandoffStore(this.app);
     const rawSaved = await this.loadData();
-    const freshInstall = !rawSaved || Object.keys(rawSaved).length === 0;
     const saved = (rawSaved ?? {}) as PersistedSettings;
     const {
       noteFolder: _legacyNoteFolder,
@@ -336,25 +365,41 @@ export default class WeTongbuPlugin extends Plugin {
       this.settings.activeStorageBucket = this.settings.bucket;
       this.settings.activeStoragePrefix = this.settings.prefix;
     }
-    if (!Object.prototype.hasOwnProperty.call(currentSettings, "vaultSyncAutoEnablePending")) {
-      this.settings.vaultSyncAutoEnablePending = freshInstall;
-    }
+    // Vault sync is always an explicit user choice. Older builds persisted a
+    // pending auto-enable flag; clear it during upgrade so login/setup can
+    // never turn the switch on implicitly.
+    this.settings.vaultSyncAutoEnablePending = false;
     this.settings.articleSyncIntervalSeconds = normalizeArticleSyncInterval(this.settings.articleSyncIntervalSeconds);
+    this.settings.vaultSyncIntervalMinutes = normalizeVaultSyncInterval(this.settings.vaultSyncIntervalMinutes);
     this.settings.vaultSafetyRatio = normalizeVaultSafetyRatio(this.settings.vaultSafetyRatio);
     // The API base is not a user-facing setting. Normalize old/manual data so
-    // plugin credentials can never be sent to an arbitrary endpoint.
-    this.settings.apiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
+    // plugin credentials can never be sent to an arbitrary endpoint. When a
+    // production build replaces a staging test build, also migrate the hidden
+    // persisted staging value to production; Obsidian keeps data.json and
+    // SecretStorage across plugin upgrades. Tokens and target IDs are scoped to
+    // an API environment, so carrying them across environments would produce
+    // an immediate 401 on the first login request.
+    const persistedApiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
+    const resolvedApiBaseUrl = resolvePersistedApiBaseUrl(persistedApiBaseUrl);
+    if (shouldResetEnvironmentCredentials(persistedApiBaseUrl)) {
+      await this.resetEnvironmentScopedCredentials();
+    }
+    this.settings.apiBaseUrl = resolvedApiBaseUrl;
     if (!this.settings.vaultInstallationId) {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
     await this.saveSettings();
+    this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
+      void this.handleLocalClipImport(params as Record<string, unknown>);
+    });
     this.vaultSyncRetry = createVaultSyncRetryScheduler({
-      run: () => this.runVaultSync(true),
+      run: () => this.settings.vaultSyncIntervalMinutes === null
+        ? Promise.resolve()
+        : this.runVaultSync(true),
     });
     void this.refreshAccountStatus();
     void this.refreshCaptureReceiverStatus();
     void this.resumeAccountLogin().catch(() => undefined);
-    if (this.settings.pendingStorageSwitchJobId) void this.runStorageSwitch(true);
     this.registerDomEvent(window, "focus", () => {
       void this.resumeAccountLogin().catch(() => undefined);
       this.vaultSyncRetry?.wake();
@@ -366,7 +411,8 @@ export default class WeTongbuPlugin extends Plugin {
         this.vaultSyncRetry?.wake();
       }
     });
-    this.addSettingTab(new WeTongbuSettingTab(this.app, this));
+    this.settingTab = new WeTongbuSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
     addIcon("wetongbu-sync", WETONGBU_RIBBON_ICON);
     this.addRibbonIcon("wetongbu-sync", "微同步：立即同步", () => {
       void this.manualSync();
@@ -384,13 +430,9 @@ export default class WeTongbuPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       this.articleSyncSchedulerStarted = true;
       void this.ensureWorkspace();
-      void this.maybeEnableVaultSyncAfterSetup(false);
       void this.syncNow(true).then(() => this.recoverCaptureHandoffs());
       this.restartArticleSyncTimer();
-      // Vault 多端同步：60s 轮询，只在用户开启且已配置时运行。
-      this.registerInterval(
-        window.setInterval(() => { void this.runVaultSync(true); }, 60_000),
-      );
+      this.restartVaultSyncTimer();
     });
   }
 
@@ -399,6 +441,8 @@ export default class WeTongbuPlugin extends Plugin {
     this.accountPollTimer = null;
     if (this.articleSyncTimer !== null) window.clearInterval(this.articleSyncTimer);
     this.articleSyncTimer = null;
+    if (this.vaultSyncTimer !== null) window.clearInterval(this.vaultSyncTimer);
+    this.vaultSyncTimer = null;
     this.vaultSyncRetry?.clear();
     this.vaultSyncRetry = null;
   }
@@ -407,16 +451,259 @@ export default class WeTongbuPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  /**
+   * Receive a lightweight browser clip through obsidian://.  The claim token
+   * is scoped to one temporary task and never becomes a plugin credential.
+   * The note is written immediately; local image downloads happen afterwards
+   * as part of this same handler and failures leave the original URL intact.
+   */
+  private async handleLocalClipImport(params: Record<string, unknown>) {
+    const taskId = typeof params.taskId === "string" ? params.taskId : typeof params.task_id === "string" ? params.task_id : "";
+    const claimToken = typeof params.token === "string" ? params.token : typeof params.claim_token === "string" ? params.claim_token : "";
+    const requestedTargetId = typeof params.target === "string" ? params.target.trim() : "";
+    const requestedVault = typeof params.vault === "string" ? params.vault.trim() : "";
+    if (!taskId || !claimToken) {
+      new Notice("微同步剪藏链接缺少任务凭证", 8000);
+      return;
+    }
+    if (requestedTargetId && requestedTargetId !== this.settings.syncTargetId) {
+      new Notice("剪藏任务属于另一个 Vault，当前 Vault 未写入。", 10000);
+      return;
+    }
+    if (requestedTargetId && !this.settings.syncTargetId) {
+      new Notice("当前 Vault 尚未连接账号，无法接收定向剪藏。", 10000);
+      return;
+    }
+    if (requestedVault && requestedVault !== this.app.vault.getName()) {
+      new Notice(`剪藏目标是 Vault“${requestedVault}”，当前打开的是“${this.app.vault.getName()}”，未写入当前 Vault。`, 10000);
+      return;
+    }
+    const base = this.settings.apiBaseUrl.replace(/\/$/, "");
+    try {
+      const response = await requestUrl({
+        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/claim`,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify({ token: claimToken, ...(this.settings.syncTargetId ? { target_id: this.settings.syncTargetId } : {}) }),
+        throw: false,
+      });
+      if (response.status !== 200) throw new Error(response.json?.error ?? "剪藏任务领取失败");
+      const payload = response.json as {
+        taskId: string;
+        targetId?: string | null;
+        title: string;
+        sourceUrl: string;
+        markdown: string;
+        imageMode: "original" | "local" | "hosted";
+        imageUrls?: Array<{ url: string; alt?: string }>;
+      };
+      if (payload.targetId && payload.targetId !== this.settings.syncTargetId) {
+        new Notice("剪藏任务属于另一个 Vault，当前 Vault 未写入。", 10000);
+        return;
+      }
+      const capturedAt = new Date().toISOString();
+      // Lightweight local clips arrive without a ZIP manifest. Persist the
+      // source metadata needed for dedupe, but keep implementation markers out
+      // of the user-visible note.
+      let markdown = ensureLocalClipFrontmatter(payload.markdown, {
+        title: payload.title,
+        sourceUrl: payload.sourceUrl,
+        capturedAt,
+      });
+      const imageUrls = payload.imageMode === "local" && Array.isArray(payload.imageUrls)
+        ? payload.imageUrls.slice(0, 200)
+        : [];
+      // Write and open the note before touching remote images.  Image URLs are
+      // intentionally kept in the first render so a slow/expired image cannot
+      // delay the primary clipping experience.
+      const written = await this.writeTask({
+        manifest: {
+          taskId: payload.taskId,
+          title: payload.title,
+          sourceUrl: payload.sourceUrl,
+          capturedAt,
+        },
+        markdown,
+        assets: [],
+      }, {}, { preserveGeneratedMarkers: false, allowLegacyPathMatch: true });
+      const completed = await requestUrl({
+        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify({ token: claimToken }),
+        throw: false,
+      });
+      if (completed.status !== 200) console.warn("WeTongbu local clip completion failed", completed.status);
+      if (imageUrls.length) {
+        new Notice(`文章已打开；${imageUrls.length} 张图片正在后台保存`, 6000);
+        this.scheduleLocalClipImageProcessing({
+          manifest: {
+            taskId: payload.taskId,
+            title: payload.title,
+            sourceUrl: payload.sourceUrl,
+            capturedAt,
+          },
+          markdown,
+          assets: [],
+        }, imageUrls, written.notePath);
+      } else {
+        new Notice(`已打开剪藏文章：${written.notePath}`, 6000);
+      }
+    } catch (error) {
+      new Notice(`微同步剪藏失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+      console.error("WeTongbu local clip import failed", error);
+    }
+  }
+
+  /**
+   * Download local clip images after the note is visible.  Downloads within a
+   * task run in parallel, while note/asset writes are serialized across tasks
+   * to avoid two URI handoffs racing on the same source article.
+   */
+  private scheduleLocalClipImageProcessing(
+    task: any,
+    imageUrls: Array<{ url?: string; alt?: string }>,
+    notePath: string,
+  ) {
+    const run = this.localClipImageQueue.then(async () => {
+      const results = await Promise.all(imageUrls.map(async (image, index) => {
+        if (!image?.url) return { index, asset: null, failed: false };
+        try {
+          const downloaded = await requestUrl({ url: image.url, method: "GET", throw: false });
+          if (downloaded.status < 200 || downloaded.status >= 300 || !downloaded.arrayBuffer.byteLength) {
+            throw new Error(`HTTP ${downloaded.status}`);
+          }
+          return {
+            index,
+            failed: false,
+            asset: {
+              relativePath: image.url,
+              body: new Uint8Array(downloaded.arrayBuffer),
+              kind: "image" as const,
+              contentType: downloaded.headers["content-type"] ?? "image/*",
+              clipIndex: index,
+            },
+          };
+        } catch (error) {
+          return {
+            index,
+            asset: null,
+            failed: true,
+            error: error instanceof Error ? error.message : "网络错误",
+          };
+        }
+      }));
+      const assets = results.flatMap((result) => result.asset ? [result.asset] : []);
+      const failedImages = results.filter((result) => result.failed).length;
+      const failureReason = results.find((result) => result.failed)?.error;
+      if (!assets.length) {
+        if (failedImages) new Notice(`文章已打开；${failedImages} 张图片下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
+        return;
+      }
+      try {
+        await this.persistLocalClipImages(task, assets, notePath);
+        if (failedImages) {
+          new Notice(`图片已保存 ${assets.length} 张；${failedImages} 张下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
+        } else {
+          new Notice(`文章图片已保存 ${assets.length} 张`, 6000);
+        }
+      } catch (error) {
+        new Notice(`文章已打开；图片保存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+        console.error("WeTongbu local clip image processing failed", error);
+      }
+    });
+    this.localClipImageQueue = run.catch((error) => {
+      console.error("WeTongbu local clip image queue failed", error);
+    });
+  }
+
+  /**
+   * Save downloaded images and rewrite only their references in the already
+   * visible note.  Avoiding a second full article merge preserves edits the
+   * user may make while the images are downloading.
+   */
+  private async persistLocalClipImages(task: any, assets: any[], notePath: string) {
+    const note = this.app.vault.getAbstractFileByPath(notePath);
+    if (!(note instanceof TFile)) throw new Error("剪藏文章已不存在，无法更新图片");
+    const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+    const layout = buildVaultPaths({
+      rootFolder: normalizePath(this.settings.rootFolder),
+      title: task.manifest.title,
+      capturedAt: task.manifest.capturedAt,
+      taskId: task.manifest.taskId,
+      assets,
+    });
+    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    const plans: Array<{ asset: any; targetPath: string; writeLocal: boolean; relativePath: string }> = [];
+    for (const [index, asset] of assets.entries()) {
+      const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[index]}`);
+      const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
+      plans.push({
+        asset,
+        targetPath: resolved.targetPath,
+        writeLocal: resolved.writeLocal,
+        relativePath: relativeVaultPath(noteFolder, resolved.targetPath),
+      });
+    }
+    if (plans.some((plan) => plan.writeLocal)) await ensureFolder(this, attachmentFolder);
+    const created: string[] = [];
+    try {
+      for (const plan of plans) {
+        if (!plan.writeLocal) continue;
+        created.push(plan.targetPath);
+        await this.app.vault.adapter.writeBinary(plan.targetPath, toArrayBuffer(new Uint8Array(plan.asset.body)));
+        const persisted = await this.app.vault.adapter.stat(plan.targetPath);
+        if (!persisted || persisted.type !== "file" || persisted.size !== plan.asset.body.length) {
+          throw new Error(`附件写入校验失败：${plan.targetPath}`);
+        }
+      }
+      const original = await this.app.vault.cachedRead(note);
+      let updated = original;
+      const sourceReferencesReplaced = new Set<number>();
+      for (const [planIndex, plan] of plans.entries()) {
+        const imageIndex = Number.isInteger(plan.asset.clipIndex) ? plan.asset.clipIndex : planIndex;
+        const before = updated;
+        updated = updated
+          .split(`<${plan.asset.relativePath}>`).join(plan.relativePath)
+          .split(plan.asset.relativePath).join(plan.relativePath);
+        if (updated !== before) sourceReferencesReplaced.add(imageIndex);
+      }
+      // A note created by an older test plugin may already have replaced the
+      // source URL with an extensionless generated WTB path.  The article
+      // dedupe path intentionally reuses that note, so migrate only those
+      // recognizable generated image references when the source URL is no
+      // longer present.  User-authored local paths are left untouched.
+      const imageReferencePattern = /!\[[^\]]*\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
+      const legacyBySequence = new Map<number, string>();
+      for (const match of updated.matchAll(imageReferencePattern)) {
+        const raw = match[1] ?? "";
+        const reference = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
+        if (!generatedImageReference(reference)) continue;
+        const sequence = /-(\d{3})(?:\.[a-z0-9]+)?$/i.exec(reference.replace(/\\/g, "/").split("/").at(-1) ?? "");
+        if (sequence) legacyBySequence.set(Number(sequence[1]) - 1, reference);
+      }
+      for (const [planIndex, plan] of plans.entries()) {
+        const imageIndex = Number.isInteger(plan.asset.clipIndex) ? plan.asset.clipIndex : planIndex;
+        if (sourceReferencesReplaced.has(imageIndex)) continue;
+        const legacy = legacyBySequence.get(imageIndex);
+        if (!legacy) continue;
+        updated = updated.split(`<${legacy}>`).join(plan.relativePath).split(legacy).join(plan.relativePath);
+      }
+      if (updated !== original) await writeTextAtomically(this.app, notePath, updated);
+    } catch (error) {
+      for (const path of created) {
+        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
   private restartArticleSyncTimer() {
     if (this.articleSyncTimer !== null) window.clearInterval(this.articleSyncTimer);
     this.articleSyncTimer = null;
     if (!this.articleSyncSchedulerStarted) return;
     this.articleSyncTimer = window.setInterval(
-      () => {
-        void this.syncNow(true).then((synced) => {
-          if (synced > 0 && this.settings.vaultSyncEnabled) void this.runVaultSync(true);
-        });
-      },
+      () => { void this.syncNow(true); },
       this.settings.articleSyncIntervalSeconds * 1000,
     );
   }
@@ -425,6 +712,23 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.articleSyncIntervalSeconds = normalizeArticleSyncInterval(seconds);
     await this.saveSettings();
     this.restartArticleSyncTimer();
+  }
+
+  private restartVaultSyncTimer() {
+    if (this.vaultSyncTimer !== null) window.clearInterval(this.vaultSyncTimer);
+    this.vaultSyncTimer = null;
+    const minutes = this.settings.vaultSyncIntervalMinutes;
+    if (!this.articleSyncSchedulerStarted || !this.settings.vaultSyncEnabled || minutes === null) return;
+    this.vaultSyncTimer = window.setInterval(
+      () => { void this.runVaultSync(true); },
+      minutes * 60 * 1000,
+    );
+  }
+
+  async setVaultSyncInterval(minutes: number | null) {
+    this.settings.vaultSyncIntervalMinutes = normalizeVaultSyncInterval(minutes);
+    await this.saveSettings();
+    this.restartVaultSyncTimer();
   }
 
   private hasConfiguredUserStorage() {
@@ -437,29 +741,63 @@ export default class WeTongbuPlugin extends Plugin {
     );
   }
 
-  private async maybeEnableVaultSyncAfterSetup(announce: boolean) {
-    if (!this.settings.vaultSyncAutoEnablePending || this.settings.vaultSyncEnabled) return;
-    if (!this.settings.syncTargetId) return;
-    const pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    if (!pluginToken) return;
-    const ready = this.accountPlanType === "pro"
-      ? this.accountLoggedIn
-      : this.hasConfiguredUserStorage();
-    if (!ready) return;
-    try {
-      await this.setVaultSyncEnabled(true);
-      if (!this.settings.vaultSyncEnabled) return;
-      this.settings.vaultSyncAutoEnablePending = false;
-      await this.saveSettings();
-      if (announce) new Notice("多端同步已自动开启", 6000);
-      void this.runVaultSync(false);
-    } catch (error) {
-      console.warn("WeTongbu default Vault sync enable deferred", error instanceof Error ? error.message : String(error));
-    }
-  }
-
   private pluginTokenSecretId() {
     return `wetongbu-plugin-${this.settings.authSecretSuffix}`;
+  }
+
+  private async resetEnvironmentScopedCredentials() {
+    if (this.settings.authSecretSuffix) {
+      this.app.secretStorage.setSecret(this.pluginTokenSecretId(), "");
+    }
+    if (this.settings.vaultDeviceTokenSecretId) {
+      this.app.secretStorage.setSecret(this.settings.vaultDeviceTokenSecretId, "");
+    }
+    this.settings.userId = "";
+    this.settings.syncTargetId = "";
+    this.settings.syncTargetName = "";
+    this.settings.authSecretSuffix = "";
+    this.settings.accountPlanType = "free";
+    this.settings.vaultDeviceTokenSecretId = "";
+    this.settings.vaultDeviceId = "";
+    this.settings.vaultSyncEnabled = false;
+    this.settings.pendingDeviceCode = "";
+    this.settings.pendingDeviceVerificationUri = "";
+    this.vaultDeviceTokenCache = "";
+    this.accountLoggedIn = false;
+    this.accountPlanType = "free";
+    this.accountCanVaultSync = false;
+    this.accountLegacyFreeStorageCompat = false;
+    this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
+    await this.saveSettings();
+  }
+
+  async logoutAccount(): Promise<{ remoteRevoked: boolean }> {
+    const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    let remoteRevoked = !token || !this.settings.syncTargetId;
+    if (token && this.settings.syncTargetId) {
+      const response = await requestUrl({
+        url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/device/revoke`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        contentType: "application/json",
+        body: "{}",
+        throw: false,
+      });
+      if (response.status !== 200 && response.status !== 401) {
+        throw new Error(response.json?.error ?? "退出账号失败");
+      }
+      remoteRevoked = true;
+    }
+    await this.resetEnvironmentScopedCredentials();
+    this.recoveryToken = "";
+    this.pairingCode = "";
+    this.pairingExpiresAt = "";
+    this.vaultPairingCode = "";
+    this.vaultPairingExpiresAt = "";
+    this.captureReceiverStatus = null;
+    this.vaultSyncRetry?.clear();
+    this.restartVaultSyncTimer();
+    return { remoteRevoked };
   }
 
   hasPluginToken() {
@@ -642,7 +980,7 @@ export default class WeTongbuPlugin extends Plugin {
   async startAccountLogin() {
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    const response = token && this.settings.syncTargetId
+    let response = token && this.settings.syncTargetId
       ? await requestUrl({
         url: `${base}/api/device-authorizations`,
         method: "POST",
@@ -674,18 +1012,35 @@ export default class WeTongbuPlugin extends Plugin {
             throw: false,
           });
         })();
+    // A 0.11.14 upgrade may already have rewritten apiBaseUrl to production
+    // while leaving a staging token behind. Re-register once when production
+    // rejects that token, so users do not have to delete the plugin manually.
+    if (response.status === 401 && token && this.settings.syncTargetId) {
+      await this.resetEnvironmentScopedCredentials();
+      const registeredToken = await this.ensureCurrentVaultRegistered();
+      response = await requestUrl({
+        url: `${base}/api/device-authorizations`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${registeredToken}` },
+        contentType: "application/json",
+        body: "{}",
+        throw: false,
+      });
+    }
     if (response.status !== 201) throw new Error(response.json?.error ?? "登录授权申请失败");
     const authorization = response.json;
     if (!isTrustedAuthorizationUrl(authorization.verification_uri)) {
       throw new Error("登录授权地址不受信任");
     }
-    const verification = new URL(authorization.verification_uri);
-    verification.search = `?user_code=${encodeURIComponent(authorization.user_code)}`;
-    const verificationUrl = verification.toString();
-    window.open(verificationUrl, "_blank");
+    const verificationUrl = createAuthorizationUrl(authorization.verification_uri, authorization.user_code, this.settings.apiBaseUrl).toString();
     this.settings.pendingDeviceCode = authorization.device_code;
     this.settings.pendingDeviceVerificationUri = verificationUrl;
+    // Persist the polling state before handing control to the browser. On
+    // mobile and some desktop window managers opening the external page can
+    // suspend or reload Obsidian immediately; saving afterwards loses the
+    // only device code and makes a successful browser approval look stuck.
     await this.saveSettings();
+    window.open(verificationUrl, "_blank");
     this.accountStatus = "请在浏览器完成账号登录并确认授权";
     await this.resumeAccountLogin(base);
   }
@@ -729,8 +1084,9 @@ export default class WeTongbuPlugin extends Plugin {
       if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
       this.accountPollTimer = null;
       await this.refreshAccountStatus();
+      this.settingTab?.refreshFromPlugin();
       if (!this.accountLoggedIn) throw new Error("账号状态读取失败，请重新登录");
-      await this.maybeEnableVaultSyncAfterSetup(true);
+      new Notice(`登录成功：${this.accountStatus.replace(/^当前账号：/, "")}`, 8000);
     } catch (error) {
       if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
       this.accountPollTimer = null;
@@ -747,8 +1103,10 @@ export default class WeTongbuPlugin extends Plugin {
     if (!this.settings.syncTargetId || !token) {
       this.accountLoggedIn = false;
       this.accountPlanType = this.settings.accountPlanType = "free";
+      this.accountLegacyFreeStorageCompat = false;
+      this.accountCanVaultSync = false;
       this.canHostImages = false;
-      this.accountStatus = "当前账号：未登录，自助版";
+      this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
       return;
     }
     try {
@@ -761,21 +1119,33 @@ export default class WeTongbuPlugin extends Plugin {
       if (response.status !== 200) {
         this.accountLoggedIn = false;
         this.accountPlanType = this.settings.accountPlanType = "free";
+        this.accountLegacyFreeStorageCompat = false;
+        this.accountCanVaultSync = false;
         this.canHostImages = false;
-        this.accountStatus = "当前账号：未登录，自助版";
+        this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
         return;
       }
       const account = response.json?.account ?? {};
       this.accountLoggedIn = Boolean(account.email);
-      this.accountPlanType = account.planType === "pro" ? "pro" : "free";
+      const capabilities = account.capabilities && typeof account.capabilities === "object"
+        ? account.capabilities
+        : null;
+      const plusActive = account.capabilities?.plusActive === true
+        || (account.effectivePlan === "plus" && account.subscriptionStatus !== "expired");
+      this.accountLegacyFreeStorageCompat = capabilities
+        ? capabilities.legacyFreeStorageCompat === true
+        : false;
+      this.accountCanVaultSync = this.accountLoggedIn
+        && (capabilities ? capabilities.canVaultSync === true : plusActive);
+      this.accountPlanType = plusActive ? "pro" : "free";
       this.settings.accountPlanType = this.accountPlanType;
       this.accountStatus = this.accountLoggedIn
-        ? `当前账号：${account.email}，${account.planType === "pro" ? "托管版 Plus" : "自助版"}`
-        : "当前账号：未登录，自助版";
+        ? `当前账号：${account.email}，${plusActive ? "Plus" : "免费账号"}`
+        : "当前账号：未登录；登录后可使用多端同步";
       await this.refreshImageDeliveryPreference(token);
       await this.saveSettings();
     } catch {
-      this.accountStatus = this.accountLoggedIn ? this.accountStatus : "当前账号：未登录，自助版";
+      this.accountStatus = this.accountLoggedIn ? this.accountStatus : "当前账号：未登录；登录后可使用多端同步";
     }
   }
 
@@ -820,6 +1190,11 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async setVaultSyncEnabled(enabled: boolean) {
+    if (enabled && (!this.accountLoggedIn || !this.accountCanVaultSync)) {
+      throw new Error(this.accountLoggedIn
+        ? "当前账号暂未开放 Vault 多端同步，请开通对应权益"
+        : "请先登录账号后再开启 Vault 多端同步");
+    }
     let pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (enabled && !this.settings.syncTargetId) {
       await this.registerCurrentVault();
@@ -830,6 +1205,7 @@ export default class WeTongbuPlugin extends Plugin {
         this.settings.vaultSyncEnabled = false;
         this.settings.vaultSyncAutoEnablePending = false;
         await this.saveSettings();
+        this.restartVaultSyncTimer();
         return;
       }
       throw new Error("请先连接当前 Vault");
@@ -866,6 +1242,7 @@ export default class WeTongbuPlugin extends Plugin {
       this.vaultDeviceTokenCache = "";
     }
     await this.saveSettings();
+    this.restartVaultSyncTimer();
   }
 
   async enableVaultEncryption(passphrase: string) {
@@ -898,10 +1275,6 @@ export default class WeTongbuPlugin extends Plugin {
   async disableVaultEncryption() {
     this.settings.vaultEncryptionEnabled = false;
     await this.saveSettings();
-  }
-
-  openAccountCenter() {
-    window.open("https://app.wetongbu.com/account/", "_blank");
   }
 
   openPromotionCenter() {
@@ -990,7 +1363,6 @@ export default class WeTongbuPlugin extends Plugin {
     this.storageStatus = resolved?.resolution === "adopted"
       ? `已找到远程 Vault · ${resolved.target_name ?? this.settings.syncTargetName}`
       : `连接正常 · ${providerLabel(resolved?.provider ?? this.settings.storageProvider)} · ${resolved?.bucket ?? this.settings.bucket}`;
-    await this.maybeEnableVaultSyncAfterSetup(true);
     return "verified";
   }
 
@@ -1189,13 +1561,29 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   /**
-   * Vault 多端同步入口。由 60s 轮询或手动命令触发。
+   * Vault 多端同步入口。由用户手动操作或已配置的自动同步间隔触发。
    * quiet=true 时静默；false 时弹 Notice。
-   * 前置条件：vaultSyncEnabled + 已注册（syncTargetId）+ 有 plugin token + 有 user_s3 凭证。
+   * 前置条件：vaultSyncEnabled + 已注册（syncTargetId）+ 已登录且有云端同步权益。
    */
   async runVaultSync(quiet = false, deletionResolution?: DeletionResolution) {
     if (!this.settings.vaultSyncEnabled) return;
     if (!this.settings.syncTargetId) return;
+    // Refresh server-side entitlement before a background run so expiry and
+    // future free-sync rollouts are reflected without restarting Obsidian.
+    await this.refreshAccountStatus();
+    if (!this.accountLoggedIn) {
+      if (!quiet) new Notice("请先登录账号后再使用 Vault 多端同步", 10000);
+      return;
+    }
+    if (!this.accountCanVaultSync) {
+      this.settings.vaultSyncEnabled = false;
+      this.settings.vaultSyncAutoEnablePending = false;
+      await this.saveSettings();
+      this.vaultSyncRetry?.clear();
+      this.restartVaultSyncTimer();
+      if (!quiet) new Notice("当前账号暂未开放 Vault 多端同步，已暂停", 10000);
+      return;
+    }
     if (this.vaultSyncing) {
       if (!quiet) new Notice("Vault 同步正在运行");
       return;
@@ -1234,51 +1622,14 @@ export default class WeTongbuPlugin extends Plugin {
         deviceToken,
       });
       const status = await remote.getStatus();
+      if (status.can_sync === false || status.storage_type !== "hosted_s3") {
+        throw new Error("当前账号的云端同步存储未就绪，请刷新账号状态后重试");
+      }
       if (status.storage_switch_state && status.storage_switch_state !== "active") {
-        this.storageStatus = "对象存储正在切换，Vault 同步已暂停；请等待存储管理电脑完成迁移";
+        this.storageStatus = "云端同步存储正在切换，Vault 同步已暂停，请稍后重试";
         this.vaultSyncRetry?.clear();
         if (!quiet) new Notice(this.storageStatus, 10000);
         return;
-      }
-      if (this.accountPlanType !== "pro" && status.storage_type === "user_s3") {
-        const remoteCredentialVersion = status.storage_credential_version ?? "";
-        const remoteStorageGeneration = Number(status.storage_generation ?? this.settings.storageGeneration ?? 1);
-        const localCredentialVersion = this.settings.storageCredentialVersion;
-        this.settings.storageManagerDeviceName = status.storage_manager_device_name ?? this.settings.storageManagerDeviceName;
-        this.settings.storageManagerIsCurrentDevice = Boolean(status.storage_manager_is_current_device);
-        this.settings.storageCredentialsUpdatedAt = status.storage_credentials_updated_at ?? this.settings.storageCredentialsUpdatedAt;
-        if (remoteCredentialVersion && localCredentialVersion !== remoteCredentialVersion) {
-          this.lastSafeErrorCode = "storage_credential_mismatch";
-          this.storageStatus = localCredentialVersion
-            ? `对象存储密钥已由${this.settings.storageManagerDeviceName || "主设备"}更新，请在本机填写最新密钥并测试保存`
-            : `请先在本机测试并保存对象存储密钥，再开始 Vault 同步`;
-          this.vaultSyncRetry?.clear();
-          if (!quiet) new Notice(this.storageStatus, 12000);
-          await this.saveSettings();
-          return;
-        }
-        if (this.settings.storageGeneration && remoteStorageGeneration !== this.settings.storageGeneration) {
-          this.lastSafeErrorCode = "storage_generation_changed";
-          this.storageStatus = `对象存储已切换到新版本（第 ${remoteStorageGeneration} 代），请在本机填写新配置并测试保存`;
-          this.vaultSyncRetry?.clear();
-          if (!quiet) new Notice(this.storageStatus, 12000);
-          await this.saveSettings();
-          return;
-        }
-        if (!remoteCredentialVersion) {
-          this.lastSafeErrorCode = "storage_credential_unverified";
-          this.storageStatus = "请先在电脑上测试并保存对象存储密钥，再开始 Vault 同步";
-          this.vaultSyncRetry?.clear();
-          if (!quiet) new Notice(this.storageStatus, 12000);
-          await this.saveSettings();
-          return;
-        }
-        if (this.settings.storageCredentialVersion !== remoteCredentialVersion
-          || this.settings.storageCredentialsUpdatedAt !== (status.storage_credentials_updated_at ?? "")) {
-          this.settings.storageCredentialVersion = remoteCredentialVersion;
-          this.settings.storageGeneration = remoteStorageGeneration;
-          await this.saveSettings();
-        }
       }
       if (status.encryption?.enabled && status.encryption.salt_hex) {
         this.settings.vaultEncryptionEnabled = true;
@@ -1286,49 +1637,20 @@ export default class WeTongbuPlugin extends Plugin {
         await this.saveSettings();
       }
 
-      // Pro 走托管存储（预签名 URL）；自助版直连用户自有 bucket（SigV4）。
-      let storage: VaultSyncStorage;
-      if (this.accountPlanType === "pro") {
-        storage = createProHostedStorage({
-          prepareUpload: async (hash, byteSize) => {
-            const r = await remote.prepareUpload(hash, byteSize);
-            return { uploadUrl: r.upload_url ?? null, uploadId: r.upload_id ?? null, deduped: !!r.deduped };
-          },
-          prepareDownload: async (hash) => {
-            const r = await remote.prepareDownload(hash);
-            return { downloadUrl: r.download_url ?? null };
-          },
-          verifyHash: !this.settings.vaultEncryptionEnabled,
-        });
-      } else {
-        const accessKey = await this.app.secretStorage.getSecret(
-          this.settings.accessKeySecretId || "wetongbu-storage-access-key-id",
-        );
-        const secretKey = await this.app.secretStorage.getSecret(
-          this.settings.secretKeySecretId || "wetongbu-storage-secret-access-key",
-        );
-        if (!accessKey || !secretKey) {
-          throw new Error("缺少对象存储凭证，请先在插件设置中验证并保存存储配置");
-        }
-        const s3cfg = deriveS3Config(
-          this.settings.activeStorageProvider || this.settings.storageProvider,
-          this.settings.activeStorageEndpoint || this.settings.endpoint,
-          this.settings.activeStorageRegion || this.settings.region,
-          this.settings.activeStorageBucket || this.settings.bucket,
-          this.settings.activeStoragePrefix || this.settings.prefix,
-        );
-        storage = createFreeS3Storage({
-          endpoint: s3cfg.endpoint,
-          region: s3cfg.region,
-          bucket: this.settings.activeStorageBucket || this.settings.bucket,
-          prefix: this.settings.activeStoragePrefix || this.settings.prefix,
-          accessKeyId: accessKey,
-          secretAccessKey: secretKey,
-          forcePathStyle: s3cfg.forcePathStyle,
-          targetId: this.settings.syncTargetId,
-          verifyHash: !this.settings.vaultEncryptionEnabled,
-        });
-      }
+      // All account tiers use platform-hosted presigned URLs. A future free
+      // rollout only changes the server capability response; no user bucket
+      // or long-lived object-storage credential is needed in the plugin.
+      let storage: VaultSyncStorage = createProHostedStorage({
+        prepareUpload: async (hash, byteSize) => {
+          const r = await remote.prepareUpload(hash, byteSize);
+          return { uploadUrl: r.upload_url ?? null, uploadId: r.upload_id ?? null, deduped: !!r.deduped };
+        },
+        prepareDownload: async (hash) => {
+          const r = await remote.prepareDownload(hash);
+          return { downloadUrl: r.download_url ?? null };
+        },
+        verifyHash: !this.settings.vaultEncryptionEnabled,
+      });
 
       if (this.settings.vaultEncryptionEnabled) {
         const passphrase = this.settings.vaultEncryptionSecretId
@@ -1377,7 +1699,9 @@ export default class WeTongbuPlugin extends Plugin {
       if (!result.failed) this.pendingDeletionReview = null;
       if (result.aborted) {
         this.vaultSyncRetry?.clear();
-      } else if (result.failed > 0 && result.failureMessages?.some(isRetryableVaultSyncError)) {
+      } else if (this.settings.vaultSyncIntervalMinutes !== null
+        && result.failed > 0
+        && result.failureMessages?.some(isRetryableVaultSyncError)) {
         this.vaultSyncRetry?.scheduleRetry();
       } else if (result.failed === 0) {
         this.vaultSyncRetry?.clear();
@@ -1411,7 +1735,9 @@ export default class WeTongbuPlugin extends Plugin {
       this.vaultSafetyOverrideFingerprint = "";
       const message = error instanceof Error ? error.message : String(error);
       this.lastSafeErrorCode = "vault_sync_failed";
-      if (isRetryableVaultSyncError(error)) this.vaultSyncRetry?.scheduleRetry();
+      if (this.settings.vaultSyncIntervalMinutes !== null && isRetryableVaultSyncError(error)) {
+        this.vaultSyncRetry?.scheduleRetry();
+      }
       if (!quiet) new Notice(`Vault 同步失败：${message}`, 10000);
       console.error("WeTongbu vault sync failed", error);
     } finally {
@@ -1527,7 +1853,7 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   private async refreshCaptureReceiverStatus() {
-    if (this.accountPlanType === "pro") {
+    if (this.accountPlanType === "pro" || (this.accountLoggedIn && !this.accountLegacyFreeStorageCompat)) {
       this.captureReceiverStatus = null;
       return;
     }
@@ -1545,6 +1871,9 @@ export default class WeTongbuPlugin extends Plugin {
 
   async setCurrentDeviceAsCaptureReceiver() {
     if (this.accountPlanType === "pro") throw new Error("Plus 托管版不需要设置剪藏接收设备");
+    if (this.accountLoggedIn && !this.accountLegacyFreeStorageCompat) {
+      throw new Error("当前免费账号仅支持本地剪藏，不需要设置云端接收设备");
+    }
     const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     if (!token || !this.settings.syncTargetId) throw new Error("请先连接 Obsidian Vault");
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
@@ -1684,7 +2013,6 @@ export default class WeTongbuPlugin extends Plugin {
     try {
       const handoffs = await this.captureHandoffs.list();
       if (!handoffs.length) return;
-      if (this.settings.vaultSyncEnabled) await this.runVaultSync(true);
       await this.reconcileCaptureHandoffs();
     } catch (error) {
       console.warn("WeTongbu capture handoff recovery failed", error);
@@ -1935,7 +2263,11 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
-  private async writeTask(task: any, imageLinks: Record<string, string> = {}) {
+  private async writeTask(
+    task: any,
+    imageLinks: Record<string, string> = {},
+    options: { preserveGeneratedMarkers?: boolean; allowLegacyPathMatch?: boolean } = {},
+  ) {
     const layout = buildVaultPaths({
       rootFolder: normalizePath(this.settings.rootFolder),
       title: task.manifest.title,
@@ -1947,9 +2279,11 @@ export default class WeTongbuPlugin extends Plugin {
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
 
-    // New notes carry a managed body marker. It lets later captures update
-    // the same article without replacing user-written notes around it.
-    let markdown = ensureGeneratedMarkers(task.markdown);
+    // ZIP captures carry a managed body marker so later captures can preserve
+    // user-written notes around the generated block. Lightweight local clips
+    // use frontmatter/tags for identity and intentionally hide those markers.
+    const preserveGeneratedMarkers = options.preserveGeneratedMarkers !== false;
+    let markdown = preserveGeneratedMarkers ? ensureGeneratedMarkers(task.markdown) : stripGeneratedMarkers(task.markdown);
     const assetPlans: Array<{ asset: any; filename: string; targetPath: string; writeLocal: boolean }> = [];
     for (const [index, asset] of task.assets.entries()) {
       const filename = layout.assetNames[index];
@@ -1979,6 +2313,19 @@ export default class WeTongbuPlugin extends Plugin {
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
         if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file });
+      }
+    }
+    // Older lightweight clips have generated markers but no source_url. When
+    // re-clipping the same day, migrate that exact WTB path in place instead
+    // of creating a second note. Restricting this fallback to the calculated
+    // path prevents same-title notes from unrelated sources being merged.
+    if (options.allowLegacyPathMatch && candidates.length === 0) {
+      const expectedPath = normalizePath(`${layout.noteFolder}/${layout.noteFilename}`);
+      const legacyFile = this.app.vault.getAbstractFileByPath(expectedPath);
+      if (legacyFile instanceof TFile) {
+        const content = await this.app.vault.cachedRead(legacyFile);
+        const candidate = articleCandidate(legacyFile.path, content);
+        if (isLegacyArticleCandidate(candidate, expectedPath)) candidates.push({ ...candidate, file: legacyFile });
       }
     }
     const incomingBody = normalizeArticleBodyForCompare(splitMarkdownFrontmatter(markdown).body);
@@ -2042,7 +2389,7 @@ export default class WeTongbuPlugin extends Plugin {
           const to = relativeVaultPath(existingFolder, plan.targetPath);
           markdown = markdown.split(`<${from}>`).join(`<${to}>`).split(from).join(to);
         }
-        const merged = mergeArticleMarkdown(existing, markdown);
+        const merged = mergeArticleMarkdown(existing, markdown, { preserveGeneratedMarkers });
         await writeTextAtomically(this.app, existing.path, merged);
         createdNote = existing.file;
         persistedMarkdown = merged;
@@ -2106,11 +2453,16 @@ async function writeTextAtomically(app: App, path: string, content: string) {
   const original = await adapter.read(path);
   await adapter.write(backup, original);
   try {
-    if (typeof adapter.rename === "function") {
+    // DataAdapter.rename intentionally rejects an existing destination on
+    // Obsidian's local adapter. Use the verified overwrite path whenever the
+    // note is still present; only use rename if a concurrent operation removed
+    // the destination between the backup and replacement steps.
+    if (typeof adapter.rename === "function" && !(await adapter.exists(path))) {
       await adapter.rename(temporary, path);
     } else {
-      // Older adapters cannot replace atomically. Verify the fallback and
-      // restore the original on a torn/corrupted write.
+      // Verify the overwrite and restore the original on a torn/corrupted
+      // write. The backup above still gives us a recovery copy during this
+      // non-atomic replacement window.
       await adapter.write(path, content);
       if ((await adapter.read(path)) !== content) throw new Error("文章更新替换校验失败");
       await adapter.remove(temporary).catch(() => {});
@@ -2370,6 +2722,10 @@ class WeTongbuSettingTab extends PluginSettingTab {
     }
   }
 
+  refreshFromPlugin() {
+    this.displayPreservingScroll();
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.classList.add("wetongbu-setting-tab");
@@ -2384,35 +2740,50 @@ class WeTongbuSettingTab extends PluginSettingTab {
     this.secretKeyInput ??= this.plugin.settings.secretKeySecretId
       ? this.app.secretStorage.getSecret(this.plugin.settings.secretKeySecretId) ?? ""
       : "";
+    // User-managed object-storage configuration is retired for all new
+    // accounts. Persisted legacy fields remain hidden for non-destructive
+    // upgrades and are never used to construct a sync client.
+    const canUseSelfHostedStorage = false;
 
     new Setting(containerEl)
       .setName("账号与登录")
       .setDesc(this.plugin.accountStatus)
       .addButton((button) =>
-        button.setButtonText(this.plugin.accountLoggedIn ? "更换账号" : "登录账号")
+        button.setButtonText(this.plugin.accountLoggedIn ? "退出账号" : "登录账号")
           .onClick(async () => {
+            const wasLoggedIn = this.plugin.accountLoggedIn;
             try {
               button.setDisabled(true);
+              if (this.plugin.accountLoggedIn) {
+                await this.plugin.logoutAccount();
+                this.display();
+                new Notice("已退出当前账号");
+                return;
+              }
               await this.plugin.startAccountLogin();
               this.display();
               new Notice(this.plugin.accountLoggedIn
-                ? "登录成功，可开始使用 Plus 试用"
+                ? "登录成功；需要时可在账号中心主动开启 Plus 试用"
                 : "已打开授权页面，完成授权后插件会自动登录");
             } catch (error) {
-              new Notice(`登录失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              new Notice(`${wasLoggedIn ? "退出账号失败" : "登录失败"}：${error instanceof Error ? error.message : String(error)}`, 10000);
             } finally {
               button.setDisabled(false);
             }
           }),
-      )
-      .addButton((button) =>
-        button.setButtonText("打开账号中心").onClick(() => this.plugin.openAccountCenter()),
-      )
-      .addButton((button) =>
-        button.setButtonText("免费月卡活动").onClick(() => this.plugin.openPromotionCenter()),
       );
 
+    const promotionLink = containerEl.createDiv({ cls: "wetongbu-promotion-link" }).createEl("a", {
+      text: "免费月卡活动",
+      href: "https://app.wetongbu.com/account/gift-cards",
+    });
+    promotionLink.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.plugin.openPromotionCenter();
+    });
+
     if ((this.plugin.accountPlanType === "pro" && this.plugin.canHostImages)
+      || (this.plugin.accountLoggedIn && this.plugin.settings.imageDeliveryMode === "hosted_link")
       || this.plugin.settings.imageDeliveryMode === "hosted_link") {
       new Setting(containerEl)
         .setName("图片保存位置")
@@ -2444,120 +2815,130 @@ class WeTongbuSettingTab extends PluginSettingTab {
           : "图片会下载到 Obsidian 本地。登录并开通 Plus 后，可选择云端图片链接。");
     }
 
-    new Setting(containerEl)
-      .setName("存储服务")
-      .setDesc("免费版使用你自己的私有对象存储；图片和附件仍保存到 Obsidian 本地")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("cloudflare_r2", "Cloudflare R2")
-          .addOption("aws_s3", "Amazon S3")
-          .addOption("aliyun_oss", "阿里云 OSS")
-          .addOption("tencent_cos", "腾讯云 COS")
-          .setValue(this.plugin.settings.storageProvider)
-          .onChange(async (value) => {
-            const provider = value as StorageProvider;
-            this.plugin.settings.storageProvider = provider;
-            this.plugin.settings.region = PROVIDER_DEFAULT_REGION[provider];
-            this.plugin.storageStatus = "";
-            await this.plugin.saveSettings();
-            this.display();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("配置提示")
-      .setDesc(this.providerConfigurationGuide());
-
-    if (this.plugin.settings.storageProvider === "cloudflare_r2") {
-      this.textSetting("R2 S3 Endpoint", "从 R2 控制台复制；格式类似 https://<账户 ID>.r2.cloudflarestorage.com", "endpoint");
-    }
-    this.textSetting(
-      "存储区域（Region）",
-      this.regionDescription(),
-      "region",
-    );
-    this.textSetting("存储桶（Bucket）", this.bucketDescription(), "bucket");
-    this.textSetting("存储目录", "默认 WeTongbu，一般不需要修改", "prefix");
-
-    new Setting(containerEl)
-      .setName(this.accessKeyLabel())
-      .setDesc(`输入从 ${providerLabel(this.plugin.settings.storageProvider)} 控制台获取的访问密钥 ID`)
-      .addText((text) =>
-        text
-          .setPlaceholder("请输入访问密钥 ID")
-          .setValue(this.accessKeyInput ?? "")
-          .onChange((value) => {
-            this.accessKeyInput = value;
-            this.plugin.storageStatus = "";
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName(this.secretKeyLabel())
-      .setDesc(`输入从 ${providerLabel(this.plugin.settings.storageProvider)} 控制台获取的访问密钥；内容将安全保存`)
-      .addText((text) => {
-        text.inputEl.type = "password";
-        text
-          .setPlaceholder("请输入访问密钥密码")
-          .setValue(this.secretKeyInput ?? "")
-          .onChange((value) => {
-            this.secretKeyInput = value;
-            this.plugin.storageStatus = "";
-          });
-      });
-
-    new Setting(containerEl)
-      .setName("测试验证")
-      .setDesc(this.plugin.storageStatus || "测试会写入、读取并删除一个临时文件；只有测试成功且与主设备密钥一致时才会保存")
-      .addButton((button) =>
-        button.setButtonText("测试并保存").onClick(async () => {
-          try {
-            const result = await this.plugin.configureUserStorage(
-              this.accessKeyInput ?? "",
-              this.secretKeyInput ?? "",
-            );
-            this.display();
-            new Notice(result === "migration_pending"
-              ? "对象存储测试成功，正在迁移 Vault 内容；完成前继续使用原存储"
-              : "对象存储测试成功，配置已保存", 8000);
-          } catch (error) {
-            this.display();
-            new Notice(`对象存储测试失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-          }
-        }),
-      );
-
-    if (this.plugin.settings.storageProvider !== "cloudflare_r2"
-      || this.plugin.settings.bucket
-      || this.plugin.settings.storageCredentialVersion) {
-      const manager = this.plugin.settings.storageManagerDeviceName || "尚未确定（请先在电脑上测试并保存）";
-      const state = this.plugin.settings.storageCredentialVersion
-        ? (this.plugin.settings.storageManagerIsCurrentDevice ? "本机是存储管理设备" : "本机已记录当前密钥版本")
-        : "本机尚未确认当前密钥版本";
+    if (canUseSelfHostedStorage) {
       new Setting(containerEl)
-        .setName("多端密钥状态")
-        .setDesc(`存储管理设备：${manager}；${state}。如果其他设备更新了密钥，请先在电脑上测试并保存，再在本机填写相同密钥。`);
+        .setName("存储服务")
+        .setDesc("免费版使用你自己的私有对象存储；图片和附件仍保存到 Obsidian 本地")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("cloudflare_r2", "Cloudflare R2")
+            .addOption("aws_s3", "Amazon S3")
+            .addOption("aliyun_oss", "阿里云 OSS")
+            .addOption("tencent_cos", "腾讯云 COS")
+            .setValue(this.plugin.settings.storageProvider)
+            .onChange(async (value) => {
+              const provider = value as StorageProvider;
+              this.plugin.settings.storageProvider = provider;
+              this.plugin.settings.region = PROVIDER_DEFAULT_REGION[provider];
+              this.plugin.storageStatus = "";
+              await this.plugin.saveSettings();
+              this.display();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("配置提示")
+        .setDesc(this.providerConfigurationGuide());
+
+      if (this.plugin.settings.storageProvider === "cloudflare_r2") {
+        this.textSetting("R2 S3 Endpoint", "从 R2 控制台复制；格式类似 https://<账户 ID>.r2.cloudflarestorage.com", "endpoint");
+      }
+      this.textSetting(
+        "存储区域（Region）",
+        this.regionDescription(),
+        "region",
+      );
+      this.textSetting("存储桶（Bucket）", this.bucketDescription(), "bucket");
+      this.textSetting("存储目录", "默认 WeTongbu，一般不需要修改", "prefix");
+
+      new Setting(containerEl)
+        .setName(this.accessKeyLabel())
+        .setDesc(`输入从 ${providerLabel(this.plugin.settings.storageProvider)} 控制台获取的访问密钥 ID`)
+        .addText((text) =>
+          text
+            .setPlaceholder("请输入访问密钥 ID")
+            .setValue(this.accessKeyInput ?? "")
+            .onChange((value) => {
+              this.accessKeyInput = value;
+              this.plugin.storageStatus = "";
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName(this.secretKeyLabel())
+        .setDesc(`输入从 ${providerLabel(this.plugin.settings.storageProvider)} 控制台获取的访问密钥；内容将安全保存`)
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text
+            .setPlaceholder("请输入访问密钥密码")
+            .setValue(this.secretKeyInput ?? "")
+            .onChange((value) => {
+              this.secretKeyInput = value;
+              this.plugin.storageStatus = "";
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("测试验证")
+        .setDesc(this.plugin.storageStatus || "测试会写入、读取并删除一个临时文件；只有测试成功且与主设备密钥一致时才会保存")
+        .addButton((button) =>
+          button.setButtonText("测试并保存").onClick(async () => {
+            try {
+              const result = await this.plugin.configureUserStorage(
+                this.accessKeyInput ?? "",
+                this.secretKeyInput ?? "",
+              );
+              this.display();
+              new Notice(result === "migration_pending"
+                ? "对象存储测试成功，正在迁移 Vault 内容；完成前继续使用原存储"
+                : "对象存储测试成功，配置已保存", 8000);
+            } catch (error) {
+              this.display();
+              new Notice(`对象存储测试失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            }
+          }),
+        );
+
+      if (this.plugin.settings.storageProvider !== "cloudflare_r2"
+        || this.plugin.settings.bucket
+        || this.plugin.settings.storageCredentialVersion) {
+        const manager = this.plugin.settings.storageManagerDeviceName || "尚未确定（请先在电脑上测试并保存）";
+        const state = this.plugin.settings.storageCredentialVersion
+          ? (this.plugin.settings.storageManagerIsCurrentDevice ? "本机是存储管理设备" : "本机已记录当前密钥版本")
+          : "本机尚未确认当前密钥版本";
+        new Setting(containerEl)
+          .setName("多端密钥状态")
+          .setDesc(`存储管理设备：${manager}；${state}。如果其他设备更新了密钥，请先在电脑上测试并保存，再在本机填写相同密钥。`);
+      }
+    } else {
+      new Setting(containerEl)
+        .setName("同步与图片")
+        .setDesc(this.plugin.accountLoggedIn
+          ? "登录账号后由微同步统一托管多端同步；图片仍可按上方设置保存到本地或云端。"
+          : "未登录时支持本地剪藏，图片保存到当前 Obsidian Vault；登录账号后可使用云端同步。无需其他设置。");
     }
 
-    new Setting(containerEl)
-      .setName("连接 Chrome 扩展")
-      .setDesc(
-        this.plugin.pairingCode
-          ? `绑定码 ${this.plugin.pairingCode}，有效至 ${new Date(this.plugin.pairingExpiresAt).toLocaleTimeString()}`
-          : "对象存储测试通过后，生成 6 位一次性绑定码，在 Chrome 扩展中完成连接；自助版无需登录账号",
-      )
-      .addButton((button) =>
-        button.setButtonText("生成 6 位绑定码").onClick(async () => {
-          try {
-            await this.plugin.createBrowserPairingCode();
-            this.display();
-          } catch (error) {
-            new Notice(`生成绑定码失败：${error instanceof Error ? error.message : String(error)}`);
-          }
-        }),
-      );
+    if (canUseSelfHostedStorage) {
+      new Setting(containerEl)
+        .setName("连接 Chrome 扩展")
+        .setDesc(
+          this.plugin.pairingCode
+            ? `绑定码 ${this.plugin.pairingCode}，有效至 ${new Date(this.plugin.pairingExpiresAt).toLocaleTimeString()}`
+            : "登录账号后，在浏览器完成设备授权并选择保存到哪个 Vault；不再需要配置对象存储或访问密钥",
+        )
+        .addButton((button) =>
+          button.setButtonText("生成 6 位绑定码").onClick(async () => {
+            try {
+              await this.plugin.createBrowserPairingCode();
+              this.display();
+            } catch (error) {
+              new Notice(`生成绑定码失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+          }),
+        );
+    }
 
-    if (this.plugin.accountPlanType !== "pro") {
+    if (canUseSelfHostedStorage) {
       const receiverName = this.plugin.captureReceiverStatus?.device_name;
       const canSetCaptureReceiver = !Platform.isIosApp && !Platform.isAndroidApp;
       new Setting(containerEl)
@@ -2585,15 +2966,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
     }
 
     this.textSetting("微同步目录", "文章、附件和 AI 说明文件的根目录", "rootFolder");
-
-    new Setting(containerEl)
-      .setName("立即同步")
-      .setDesc(this.plugin.settings.vaultSyncEnabled
-        ? "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除"
-        : "检查飞书、网页和微信剪藏任务；开启多端同步后也会同步 Vault 文件")
-      .addButton((button) =>
-        button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
-      );
 
     if (this.plugin.pendingDeletionCount > 0) {
       new Setting(containerEl)
@@ -2627,18 +2999,32 @@ class WeTongbuSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("立即同步")
+      .setDesc(this.plugin.settings.vaultSyncEnabled
+        ? "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除"
+        : "检查飞书、网页和微信剪藏任务；开启多端同步后也会同步 Vault 文件")
+      .addButton((button) =>
+        button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
+      );
+
+    const canVaultSync = this.plugin.accountCanVaultSync;
+    const vaultSyncSetting = new Setting(containerEl)
       .setName("多端同步")
-      .setDesc(`在多台设备间双向同步整个 Vault。${this.plugin.settings.vaultSyncAutoEnablePending && !this.plugin.settings.vaultSyncEnabled ? "完成对象存储测试或账号授权后会自动开启。" : "同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"}`)
+      .setDesc(canVaultSync
+        ? "在多台设备间双向同步整个 Vault，无需其他设置。开启后仍需点击“立即同步”，或配置自动同步间隔；同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"
+        : (this.plugin.accountLoggedIn
+          ? "当前账号暂未开放 Vault 多端同步；同步权益由账号套餐配置。"
+          : "登录账号后可连接云端 Vault，并在多台设备间同步。无需其他设置。"))
       .addToggle((toggle) =>
-      toggle
-          .setValue(this.plugin.settings.vaultSyncEnabled)
+        toggle
+          .setValue(canVaultSync && this.plugin.settings.vaultSyncEnabled)
+          .setDisabled(!canVaultSync)
           .onChange(async (value) => {
             try {
               toggle.setDisabled(true);
               await this.plugin.setVaultSyncEnabled(value);
               if (value) {
-                new Notice("Vault 多端同步已开启：将在后台检查并同步", 6000);
-                void this.plugin.runVaultSync(false);
+                new Notice("Vault 多端同步已开启：请点击“立即同步”，或配置自动同步间隔", 7000);
               } else {
                 new Notice("Vault 多端同步已暂停");
               }
@@ -2647,12 +3033,38 @@ class WeTongbuSettingTab extends PluginSettingTab {
               new Notice(`Vault 同步设置失败：${error instanceof Error ? error.message : String(error)}`, 10000);
               toggle.setValue(this.plugin.settings.vaultSyncEnabled);
             } finally {
-              toggle.setDisabled(false);
+              toggle.setDisabled(!this.plugin.accountCanVaultSync);
             }
           }),
       );
+    vaultSyncSetting.settingEl.addClass("wetongbu-vault-sync-setting");
 
-    if (this.plugin.settings.vaultSyncEnabled) {
+    if (this.plugin.accountCanVaultSync) {
+      const currentInterval = this.plugin.settings.vaultSyncIntervalMinutes;
+      new Setting(containerEl)
+        .setName("自动同步 Vault")
+        .setDesc(this.plugin.settings.vaultSyncEnabled
+          ? (currentInterval === null ? "当前为无限：不会自动同步，请在上方点击“立即同步”。" : `每 ${currentInterval} 分钟自动同步一次；仍可随时点击“立即同步”。`)
+          : "先开启多端同步；设置为“无限”可关闭自动同步。")
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption("1", "1 分钟")
+            .addOption("5", "5 分钟")
+            .addOption("10", "10 分钟")
+            .addOption("20", "20 分钟")
+            .addOption("30", "30 分钟")
+            .addOption("unlimited", "无限（关闭自动同步）")
+            .setValue(currentInterval === null ? "unlimited" : String(currentInterval))
+            .setDisabled(!this.plugin.settings.vaultSyncEnabled)
+            .onChange(async (value) => {
+              await this.plugin.setVaultSyncInterval(value === "unlimited" ? null : Number(value));
+              this.displayPreservingScroll();
+            });
+          return dropdown;
+        });
+    }
+
+    if (this.plugin.settings.vaultSyncEnabled && this.plugin.accountCanVaultSync) {
       new Setting(containerEl)
         .setName("同步范围")
         .setDesc("选择要同步的范围。整个 Vault 会包含所有笔记；仅微同步目录只同步剪藏产生的内容。")
@@ -2748,7 +3160,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
         .setName("账号恢复")
         .setDesc("Plus 用户请点击上方“登录账号”，登录后会自动恢复当前账号和 Vault。");
     }
-    if (this.plugin.accountPlanType !== "pro") {
+    if (canUseSelfHostedStorage) {
       const needsRecoveryInput = !this.plugin.settings.syncTargetId || !hasPluginToken;
       const recoverySetting = new Setting(containerEl)
         .setName("恢复当前 Vault")
