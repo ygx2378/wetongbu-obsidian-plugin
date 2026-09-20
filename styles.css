@@ -33,6 +33,30 @@
   max-width: 100%;
 }
 
+/* Match the native Toggle spacing used by the lower safety setting. */
+.wetongbu-setting-tab .wetongbu-vault-sync-setting .setting-item-control {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  margin-inline-end: 16px;
+}
+
+.wetongbu-setting-tab .wetongbu-promotion-link {
+  display: flex;
+  justify-content: center;
+  margin: 0 0 1rem;
+  padding: 0.5rem 0;
+}
+
+.wetongbu-setting-tab .wetongbu-promotion-link a {
+  color: var(--text-accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.wetongbu-setting-tab .wetongbu-promotion-link a:hover {
+  text-decoration: underline;
+}
+
 .wetongbu-setting-tab.wetongbu-mobile-settings,
 .wetongbu-setting-scroll.wetongbu-mobile-settings {
   overflow-x: hidden;

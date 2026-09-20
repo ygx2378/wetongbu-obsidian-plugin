@@ -1,9 +1,9 @@
 {
   "id": "wetongbu",
   "name": "WeTongbu",
-  "version": "0.11.8",
+  "version": "0.11.26",
   "minAppVersion": "1.11.4",
-  "description": "Sync selected WeChat articles, Feishu documents, and web pages to local Markdown notes.",
+  "description": "Receive clipped web pages, Feishu documents, WeChat articles, and AI conversations as local Markdown notes.",
   "author": "WeTongbu",
   "authorUrl": "https://wetongbu.com",
   "isDesktopOnly": false
