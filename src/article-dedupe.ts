@@ -1,9 +1,9 @@
 /**
  * Article identity and merge helpers used by the Obsidian delivery path.
  *
- * A task id identifies a delivery attempt, not an article.  These helpers use
- * the canonical source URL as the article identity and keep formatting noise
- * (BOM/line endings/generated asset names) out of duplicate comparisons.
+ * A task id identifies one delivery attempt, while the canonical source URL
+ * identifies the article for lightweight clip updates. Full create_new ZIP
+ * captures are intentionally allowed to create another note for the same URL.
  */
 
 import { normalizeCompletionSourceUrl } from "./completion-task-validation.ts";
@@ -15,6 +15,7 @@ export const GENERATED_END = "<!-- wetongbu:generated:end -->";
 export interface ArticleFrontmatter {
   title?: string;
   sourceUrl?: string;
+  taskId?: string;
   syncMode?: string;
   tags?: string[];
   [key: string]: unknown;
@@ -26,6 +27,7 @@ export interface ArticleCandidate {
   frontmatter: ArticleFrontmatter;
   body: string;
   sourceKey: string | null;
+  taskId: string | undefined;
   managed: boolean;
 }
 
@@ -124,8 +126,11 @@ function parseScalar(value: string): string | number | boolean {
 
 export function parseArticleFrontmatter(markdown: string): ArticleFrontmatter {
   const { frontmatter } = splitMarkdownFrontmatter(markdown);
-  if (!frontmatter) return {};
   const result: ArticleFrontmatter = {};
+  if (!frontmatter) {
+    result.taskId = /<!--\s*wetongbu:task_id:([a-zA-Z0-9_-]+)\s*-->/i.exec(markdown)?.[1];
+    return result;
+  }
   const lines = frontmatter.split(/\r?\n/);
   let currentList: string | null = null;
   for (const line of lines) {
@@ -151,6 +156,9 @@ export function parseArticleFrontmatter(markdown: string): ArticleFrontmatter {
   result.sourceUrl = typeof result.source_url === "string"
     ? result.source_url
     : typeof result.url === "string" ? result.url : undefined;
+  result.taskId = typeof result.wetongbu_task_id === "string"
+    ? result.wetongbu_task_id
+    : /<!--\s*wetongbu:task_id:([a-zA-Z0-9_-]+)\s*-->/i.exec(markdown)?.[1];
   result.syncMode = typeof result.sync_mode === "string" ? result.sync_mode : undefined;
   result.tags = Array.isArray(result.tags) ? result.tags.map(String) : undefined;
   return result;
@@ -166,7 +174,7 @@ export function articleCandidate(path: string, content: string): ArticleCandidat
     || frontmatter.syncMode === "complete_capture"
     || frontmatter.tags?.some((tag) => tag === "微同步" || tag === "网页剪藏" || tag === "微信剪藏" || tag === "飞书同步"),
   );
-  return { path, content, frontmatter, body, sourceKey, managed };
+  return { path, content, frontmatter, body, sourceKey, taskId: frontmatter.taskId, managed };
 }
 
 /**
@@ -230,10 +238,22 @@ export function ensureLocalClipFrontmatter(markdown: string, input: {
   title: string;
   sourceUrl: string;
   capturedAt: string;
+  taskId?: string;
 }) {
   const cleaned = withoutDuplicateTitle(stripGeneratedMarkers(markdown), input.title);
   const parts = splitMarkdownFrontmatter(cleaned);
-  if (parts.frontmatter.trim()) return cleaned;
+  if (parts.frontmatter.trim()) {
+    if (!input.taskId || /^\s*wetongbu_task_id\s*:/mi.test(parts.frontmatter)) return cleaned;
+    return [
+      "---",
+      parts.frontmatter,
+      `wetongbu_task_id: ${JSON.stringify(input.taskId)}`,
+      "---",
+      "",
+      parts.body.trim(),
+      "",
+    ].join(parts.newline);
+  }
   const title = JSON.stringify(String(input.title || "未命名文档"));
   const sourceUrl = JSON.stringify(String(input.sourceUrl || ""));
   const capturedAt = JSON.stringify(String(input.capturedAt || new Date().toISOString()));
@@ -242,6 +262,7 @@ export function ensureLocalClipFrontmatter(markdown: string, input: {
     `title: ${title}`,
     `source_url: ${sourceUrl}`,
     `captured_at: ${capturedAt}`,
+    ...(input.taskId ? [`wetongbu_task_id: ${JSON.stringify(input.taskId)}`] : []),
     'capture_level: "full"',
     'platform: "generic_web"',
     "tags:",
