@@ -509,6 +509,7 @@ export default class WeTongbuPlugin extends Plugin {
         title: payload.title,
         sourceUrl: payload.sourceUrl,
         capturedAt,
+        taskId: payload.taskId,
       });
       const imageUrls = payload.imageMode === "local" && Array.isArray(payload.imageUrls)
         ? payload.imageUrls.slice(0, 200)
@@ -522,10 +523,11 @@ export default class WeTongbuPlugin extends Plugin {
           title: payload.title,
           sourceUrl: payload.sourceUrl,
           capturedAt,
+          operation: "create_new",
         },
         markdown,
         assets: [],
-      }, {}, { preserveGeneratedMarkers: false, allowLegacyPathMatch: true });
+      }, {}, { preserveGeneratedMarkers: false });
       const completed = await requestUrl({
         url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
         method: "POST",
@@ -980,6 +982,10 @@ export default class WeTongbuPlugin extends Plugin {
   async startAccountLogin() {
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    // A fresh plugin installation in a different local Obsidian Vault must
+    // claim that Vault as a distinct account target. Joining another device to
+    // an existing Vault is handled by the dedicated Vault pairing flow.
+    let createsNewVault = !token && !this.settings.syncTargetId;
     let response = token && this.settings.syncTargetId
       ? await requestUrl({
         url: `${base}/api/device-authorizations`,
@@ -1017,6 +1023,7 @@ export default class WeTongbuPlugin extends Plugin {
     // rejects that token, so users do not have to delete the plugin manually.
     if (response.status === 401 && token && this.settings.syncTargetId) {
       await this.resetEnvironmentScopedCredentials();
+      createsNewVault = true;
       const registeredToken = await this.ensureCurrentVaultRegistered();
       response = await requestUrl({
         url: `${base}/api/device-authorizations`,
@@ -1032,7 +1039,12 @@ export default class WeTongbuPlugin extends Plugin {
     if (!isTrustedAuthorizationUrl(authorization.verification_uri)) {
       throw new Error("登录授权地址不受信任");
     }
-    const verificationUrl = createAuthorizationUrl(authorization.verification_uri, authorization.user_code, this.settings.apiBaseUrl).toString();
+    const verificationUrl = createAuthorizationUrl(
+      authorization.verification_uri,
+      authorization.user_code,
+      this.settings.apiBaseUrl,
+      createsNewVault,
+    ).toString();
     this.settings.pendingDeviceCode = authorization.device_code;
     this.settings.pendingDeviceVerificationUri = verificationUrl;
     // Persist the polling state before handing control to the browser. On
@@ -1904,7 +1916,10 @@ export default class WeTongbuPlugin extends Plugin {
     const listed = await requestUrl({
       url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/claim`,
       method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "X-Wetongbu-Task-Download-Proxy": "1",
+      },
       contentType: "application/json",
       body: "{}",
       throw: false,
@@ -1932,14 +1947,24 @@ export default class WeTongbuPlugin extends Plugin {
         // Vault still contains the written file, so never acknowledge a task
         // solely because its id was persisted in settings. The handoff check
         // above is the only fast path that has local file evidence.
+        const expectedDownloadPath = `/api/sync-targets/${this.settings.syncTargetId}/tasks/${item.task_id}/download`;
+        const proxyDownloadUrl = item.download_path === expectedDownloadPath
+          ? `${base}${expectedDownloadPath}`
+          : null;
+        const downloadUrl = proxyDownloadUrl ?? item.download_url;
         if (!isTrustedStorageUrl(
-          item.download_url,
+          downloadUrl,
           this.settings.activeStorageEndpoint || this.settings.endpoint,
           base,
         )) {
           throw new Error("任务下载地址不受信任");
         }
-        const downloaded = await requestUrl({ url: item.download_url, method: "GET", throw: false });
+        const downloaded = await requestUrl({
+          url: downloadUrl,
+          method: "GET",
+          ...(proxyDownloadUrl ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+          throw: false,
+        });
         if (downloaded.status !== 200) throw new Error(`任务下载失败（${downloaded.status}）`);
         const zipBytes = new Uint8Array(downloaded.arrayBuffer);
         const packageHash = await sha256Hex(zipBytes);
@@ -2304,9 +2329,32 @@ export default class WeTongbuPlugin extends Plugin {
     }
     markdown = markdown.replace(/^[\t ]+(?=(?:!\[|\[!\[))/gm, "");
 
+    const taskId = typeof task.manifest.taskId === "string" ? task.manifest.taskId : "";
+    const isCreateNewZip = task.manifest.operation === "create_new" && options.allowLegacyPathMatch !== true;
+    const taskIdentityCandidates: Array<ArticleCandidate & { file: TFile }> = [];
+    if (taskId) {
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
+        if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        const content = await this.app.vault.cachedRead(file);
+        const candidate = articleCandidate(file.path, content);
+        if (candidate.taskId === taskId) taskIdentityCandidates.push({ ...candidate, file });
+      }
+    }
+    if (taskIdentityCandidates.length > 1) throw new Error("同一任务已有多个本地版本，请先在 Vault 中处理重复文章");
+    if (taskIdentityCandidates.length === 1) {
+      const existing = taskIdentityCandidates[0];
+      const encoded = new TextEncoder().encode(existing.content);
+      try { await this.app.workspace.getLeaf(false).openFile(existing.file); } catch { /* best effort */ }
+      return {
+        notePath: existing.path,
+        files: [{ path: existing.path, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }],
+      };
+    }
+
     const sourceKey = normalizeArticleSourceUrl(task.manifest.sourceUrl);
     const candidates: Array<ArticleCandidate & { file: TFile }> = [];
-    if (sourceKey) {
+    if (!isCreateNewZip && sourceKey) {
       const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
       for (const file of this.app.vault.getMarkdownFiles()) {
         if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
@@ -2516,6 +2564,53 @@ class VaultConflictReviewModal extends Modal {
         setting.addButton((button) => button.setButtonText("已处理").setDisabled(true));
       }
     }
+  }
+}
+
+class AccountLogoutConfirmModal extends Modal {
+  constructor(
+    app: App,
+    private onConfirm: () => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.titleEl.setText("确认退出账号？");
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: "退出后，本机将断开当前微同步账号和 Vault 同步。当前 Vault 中已有的笔记、图片和附件不会删除。",
+    });
+    contentEl.createEl("p", {
+      text: "之后可以随时重新登录，或换用其他账号。",
+    });
+    const status = contentEl.createEl("p", { cls: "setting-item-description", attr: { role: "status" } });
+    let confirming = false;
+    new Setting(contentEl)
+      .addButton((button) => button
+        .setButtonText("取消")
+        .onClick(() => this.close()))
+      .addButton((button) => button
+        .setButtonText("确认退出")
+        .setWarning()
+        .onClick(() => {
+          if (confirming) return;
+          confirming = true;
+          button.setDisabled(true).setButtonText("正在退出…");
+          void this.onConfirm().then(
+            () => this.close(),
+            (error) => {
+              confirming = false;
+              button.setDisabled(false).setButtonText("确认退出");
+              status.setText(`退出账号失败：${error instanceof Error ? error.message : String(error)}`);
+            },
+          );
+        }));
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -2752,14 +2847,16 @@ class WeTongbuSettingTab extends PluginSettingTab {
         button.setButtonText(this.plugin.accountLoggedIn ? "退出账号" : "登录账号")
           .onClick(async () => {
             const wasLoggedIn = this.plugin.accountLoggedIn;
-            try {
-              button.setDisabled(true);
-              if (this.plugin.accountLoggedIn) {
+            if (wasLoggedIn) {
+              new AccountLogoutConfirmModal(this.app, async () => {
                 await this.plugin.logoutAccount();
                 this.display();
                 new Notice("已退出当前账号");
-                return;
-              }
+              }).open();
+              return;
+            }
+            try {
+              button.setDisabled(true);
               await this.plugin.startAccountLogin();
               this.display();
               new Notice(this.plugin.accountLoggedIn

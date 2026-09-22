@@ -84,7 +84,7 @@ export function isTrustedAuthorizationUrl(value: unknown): boolean {
 }
 
 /** Normalize an API-provided authorization URL for the shared app surface. */
-export function createAuthorizationUrl(value: unknown, userCode: string, apiBaseUrl = DEFAULT_API_BASE_URL): URL {
+export function createAuthorizationUrl(value: unknown, userCode: string, apiBaseUrl = DEFAULT_API_BASE_URL, createNewVault = false): URL {
   const url = parseHttpsUrl(value);
   if (!url || !TRUSTED_AUTHORIZATION_HOSTS.has(url.hostname.toLowerCase())) {
     throw new Error("登录授权地址不受信任");
@@ -94,6 +94,8 @@ export function createAuthorizationUrl(value: unknown, userCode: string, apiBase
   url.hostname = "app.wetongbu.com";
   url.searchParams.set("api_base", normalizeApiBaseUrl(apiBaseUrl));
   url.searchParams.set("user_code", userCode);
+  if (createNewVault) url.searchParams.set("vault_mode", "new");
+  else url.searchParams.delete("vault_mode");
   return url;
 }
 
