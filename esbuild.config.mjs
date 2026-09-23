@@ -2,6 +2,15 @@ import esbuild from "esbuild";
 import { readFile, writeFile } from "node:fs/promises";
 
 const production = process.argv.includes("--production");
+const apiBaseUrl = process.env.OBSIDIAN_API_BASE_URL?.trim() || "https://api.wetongbu.com";
+let parsedApiBase;
+try { parsedApiBase = new URL(apiBaseUrl); } catch { throw new Error("OBSIDIAN_API_BASE_URL must be an absolute HTTPS URL"); }
+if (parsedApiBase.protocol !== "https:" || parsedApiBase.username || parsedApiBase.password || parsedApiBase.port
+  || (parsedApiBase.pathname !== "/" && parsedApiBase.pathname !== "")
+  || !/^(?:api|staging-api|test-api)\.wetongbu\.com$/i.test(parsedApiBase.hostname)) {
+  throw new Error("OBSIDIAN_API_BASE_URL host is not an approved WeTongbu environment");
+}
+const normalizedApiBaseUrl = `https://${parsedApiBase.hostname.toLowerCase()}`;
 
 await esbuild.build({
   entryPoints: ["src/main.ts"],
@@ -16,6 +25,9 @@ await esbuild.build({
   outfile: "main.js",
   sourcemap: production ? false : "inline",
   minify: production,
+  define: {
+    WETONGBU_API_BASE_URL: JSON.stringify(normalizedApiBaseUrl),
+  },
   logLevel: "info",
 });
 

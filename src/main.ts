@@ -20,6 +20,8 @@ import { createCaptureHandoffStore, type CaptureHandoffStore } from "./capture-h
 import { selectCompletionNote, updateCompletionNoteMetadata } from "./completion-note";
 import { assertCompletionTaskIdentity, normalizeCompletionSourceUrl } from "./completion-task-validation";
 import { resolveAssetTarget } from "./asset-target";
+import { replaceMarkdownDestination } from "./media-continuation";
+import { completeLocalClipTaskWithRetry } from "./local-clip-completion";
 import { unzipWebclipArchive } from "./webclip-zip";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
@@ -107,6 +109,8 @@ interface WeTongbuSettings {
   vaultDeviceTokenSecretId: string;
   /** Stable per-installation identity; never use a platform name as identity. */
   vaultInstallationId: string;
+  /** Stable identity for this local Vault, retained across plugin reinstalls. */
+  vaultIdentityId: string;
   /** Server-side device row ID for the current installation. */
   vaultDeviceId: string;
   vaultEncryptionEnabled: boolean;
@@ -252,6 +256,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   vaultFirstSyncDirection: "auto",
   vaultDeviceTokenSecretId: "",
   vaultInstallationId: "",
+  vaultIdentityId: "",
   vaultDeviceId: "",
   vaultEncryptionEnabled: false,
   vaultEncryptionSecretId: "",
@@ -388,6 +393,7 @@ export default class WeTongbuPlugin extends Plugin {
     if (!this.settings.vaultInstallationId) {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
+    await this.ensureVaultIdentityId();
     await this.saveSettings();
     this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
       void this.handleLocalClipImport(params as Record<string, unknown>);
@@ -436,6 +442,26 @@ export default class WeTongbuPlugin extends Plugin {
     });
   }
 
+  /**
+   * Keep the Vault identity in the Vault itself so deleting/reinstalling the
+   * plugin does not make the same local Vault look like a new one. The file
+   * contains only a random UUID; no path or note content is sent to the API.
+   */
+  private async ensureVaultIdentityId() {
+    const identityPath = ".wetongbu/vault-identity";
+    const adapter = this.app.vault.adapter;
+    let identity = "";
+    if (await adapter.exists(identityPath)) {
+      identity = (await adapter.read(identityPath)).trim();
+    }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identity)) {
+      identity = this.settings.vaultIdentityId || crypto.randomUUID();
+      if (!(await adapter.exists(".wetongbu"))) await adapter.mkdir(".wetongbu");
+      await adapter.write(identityPath, identity);
+    }
+    this.settings.vaultIdentityId = identity;
+  }
+
   onunload() {
     if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
     this.accountPollTimer = null;
@@ -479,6 +505,7 @@ export default class WeTongbuPlugin extends Plugin {
       return;
     }
     const base = this.settings.apiBaseUrl.replace(/\/$/, "");
+    let articleWritten = false;
     try {
       const response = await requestUrl({
         url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/claim`,
@@ -528,14 +555,7 @@ export default class WeTongbuPlugin extends Plugin {
         markdown,
         assets: [],
       }, {}, { preserveGeneratedMarkers: false });
-      const completed = await requestUrl({
-        url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
-        method: "POST",
-        contentType: "application/json",
-        body: JSON.stringify({ token: claimToken }),
-        throw: false,
-      });
-      if (completed.status !== 200) console.warn("WeTongbu local clip completion failed", completed.status);
+      articleWritten = true;
       if (imageUrls.length) {
         new Notice(`文章已打开；${imageUrls.length} 张图片正在后台保存`, 6000);
         this.scheduleLocalClipImageProcessing({
@@ -548,11 +568,36 @@ export default class WeTongbuPlugin extends Plugin {
           markdown,
           assets: [],
         }, imageUrls, written.notePath);
-      } else {
+      }
+      let completionError: unknown;
+      try {
+        await completeLocalClipTaskWithRetry({
+          complete: async () => {
+            const response = await requestUrl({
+              url: `${base}/api/clip-tasks/${encodeURIComponent(taskId)}/complete`,
+              method: "POST",
+              contentType: "application/json",
+              body: JSON.stringify({ token: claimToken }),
+              throw: false,
+            });
+            return { status: response.status, error: response.json?.error };
+          },
+        });
+      } catch (error) {
+        completionError = error;
+        console.warn("WeTongbu local clip completion acknowledgement failed after retries", error);
+      }
+      if (completionError) {
+        new Notice(imageUrls.length
+          ? "文章已写入；图片已开始本地处理，但服务端暂未确认正文状态。"
+          : "文章已写入；服务端未确认正文状态，云端图片续传可能无法启动。", 10000);
+      } else if (!imageUrls.length) {
         new Notice(`已打开剪藏文章：${written.notePath}`, 6000);
       }
     } catch (error) {
-      new Notice(`微同步剪藏失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+      new Notice(articleWritten
+        ? `文章已写入；剪藏后续处理失败：${error instanceof Error ? error.message : String(error)}`
+        : `微同步剪藏失败：${error instanceof Error ? error.message : String(error)}`, 10000);
       console.error("WeTongbu local clip import failed", error);
     }
   }
@@ -817,6 +862,7 @@ export default class WeTongbuPlugin extends Plugin {
         targetName: this.app.vault.getName(),
         deviceName: currentDeviceName(),
         device_class: currentDeviceClass(),
+        vault_identity: this.settings.vaultIdentityId,
       }),
       throw: false,
     });
@@ -985,14 +1031,17 @@ export default class WeTongbuPlugin extends Plugin {
     // A fresh plugin installation in a different local Obsidian Vault must
     // claim that Vault as a distinct account target. Joining another device to
     // an existing Vault is handled by the dedicated Vault pairing flow.
-    let createsNewVault = !token && !this.settings.syncTargetId;
+    // The authorization page can still explicitly create a new Vault, but a
+    // fresh install should default to reusing the existing Vault identity or
+    // choosing an existing same-name target instead of forcing a duplicate.
+    let createsNewVault = false;
     let response = token && this.settings.syncTargetId
       ? await requestUrl({
         url: `${base}/api/device-authorizations`,
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
         contentType: "application/json",
-        body: "{}",
+        body: JSON.stringify({ vault_identity: this.settings.vaultIdentityId }),
         throw: false,
       })
       : !token && this.settings.syncTargetId
@@ -1004,6 +1053,7 @@ export default class WeTongbuPlugin extends Plugin {
             target_id: this.settings.syncTargetId,
             device_name: currentDeviceName(),
             device_class: currentDeviceClass(),
+            vault_identity: this.settings.vaultIdentityId,
           }),
           throw: false,
         })
@@ -1014,7 +1064,7 @@ export default class WeTongbuPlugin extends Plugin {
             method: "POST",
             headers: { Authorization: `Bearer ${registeredToken}` },
             contentType: "application/json",
-            body: "{}",
+            body: JSON.stringify({ vault_identity: this.settings.vaultIdentityId }),
             throw: false,
           });
         })();
@@ -1023,14 +1073,14 @@ export default class WeTongbuPlugin extends Plugin {
     // rejects that token, so users do not have to delete the plugin manually.
     if (response.status === 401 && token && this.settings.syncTargetId) {
       await this.resetEnvironmentScopedCredentials();
-      createsNewVault = true;
+      createsNewVault = false;
       const registeredToken = await this.ensureCurrentVaultRegistered();
       response = await requestUrl({
         url: `${base}/api/device-authorizations`,
         method: "POST",
         headers: { Authorization: `Bearer ${registeredToken}` },
         contentType: "application/json",
-        body: "{}",
+        body: JSON.stringify({ vault_identity: this.settings.vaultIdentityId }),
         throw: false,
       });
     }
@@ -1044,15 +1094,25 @@ export default class WeTongbuPlugin extends Plugin {
       authorization.user_code,
       this.settings.apiBaseUrl,
       createsNewVault,
-    ).toString();
+    );
+    if (typeof authorization.target_id === "string" && authorization.target_id) {
+      verificationUrl.searchParams.set("target_id", authorization.target_id);
+    }
+    if (typeof authorization.preferred_target_id === "string" && authorization.preferred_target_id) {
+      verificationUrl.searchParams.set("preferred_target_id", authorization.preferred_target_id);
+    }
+    if (typeof authorization.target_name === "string" && authorization.target_name) {
+      verificationUrl.searchParams.set("vault_name", authorization.target_name);
+    }
+    const verificationUrlString = verificationUrl.toString();
     this.settings.pendingDeviceCode = authorization.device_code;
-    this.settings.pendingDeviceVerificationUri = verificationUrl;
+    this.settings.pendingDeviceVerificationUri = verificationUrlString;
     // Persist the polling state before handing control to the browser. On
     // mobile and some desktop window managers opening the external page can
     // suspend or reload Obsidian immediately; saving afterwards loses the
     // only device code and makes a successful browser approval look stuck.
     await this.saveSettings();
-    window.open(verificationUrl, "_blank");
+    window.open(verificationUrlString, "_blank");
     this.accountStatus = "请在浏览器完成账号登录并确认授权";
     await this.resumeAccountLogin(base);
   }
@@ -1975,12 +2035,23 @@ export default class WeTongbuPlugin extends Plugin {
           userId: this.settings.userId,
           targetId: this.settings.syncTargetId,
         });
+        const continuationNote = task.manifest.mediaContinuationClipTaskId
+          ? await this.findClipContinuationNote(task.manifest.mediaContinuationClipTaskId)
+          : null;
+        // The browser waits for the lightweight clip to complete before
+        // creating this task. If the user removed or duplicated that note in
+        // the meantime, fail safely instead of creating a second article.
+        if (task.manifest.mediaContinuationClipTaskId && !continuationNote) {
+          throw new Error("找不到对应的原剪藏文章；为避免生成重复文章，已停止图片回填");
+        }
         const imageLinks = item.image_delivery_mode === "hosted_link"
           ? await this.publishHostedImages(base, token, item.task_id)
           : {};
-        const written = task.manifest.operation === "complete_capture"
-          ? await this.completeCaptureTask(task)
-          : await this.writeTask(task, imageLinks);
+        const written = task.manifest.mediaContinuationClipTaskId
+          ? await this.applyHostedMediaContinuation(task, imageLinks, continuationNote!)
+          : task.manifest.operation === "complete_capture"
+            ? await this.completeCaptureTask(task)
+            : await this.writeTask(task, imageLinks);
         await this.captureHandoffs.save({
           version: 1,
           taskId: item.task_id,
@@ -2002,6 +2073,84 @@ export default class WeTongbuPlugin extends Plugin {
       }
     }
     return synced;
+  }
+
+  private async findClipContinuationNote(taskId: string) {
+    const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
+    const matches: Array<ArticleCandidate & { file: TFile }> = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+      const content = await this.app.vault.cachedRead(file);
+      const candidate = articleCandidate(file.path, content);
+      if (candidate.taskId === taskId) matches.push({ ...candidate, file });
+    }
+    if (matches.length > 1) throw new Error("图片续传任务对应多个剪藏文章；为避免改错文章，已停止回填");
+    return matches[0] ?? null;
+  }
+
+  private async applyHostedMediaContinuation(
+    task: any,
+    imageLinks: Record<string, string>,
+    candidate: ArticleCandidate & { file: TFile },
+  ) {
+    const clipTaskId = String(task.manifest.mediaContinuationClipTaskId);
+    const capturedAt = String(candidate.frontmatter.captured_at ?? task.manifest.capturedAt ?? new Date().toISOString());
+    const layout = buildVaultPaths({
+      rootFolder: normalizePath(this.settings.rootFolder),
+      title: String(candidate.frontmatter.title ?? task.manifest.title),
+      capturedAt,
+      taskId: clipTaskId,
+      assets: task.assets,
+    });
+    const notePath = candidate.path;
+    const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    const createdPaths: string[] = [];
+    const localFiles: Array<{ path: string; body: Uint8Array }> = [];
+    const replacements: Array<{ from: string; to: string; imageOnly: boolean }> = [];
+    try {
+      for (const [index, asset] of task.assets.entries()) {
+        const reference = typeof asset.clipReference === "string" ? asset.clipReference : "";
+        if (!reference) throw new Error(`图片续传清单缺少原引用：${asset.relativePath}`);
+        const hostedLink = asset.kind === "image" ? imageLinks[asset.relativePath] : undefined;
+        if (hostedLink) {
+          replacements.push({ from: reference, to: hostedLink, imageOnly: true });
+          continue;
+        }
+        const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[index]}`);
+        const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
+        if (resolved.writeLocal) {
+          await ensureFolder(this, attachmentFolder);
+          createdPaths.push(resolved.targetPath);
+          await this.app.vault.adapter.writeBinary(resolved.targetPath, toArrayBuffer(new Uint8Array(asset.body)));
+          const persisted = await this.app.vault.adapter.stat(resolved.targetPath);
+          if (!persisted || persisted.type !== "file" || persisted.size !== asset.body.length) {
+            throw new Error(`附件写入校验失败：${resolved.targetPath}`);
+          }
+        }
+        localFiles.push({ path: resolved.targetPath, body: new Uint8Array(asset.body) });
+        replacements.push({ from: reference, to: relativeVaultPath(noteFolder, resolved.targetPath), imageOnly: false });
+      }
+
+      const original = await this.app.vault.cachedRead(candidate.file);
+      let updated = original;
+      for (const replacement of replacements) {
+        updated = replaceMarkdownDestination(updated, replacement.from, replacement.to, replacement.imageOnly);
+      }
+      if (updated !== original) await writeTextAtomically(this.app, notePath, updated);
+      const persisted = await this.app.vault.adapter.read(notePath);
+      const encoded = new TextEncoder().encode(persisted);
+      const files = [{ path: notePath, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }];
+      for (const file of localFiles) {
+        files.push({ path: file.path, contentHash: await sha256Hex(file.body), byteSize: file.body.byteLength });
+      }
+      return { notePath, files };
+    } catch (error) {
+      for (const path of createdPaths) {
+        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path).catch(() => {});
+      }
+      throw error;
+    }
   }
 
   private async captureHandoffFilesMatch(handoff: { notePath: string; files: Array<{ path: string; contentHash: string; byteSize: number }> }) {
@@ -2115,6 +2264,7 @@ export default class WeTongbuPlugin extends Plugin {
         captureId: manifest.capture_id ?? null,
         userId: manifest.user_id ?? null,
         targetId: manifest.target_id ?? null,
+        mediaContinuationClipTaskId: manifest.media_continuation?.clip_task_id ?? null,
       },
         markdown: new TextDecoder().decode(files.get(manifest.entry_file)!),
       assets: manifest.files
@@ -2124,6 +2274,7 @@ export default class WeTongbuPlugin extends Plugin {
           body: files.get(file.path)!,
           kind: file.kind,
           contentType: file.content_type,
+          clipReference: file.clip_reference,
         })),
     };
   }

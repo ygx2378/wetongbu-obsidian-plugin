@@ -61,6 +61,15 @@ export function validateWebclipManifest(manifest) {
     }
   }
   if (manifest.asset_mode !== "local") throw new Error("asset_mode must be local");
+  if (manifest.media_continuation !== undefined) {
+    const continuation = manifest.media_continuation;
+    if (!continuation || typeof continuation !== "object" || Array.isArray(continuation)
+      || continuation.version !== 1
+      || typeof continuation.clip_task_id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(continuation.clip_task_id)) {
+      throw new Error("invalid media continuation metadata");
+    }
+  }
   if (Number.isNaN(Date.parse(requireString(manifest.created_at, "created_at")))) {
     throw new Error("invalid created_at");
   }
@@ -99,6 +108,11 @@ export function validateWebclipManifest(manifest) {
       throw new Error(`invalid file SHA-256: ${filePath}`);
     }
     requireString(file.content_type, `content_type: ${filePath}`);
+    if (manifest.media_continuation && filePath.startsWith("assets/")) {
+      if (typeof file.clip_reference !== "string" || !file.clip_reference.trim() || file.clip_reference.length > 8192 || /[\r\n]/.test(file.clip_reference)) {
+        throw new Error(`invalid clip reference: ${filePath}`);
+      }
+    }
     if (filePath.startsWith("assets/")) {
       assetCount += 1;
       if (file.kind === "attachment") attachmentCount += 1;
