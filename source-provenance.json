@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.185",
-  "recorded_at": "2026-10-08T05:24:36.663Z",
+  "candidate": "0.11.35-prodtest1.0.186",
+  "recorded_at": "2026-10-08T06:09:54.885Z",
   "api_base_url": "https://api.wetongbu.com",
   "source": {
-    "base_head": "29a0c9704ca0a29c6abba81ab7bc83e304e41686",
+    "base_head": "08dd6ba6fd6c9e991ac2ee9f4a22a71a75112720",
     "branch": "codex/vault-sync-deletion-notice-185",
     "working_tree_dirty": false,
     "source_input_count": 65,
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
-    "source_fingerprint_sha256": "a203de3b167235a963169107efd132119b968461dce2753ab53d887d830628f7",
+    "source_fingerprint_sha256": "576c467e438b3b52ea729d58a73c215b51db76040fc78bafdb37f9fa42ba581d",
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "inputs": [
       {
@@ -270,18 +270,18 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "1195f44d17dae9871c3e86f1b49076c51a4107231f797e19953291709da3f89b"
+        "sha256": "9a29576d13a06206ce14c5d409b9353a826b015575546f35d45636fe78063bd8"
       }
     ]
   },
   "assets": {
     "manifest.json": {
       "bytes": 331,
-      "sha256": "031a0cd793b675632c705d30c6ccb039acc131b12459a270f1822cd38184a93d"
+      "sha256": "bce74414cb25e3b3181a3ee8d8c660fddc91dd022a60125cd4d428b35e4428f9"
     },
     "main.js": {
-      "bytes": 669294,
-      "sha256": "8468f3715d6557f364241d75e09c912accfb67d136d72418090f9875065bf5f9"
+      "bytes": 669551,
+      "sha256": "ac3d8fe915d55e27265a3f91bbcd4e34bb4ff6c843e3fe28e7ef0702ad618218"
     },
     "styles.css": {
       "bytes": 1654,
@@ -291,9 +291,9 @@
       "bytes": 4702,
       "sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
     },
-    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.185.zip": {
-      "bytes": 163398,
-      "sha256": "68d1a46e44d20f18f18627db16c854c711cb4063f5d238f7fefcb64ed71f410a"
+    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.186.zip": {
+      "bytes": 164341,
+      "sha256": "cf003bcd443bb98e8505e5b1ac86c798dee1fc16d698461d2361f6b33895ed0a"
     }
   }
 }
