@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.180",
-  "recorded_at": "2026-10-07T15:43:22.452Z",
+  "candidate": "0.11.35-prodtest1.0.183",
+  "recorded_at": "2026-10-08T01:00:41.668Z",
   "source": {
-    "base_head": "3b3d63dc613edc144792d3b6e1c3da40df57d09b",
-    "source_commit": "9343f31b6983fa23c7d27c70c2b22c2732857dcb",
-    "working_tree_dirty": true,
-    "source_input_count": 62,
-    "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
-    "source_fingerprint_sha256": "9e059241fcfbe4292884c423537162dc17ac49876a42a1581b09c067656a19bb",
+    "base_head": "d58ca21f3c84b979d7bc0b62e150e2346f170516",
+    "branch": "codex/vault-sync-prodtest-183-empty-source-folders",
+    "working_tree_dirty": false,
+    "source_input_count": 63,
+    "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in inherited esbuild input order",
+    "source_fingerprint_sha256": "47cc2214249ec867c0772df75e985e230e5edf9996fdffcbebb86d622fc08241",
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "inputs": [
       {
@@ -153,7 +153,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-snapshot-pump.ts",
-        "sha256": "79699969fc669d1c2ad09c25d0a4651e64c724d443db33ceda98d7c17f3979f6"
+        "sha256": "4068adf18f5f37eb3f7c55d4d1285f0a45252a4d3a8e6fab6f98c90c7c630796"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-inbox-pump.ts",
@@ -180,12 +180,16 @@
         "sha256": "1f1fe7c35d94a6fd8149499809691c5755e7df12df038b1337707b86f962fb59"
       },
       {
+        "path": "apps/obsidian-plugin/src/vault-sync-empty-source-folders.ts",
+        "sha256": "75cbd438fcd3ba38008269d0644341d8a10e9d57feb25038b1aee8128a194b67"
+      },
+      {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-apply.ts",
-        "sha256": "bb802915eff35f6603a301b227a1cb25a1a54f39e08c28b4ddd441a6e9b57086"
+        "sha256": "963a9c2da9f49a01890c47bd25456fb73b28daaf54f125503a0fdd1f2d2c954c"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-pull.ts",
-        "sha256": "2262e84e87c78e9ef9d20319ce4ee75f06dd5a495811ac9bf51c63ccded7083d"
+        "sha256": "49a229cbf9a962fecf05beab5217537bd399d80813af0a4ccb9a124c21834fe2"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-transfer-queue.ts",
@@ -257,23 +261,18 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "7bf79578779c3634e631c47ca42c633835651ca515e1d2168da6ea1099332744"
+        "sha256": "a30af7fc38788278d700bb0e0901ad0a44a45ea8bf34bbac66ee50aec8271b0b"
       }
-    ],
-    "regression_tests": {
-      "apps/obsidian-plugin/test/vault-sync-v2-apply.test.ts": "bbabc7611aaa99e0fdf69fa5559035270ae93ea5591c3be4414f9b8bb01fce0c",
-      "apps/obsidian-plugin/test/vault-sync-remote-rename-event-guard.test.ts": "b9b02503f61cfa66c22e36bd312a60859cee97a748c22b6499559da0eace3f93"
-    },
-    "tracked_bundle_inputs_match_commit": true
+    ]
   },
   "assets": {
     "manifest.json": {
       "bytes": 331,
-      "sha256": "ceb6b31aa16b2046dda1150ca0cfb82c7b28870b8484863e54abc4689abac1f8"
+      "sha256": "1359f12fea2d28b283503d2bc9a611e18536e5a286689bd1b23545fc53f5dd53"
     },
     "main.js": {
-      "bytes": 664109,
-      "sha256": "9bdd12c4d5e49fe1351b643be6b1298d910cca18da8d7dde842df0e54882c219"
+      "bytes": 667973,
+      "sha256": "5e81407501b690d172fee61a3aaa7aedec73b1123257f1a6d9014545602fb1ea"
     },
     "styles.css": {
       "bytes": 1654,
@@ -283,19 +282,9 @@
       "bytes": 4702,
       "sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
     },
-    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.180.zip": {
-      "bytes": 162112,
-      "sha256": "1a54c581273b7c7a3998c1c4e197f64ebe2b14321060fd2aaf9c08d00813549a"
-    }
-  },
-  "build": {
-    "command": "OBSIDIAN_API_BASE_URL=https://api.wetongbu.com OBSIDIAN_OUTPUT=<candidate>/main.js npm run plugin:build",
-    "independently_rebuilt_main_js_byte_identical": true,
-    "api_base_url": "https://api.wetongbu.com",
-    "dependency_versions": {
-      "esbuild": "0.28.1",
-      "fflate": "0.8.3",
-      "nodeDiff3": "3.2.1"
+    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.183.zip": {
+      "bytes": 163877,
+      "sha256": "7f7b241f19d8798061e745c96819a6a97737743b284086501a1df1c51ad7c24d"
     }
   }
 }
