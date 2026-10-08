@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.197",
-  "recorded_at": "2026-10-08T19:31:08.785Z",
+  "candidate": "0.11.35-prodtest1.0.198",
+  "recorded_at": "2026-10-08T20:11:33.138Z",
   "api_base_url": "https://api.wetongbu.com",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
@@ -12,7 +12,7 @@
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 68,
-    "source_fingerprint_sha256": "6b5bdc0ebf0a529eda2c32869c553a7fda939eb1095bfaa31b376db48aecdbf5",
+    "source_fingerprint_sha256": "2c4e7a7df5a8b474f2a562b475454b2e14304068aae5116c2722ed086a584a17",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -289,7 +289,7 @@
     ]
   },
   "assets": {
-    "manifest_sha256": "5e7141ce1a32ddb0d18d114df3874db86ec454bcf8702e49b82d323f7eebf997",
+    "manifest_sha256": "05bd6c5eb04d75cbd08aa7ef6d5728ecc63212f9320fd17f0b4ce2cfd91808ce",
     "main_js_sha256": "209abb73c5d392e4c911d10d525a974c3de0b2d2efef2c8b8f2027cd3f6fd074",
     "main_js_bytes": 687638,
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
