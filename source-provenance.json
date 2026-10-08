@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.186",
-  "recorded_at": "2026-10-08T06:09:54.885Z",
+  "candidate": "0.11.35-prodtest1.0.187",
+  "recorded_at": "2026-10-08T06:20:47.122Z",
   "api_base_url": "https://api.wetongbu.com",
   "source": {
-    "base_head": "08dd6ba6fd6c9e991ac2ee9f4a22a71a75112720",
+    "base_head": "28a62cc6300903e59b7f4871faad7ffb8c4a5a55",
     "branch": "codex/vault-sync-deletion-notice-185",
     "working_tree_dirty": false,
-    "source_input_count": 65,
+    "source_input_count": 66,
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
-    "source_fingerprint_sha256": "576c467e438b3b52ea729d58a73c215b51db76040fc78bafdb37f9fa42ba581d",
+    "source_fingerprint_sha256": "64171225298fe0dc0e97de3d9a8d0090e5b2e66f74d22ccb6ac64ff8da60a9eb",
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "inputs": [
       {
@@ -205,6 +205,10 @@
         "sha256": "a038dd868aebe538d135ae5ed3ddd2b8bb8012eb7aa5b2752e9e068552a2e571"
       },
       {
+        "path": "apps/obsidian-plugin/src/vault-sync-v2-push-outcome.ts",
+        "sha256": "17f4cadee00548005168e4001ba8c876003761da5ddfcdc43e7ff749fafb80e0"
+      },
+      {
         "path": "apps/obsidian-plugin/src/vault-sync-remote-rename-event-guard.ts",
         "sha256": "8bd676e018257c28f35621d96b47f91bb242d4cd40582f345720447fb653029b"
       },
@@ -270,18 +274,18 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "9a29576d13a06206ce14c5d409b9353a826b015575546f35d45636fe78063bd8"
+        "sha256": "3736e799d4a812bd266ce4740a55e7f7689fe3efb92c9bf6c2ac66cf6d65a1d7"
       }
     ]
   },
   "assets": {
     "manifest.json": {
       "bytes": 331,
-      "sha256": "bce74414cb25e3b3181a3ee8d8c660fddc91dd022a60125cd4d428b35e4428f9"
+      "sha256": "595914757acbda0e1a4805c9d109ba84686a0ef782c78e09db1381e627f3d9e8"
     },
     "main.js": {
-      "bytes": 669551,
-      "sha256": "ac3d8fe915d55e27265a3f91bbcd4e34bb4ff6c843e3fe28e7ef0702ad618218"
+      "bytes": 669606,
+      "sha256": "63b47f4903f93dad3a4f851dd98fa7527dfc87443d73470ce00351eeda8c7968"
     },
     "styles.css": {
       "bytes": 1654,
@@ -291,9 +295,9 @@
       "bytes": 4702,
       "sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
     },
-    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.186.zip": {
-      "bytes": 164341,
-      "sha256": "cf003bcd443bb98e8505e5b1ac86c798dee1fc16d698461d2361f6b33895ed0a"
+    "wetongbu-obsidian-plugin-0.11.35-prodtest1.0.187.zip": {
+      "bytes": 164353,
+      "sha256": "1085e3b8f923535b952a19572f987fa2490408a7138817c078a4156aa5ba4617"
     }
   }
 }
