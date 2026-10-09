@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.201",
-  "recorded_at": "2026-10-08T22:22:18.519Z",
+  "candidate": "0.11.35-prodtest1.0.202",
+  "recorded_at": "2026-10-09T00:40:26.475Z",
   "api_base_url": "https://api.wetongbu.com",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
@@ -12,7 +12,7 @@
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 68,
-    "source_fingerprint_sha256": "059ad62aa993af906536fc569b11cd7420cb75d766a65c001a320e912849a1ef",
+    "source_fingerprint_sha256": "dee82949db775fc7ad38ca00ba9382d7737d99d4e2e80bd0766eb773cd64dff5",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -228,7 +228,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-events.ts",
-        "sha256": "964669423d461e75e9a54df05276a3ae5070aac55dec4a0b5a9e77ca93e6fa53"
+        "sha256": "0ce384c24321c4e2fb373447f4b51c4a8a0f992c17ddc58df01ee1d6ab46925e"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-conflict-merge.ts",
@@ -289,9 +289,12 @@
     ]
   },
   "assets": {
-    "manifest_sha256": "b237c25e944ee41d1588a8675ee4e0d68831a39621b9625b4e38e4598122e13e",
-    "main_js_sha256": "b03da229aceeaaa58d9d1c3bf192838be09810c8939d4f4ee6faae278b888f44",
+    "manifest_sha256": "1bfbaf61dfd8a840eed92a4dc93e9d344ee04f1103f63dd2483841c3a24b5412",
+    "main_js_sha256": "f1a04df2f8bbe092c4a860c7e0a57b028118872f55418a66c10edf39698fdd16",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
-    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
+    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
+    "main_js_bytes": 695433,
+    "zip_sha256": "78d57f402900cd79b970c42754560229152e503944b4ce9768e768ba51f88414",
+    "zip_bytes": 169222
   }
 }
