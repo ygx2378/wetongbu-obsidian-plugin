@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.207",
-  "recorded_at": "2026-10-09T08:12:58.290Z",
+  "candidate": "0.11.35-prodtest1.0.208",
+  "recorded_at": "2026-10-09T08:39:47.155Z",
   "api_base_url": "https://api.wetongbu.com",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
@@ -12,7 +12,7 @@
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 68,
-    "source_fingerprint_sha256": "fab74e91aacc750f954767a3e95c669318fd58d1d8f943dac615ceea12bb6cc3",
+    "source_fingerprint_sha256": "007f16bd86e7b21ac28f795a031bfc0be517aa54abf944b56d93ef65d13ca9bb",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -56,7 +56,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-local.ts",
-        "sha256": "8db1295f271bba2c0c93cce038d00c3fbfa27698f79cbf5099ee2e8886ffe887"
+        "sha256": "7b6ce36bbd44335527a89c70606b81936a020d4147d1b1898dca137f5b5431b2"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-index.ts",
@@ -284,14 +284,14 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "9f69e99881f22a9de43e481e58fbcc11027acbf5df033c4e5cbe04ae9f05d0ee"
+        "sha256": "641b288e42344bdc01a9e374ff5d06e30b12b3aff4ee1f3343bc1933b9c70338"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "6390cb1a5644151a2cb10cce987416dd488a9c6cf96ed723535ac0f2753c7e95",
-    "main_js_sha256": "b89f68e68f8a3905dd261a189652ad2b0d108a1f00f95764a11c17e8e6e7d977",
-    "main_js_bytes": 700208,
+    "manifest_sha256": "2a0fede0f379edf371b55d439e3eb68ac5fd54dd849c99c2fb8a51744d8218ff",
+    "main_js_sha256": "ca56b3e248965d83115da5e53f6b79d7b225312fff096ebb88af81b72ddc50ce",
+    "main_js_bytes": 701135,
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
   }
