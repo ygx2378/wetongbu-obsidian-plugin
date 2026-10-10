@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.221",
+  "candidate": "0.11.35-prodtest1.0.222",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 70,
-    "source_fingerprint_sha256": "2a537f8d8f9b9f755d82644ddefa34da2ee3d89cc9d81edec35591f963908e45",
+    "source_fingerprint_sha256": "2ee77af60a82a95ce01b9ec78bf282b48b89f5c4b215871cec729ba49e3c4fae",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -251,7 +251,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-diagnostics.ts",
-        "sha256": "a5f0b3cb6c19578aa3ce47e523f60eda577af26d31b3ecee3fde1e62ac7d0041"
+        "sha256": "faa1429f68ca6a0fe1b832556e5c29078eeacd324f2b8139de1ba119a52f6175"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-path-intents.ts",
@@ -291,15 +291,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "28c0157f303382a2fcc595730f83ed25bf875c10f99353618896612eb66bf514"
+        "sha256": "63b3daed9397011d26d9be6be1c647043460ad1674e31801fe0e62652d490fcc"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "28cf97427ef0362bac67f1318dd60ba8a87253dbb7a430f10af5cf8b169cbc34",
-    "main_js_sha256": "fca1fc32626c905147b572a61b20c8267e60383c84bd0ac655e04f60abd58253",
+    "manifest_sha256": "6067f56ec026e902c2035a8631b7f79ab5247c405164b5516d7454c6072eed6c",
+    "main_js_sha256": "d187f4b8d3df1e83ddb69aa7062bd9a02c0a2af6bbc0bd12f274f293a4c113fe",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 717696
+    "main_js_bytes": 717707
   }
 }
