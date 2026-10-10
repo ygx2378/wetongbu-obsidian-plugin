@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.219",
+  "candidate": "0.11.35-prodtest1.0.220",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 70,
-    "source_fingerprint_sha256": "f3d22401be30463cd458bfd959dd86cef4c1652f2b6d59bce27c2b82759c6c3f",
+    "source_fingerprint_sha256": "e56f791d29ae936abdfc514d3093a9fd00056d3dffe8a6abf3ddf3328ae1379d",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -291,15 +291,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "da83ca7e04aeb6426668261c4f29da3cfbc2ef6f8f6df0454c83a1c7578c1e1e"
+        "sha256": "747caa20907c0611d6aaa8df9b08b5a7993a783ecc31baf31c337c88cd73090d"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "8f03bebb1819f594b77b843fee9ea50a126ee26ac3361caaec689875c38cb0cc",
-    "main_js_sha256": "93158256c591ef56d126c1d7a6b70e898d40e9f1258b13b30f851bb3f0e57e3c",
+    "manifest_sha256": "7f310d2698ae2b68f59d283f0a5d067a19338bbce80da773577e8d5a4f849e9d",
+    "main_js_sha256": "0e247a41c465592b880d154317941a2f9fd97ce5ef225301eabe09fe584b871e",
+    "main_js_bytes": 714090,
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
-    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 713921
+    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
   }
 }
