@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.232",
+  "candidate": "0.11.35-prodtest1.0.233",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 72,
-    "source_fingerprint_sha256": "89d62f8fd130caab86c5220f0eb8a6fbca1addbc0d05c41e4ceba3d469b4217c",
+    "source_fingerprint_sha256": "0721769f6c3ae5f292b1aa637f62d4e8ad3cd6152bb62d0a5584cfd6f3471ead",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -143,11 +143,11 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-outbox.ts",
-        "sha256": "5f43c0300d52feb07d6862a236dff80945464513f5d3cd390f67929a8c17fd8d"
+        "sha256": "4e8ac401285e1a60e25281a8685dddfc12c49f6a38f50116d8c59ebc2dfb99d3"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-needs-rebase.ts",
-        "sha256": "bb097f0eb56d6ec81f0993249896605dc58e7988648f7185c792547b48075c30"
+        "sha256": "0b010ead9c84893511c10a5e116fd67618f2284c2a59e8fc045194da7c4be96f"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-baseline.ts",
@@ -211,7 +211,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-push.ts",
-        "sha256": "680fedb351b865e02e50d0ee869ecc58dc31da08913f00ede28dcee00e11aa8c"
+        "sha256": "ec2ad8dfaf53550171813697c9a2f2c49d41a89ae60c93e19beaf9a11b46b213"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-remote-rename-event-guard.ts",
@@ -299,14 +299,14 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "5dfd1b782816e37eaecfe789666fc102b6375cd12258f8b5050bbc511ea38695"
+        "sha256": "b6df561081204569ddcdac20063ecdc491f2369d906a78835fda8dd3e5a97b66"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "6ab90950b0eabf2bf48346d9debcafebb0bf4f12dffe7ec2061e82562a067ea3",
-    "main_js_sha256": "faa4f012281409327f0de0e93914c97f77b162448e7d60b5544fcd74a0c479f9",
-    "main_js_bytes": 728246,
+    "manifest_sha256": "93fdf33c98943313d083aa5b216887ed546a7e7fcb8bf49cfcdb1ba1a2095fda",
+    "main_js_sha256": "f697d4bfe015b2356789e7b51e2170b030577dd9069320a767b8c0cadcaed0c0",
+    "main_js_bytes": 730871,
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
   }

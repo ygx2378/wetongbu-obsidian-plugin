@@ -1,7 +1,7 @@
 {
   "id": "wetongbu",
   "name": "WeTongbu",
-  "version": "0.11.35-prodtest1.0.232",
+  "version": "0.11.35-prodtest1.0.233",
   "minAppVersion": "1.11.4",
   "description": "Receive clipped web pages, Feishu documents, WeChat articles, and AI conversations as local Markdown notes.",
   "author": "WeTongbu",
