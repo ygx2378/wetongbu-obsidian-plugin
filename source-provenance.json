@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.226",
+  "candidate": "0.11.35-prodtest1.0.227",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 71,
-    "source_fingerprint_sha256": "5c645d00c349a4846c0addf2f0c4c929a07e36648402f6a304c921d8ec845b8a",
+    "source_fingerprint_sha256": "64b0ea6cdcdcf13e4cf0a419c725835158e3863da9cd3927fd82eeea12e38df5",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -243,7 +243,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-conflict-hint.ts",
-        "sha256": "8c2fdd0911df2a9305f51ce7ad11e461bc7b0c6b8359774380d0c5e9913fac59"
+        "sha256": "99ee5586e1ffb17bf9fe471038854843c26cb17023ddac36d670106ef83283ee"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-key-rotation.ts",
@@ -295,15 +295,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "2fa70e3aa7b69523d9445895e3d66c645fb6f1b9c3452af35c1ce45cc933769f"
+        "sha256": "d8508fa293f0aa777bd3a87ad93e4b8a0e49b5328000d3591854f16154b0b6c7"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "8026abcc988019f9d103cd8803386031995cfc30377821810937629d77642d85",
-    "main_js_sha256": "9b268db553565b57858ecea49b30b05e103e500f16ceed40e1fb542cd3937f40",
+    "manifest_sha256": "854c4667383d6756120d2781653fafb1c3eea3929bac592b04ada4485b6c5efe",
+    "main_js_sha256": "3360ed9624b9a5e9582177e3a195dfedea893f6e935a20a5394d2a0202cb29b0",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 719249
+    "main_js_bytes": 720507
   }
 }
