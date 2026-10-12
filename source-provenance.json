@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.239",
+  "candidate": "0.11.35-prodtest1.0.240",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 72,
-    "source_fingerprint_sha256": "6ff8650f0522afddd6bfa43a7cfea0c7c865f62876e4047a1e04420f8dc969e5",
+    "source_fingerprint_sha256": "f82b91a355efa982cb61786c0ea44960e63cee3a8d8f38c6cda5d6094121256d",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -119,7 +119,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-deletion-notice.ts",
-        "sha256": "25776e1d8df68d626b2f55dce22620378fe939d405540313efdd75027ab364b7"
+        "sha256": "2a0d16879ce00857af8ad901169e516e06a774f5417a5e75f2b1f27729a9059d"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-scheduler.ts",
@@ -304,9 +304,9 @@
     ]
   },
   "assets": {
-    "manifest_sha256": "1e34951bb78abfb6d5f3ad30e98725043fea0f131761310a30484e3b09a60adf",
-    "main_js_sha256": "f94e78813b8a914e383df2e8e6a9cb4be85c4564040a4aade787e309f99acc70",
-    "main_js_bytes": 733019,
+    "manifest_sha256": "4d94bc3fde751c412ac7c7bf401e5adeae59992b155fd109454d0d1c94a44efc",
+    "main_js_sha256": "d1c5cf6e32dbc135e3a9bc8cec6589a4997478a359d4981c203cfc3076bd6db3",
+    "main_js_bytes": 733020,
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
   }
