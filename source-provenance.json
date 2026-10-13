@@ -1,18 +1,17 @@
 {
   "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.197",
-  "recorded_at": "2026-10-08T19:31:08.785Z",
-  "api_base_url": "https://api.wetongbu.com",
+  "candidate": "0.11.35-prodtest1.0.243",
   "source": {
     "base_head": "a5dc776fa2372ba24e962eea33d2bb58ad4cfae5",
     "branch": "codex/local-clipper-1.0.1",
     "working_tree_dirty": true,
-    "node_version": "v26.8.2",
+    "node_version": "v26.11.0",
     "esbuild_version": "0.28.1",
     "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
+    "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
-    "source_input_count": 68,
-    "source_fingerprint_sha256": "6b5bdc0ebf0a529eda2c32869c553a7fda939eb1095bfaa31b376db48aecdbf5",
+    "source_input_count": 72,
+    "source_fingerprint_sha256": "664d4905a234cda4896325617dd859e8ef575d1cea284b354c288b391ec64cd3",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -44,7 +43,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-remote.ts",
-        "sha256": "55311a760a0bf9a2c92e0906679d509ed118fb419b488ac0499a31db35d5057b"
+        "sha256": "d6a14d6296171474f32f08a2e312edf94122448609165ed62cf09de02442169f"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-retry.ts",
@@ -52,15 +51,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-remote.ts",
-        "sha256": "dc67d49f2fed172134d71bd93c75c93f74d3e187ff8a93ba8cfb6a78000c9794"
+        "sha256": "cefb8b5c89de0e1cb3b1f9580fc7159bc382e894a7f97e6e1996d8979d193443"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-local.ts",
-        "sha256": "c99ae7247fd7cebb5a8624d244579cc4d98f8760f8a03f83c6c9410508d9dbd6"
+        "sha256": "f664209779c83fc4e06fdf7c0c0ec60e276f3b3a30334c643cbd487909d8394a"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-index.ts",
-        "sha256": "ad7e83520782ea3df17d8c1f35f4eef1bc5b634b3f98a9795200dff37a045031"
+        "sha256": "e2ff592f31f29f06eaaff58406e636cf2e82213ff69dee6a81c062429478b2cc"
       },
       {
         "path": "apps/obsidian-plugin/src/capture-handoff.ts",
@@ -120,7 +119,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-deletion-notice.ts",
-        "sha256": "2f9ca86fb595c32ac8400dd6ec7b2682e7dec4b8229b38dc8bcc20bde311cb4a"
+        "sha256": "2a0d16879ce00857af8ad901169e516e06a774f5417a5e75f2b1f27729a9059d"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-scheduler.ts",
@@ -139,16 +138,32 @@
         "sha256": "37e8de6d3bcb1bf1791a48480184acd6468638b22ce34a94b033aa68b60044b6"
       },
       {
+        "path": "apps/obsidian-plugin/src/vault-sync-v2-locks.ts",
+        "sha256": "3ac2efc90136bd5c27dd27c10881927b8cbbf11d4d681d5dfee15a9aee79e077"
+      },
+      {
         "path": "apps/obsidian-plugin/src/vault-sync-outbox.ts",
-        "sha256": "31d3eba9fcf26c41ae988e2fabbdaa0bc794476b56cc9f0d3be54fc95ab6a568"
+        "sha256": "4e8ac401285e1a60e25281a8685dddfc12c49f6a38f50116d8c59ebc2dfb99d3"
+      },
+      {
+        "path": "apps/obsidian-plugin/src/vault-sync-needs-rebase.ts",
+        "sha256": "0b010ead9c84893511c10a5e116fd67618f2284c2a59e8fc045194da7c4be96f"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-baseline.ts",
-        "sha256": "deb3370fa811df579d6d3380058fb254be5df58906a455caef939d1625d96f0b"
+        "sha256": "ef6f8ae22a67b7932288aa559e993b7fbab3b946fa17b67311ed4d9203a7ecd1"
+      },
+      {
+        "path": "apps/obsidian-plugin/src/vault-sync-object-work-gate.ts",
+        "sha256": "7ee916a73fd275717be75b0593c34a878cee322de7c2bae6ea56e2d7557ec987"
+      },
+      {
+        "path": "apps/obsidian-plugin/src/vault-sync-history.ts",
+        "sha256": "b06db9346b89ed2eb201ca4a10a8fb4cf9b1d509dc80cda43588e54df7308837"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-base-content.ts",
-        "sha256": "443653dd7a01f1f38d82683880f8075cf871098035f21c78c8da16b0b395fbc1"
+        "sha256": "3301c4a49c99637cb24a6dfefb3b02c323b820a399016419def1116c231b1090"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-legacy-migration.ts",
@@ -156,7 +171,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-snapshot-store.ts",
-        "sha256": "db1b6790e8cd429d9451a4aabcbdfdfaf1c1534591300783c25c86800b43b11f"
+        "sha256": "f811c39b37caa70aa170324e40d9a2d4aa3fc710e316f7be91c7948ae542fbfa"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-snapshot-apply-lease.ts",
@@ -164,11 +179,11 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-snapshot-pump.ts",
-        "sha256": "3c6534c8b6ecf5323adf7d7b7ebc433553f3f13be65d91ecdc722439a7f39f9f"
+        "sha256": "8b6180046bef439409ef1080963860823e74d82ecdb3abec665af02c54613fc3"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-inbox-pump.ts",
-        "sha256": "17ebabdfad84ff83a0660a9a52ada483c3466b7740a80ee9372ee03aaa17b2d7"
+        "sha256": "c9e54999060bd418a815e5d515f0ee39ab3ab1f769247c6d6b5326098e4751de"
       },
       {
         "path": "node_modules/node-diff3/dist/diff3.mjs",
@@ -179,32 +194,24 @@
         "sha256": "06b37a7dae8b44b535ad7b30fc114c0a85eaa2b23580a06eba391396eca1fcb6"
       },
       {
-        "path": "apps/obsidian-plugin/src/vault-sync-object-work-gate.ts",
-        "sha256": "7ee916a73fd275717be75b0593c34a878cee322de7c2bae6ea56e2d7557ec987"
-      },
-      {
-        "path": "apps/obsidian-plugin/src/vault-sync-history.ts",
-        "sha256": "81f569459274755c17c114211b220509880f35e9c516f567252cd2da1a76dea2"
-      },
-      {
         "path": "apps/obsidian-plugin/src/vault-sync-empty-source-folders.ts",
         "sha256": "75cbd438fcd3ba38008269d0644341d8a10e9d57feb25038b1aee8128a194b67"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-apply.ts",
-        "sha256": "e506cd7cb5a67ef2c255b9ef734719f80c0cacc4caca3a850519a7f75dd9641d"
+        "sha256": "3251a50253d797c21a7ed2090c6dc0aca844a882274dc166b83af7fe1e99bb1b"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-pull.ts",
-        "sha256": "3e5e43db103d25121aae09cd5aeea888377409e09e983a7cdf231746fee4d4c4"
+        "sha256": "d4d76de33514c5870b59ff1ce43fc87088a9e480e639229cf126293da3c3047a"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-transfer-queue.ts",
-        "sha256": "ed373c47698b0ed6209687f444cbc75161bdc1eb8d77b53c29271d227946744d"
+        "sha256": "f0bd34293cbd684fcfec4f39cbc70294a4e565ad7cbf53be9e48f642adcb03d5"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-push.ts",
-        "sha256": "d71b703f4de36cbc1979fdf40467933d167183da3ab3ac482b65d03452d7f02e"
+        "sha256": "17df90c1f84c25dd6bf3ad348d4188f83004739fb9e4ffd6f5baaebc25418187"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-remote-rename-event-guard.ts",
@@ -216,7 +223,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-download-stage.ts",
-        "sha256": "42451d9235077267496c76f4d4477113dddb1016decdd2f324173c5687fefef5"
+        "sha256": "065512eb9421c6672c078b6ba451892bdafcd71c1a771e3105755bdeba10ef64"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-storage.ts",
@@ -224,11 +231,11 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-plaintext-stage.ts",
-        "sha256": "4a93784cb0acd352d28c36a4b68d004f1b2d96f3c481f77eb95e97893e938e4f"
+        "sha256": "0ac02119f72ed2c08e36630a66a9e0b4d5dc4bef8f6d28bc8d69cb934fe9fa11"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-events.ts",
-        "sha256": "964669423d461e75e9a54df05276a3ae5070aac55dec4a0b5a9e77ca93e6fa53"
+        "sha256": "71878e11f50326e995fa3713df33afb6b14e7a1f12f8995257e23b6e37362f4c"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-conflict-merge.ts",
@@ -237,6 +244,10 @@
       {
         "path": "apps/obsidian-plugin/src/vault-sync-conflict-actions.ts",
         "sha256": "1c526596d353748a69e6305e45a140fcbddad6f87648819700d48bb075956d7f"
+      },
+      {
+        "path": "apps/obsidian-plugin/src/vault-sync-conflict-hint.ts",
+        "sha256": "99ee5586e1ffb17bf9fe471038854843c26cb17023ddac36d670106ef83283ee"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-key-rotation.ts",
@@ -248,11 +259,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-diagnostics.ts",
-        "sha256": "8d33a74d4395f5726f75e9c744121e0f36c298020adad47f38f5655af53a48a7"
+        "sha256": "faa1429f68ca6a0fe1b832556e5c29078eeacd324f2b8139de1ba119a52f6175"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-path-intents.ts",
         "sha256": "53b2613da64e0d0e5dda2e30416e40ba6a23a28fa9d350292fd6238c679de587"
+      },
+      {
+        "path": "apps/obsidian-plugin/src/vault-sync-path-events.ts",
+        "sha256": "96918ad08163b3d53b2cb4ae3b2e8089c87e1a15c5955165376dc219797f4a1a"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-ordered-queue.ts",
@@ -284,15 +299,15 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "2fa16d67142eb88c27e87fbec25c835f73031f699a1eeeab467c361e6aebe82c"
+        "sha256": "9b782f7ef92cbcc5f8e6155ff85f3f532a4880cc0cd786d68e2429c82d9d0af7"
       }
     ]
   },
   "assets": {
-    "manifest_sha256": "5e7141ce1a32ddb0d18d114df3874db86ec454bcf8702e49b82d323f7eebf997",
-    "main_js_sha256": "209abb73c5d392e4c911d10d525a974c3de0b2d2efef2c8b8f2027cd3f6fd074",
-    "main_js_bytes": 687638,
+    "manifest_sha256": "24bc41fdc5e305deeddd038415f3282d32bcf7fa6b3fe9854e58c3422f067eaa",
+    "main_js_sha256": "528e6976d5b348a3c4d0cea2afdfdf33844cd026c80bce2fae2536a1c00098e5",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
-    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd"
+    "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
+    "main_js_bytes": 736113
   }
 }
