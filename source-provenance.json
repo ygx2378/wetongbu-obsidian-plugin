@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "candidate": "0.11.35-prodtest1.0.248",
+  "schema_version": 2,
+  "candidate": "0.11.35-prodtest1.0.249",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 73,
-    "source_fingerprint_sha256": "8ba349a738c7dc0a60536395691941dfcebfe4d57b6726265a7149c732c9e9be",
+    "source_fingerprint_sha256": "d0fcdcfda5315d8a2046d3ad640b187a2702ee387dd9dd093cb0dde481e227c7",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -211,7 +211,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-push.ts",
-        "sha256": "17df90c1f84c25dd6bf3ad348d4188f83004739fb9e4ffd6f5baaebc25418187"
+        "sha256": "7d86e82a1567aeedeb558a5ec5280bf0feb1111f69451e7c4cc35d229b4f36a1"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-remote-rename-event-guard.ts",
@@ -307,11 +307,29 @@
       }
     ]
   },
+  "build": {
+    "input_count": 2,
+    "fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in provenance build input order",
+    "fingerprint_sha256": "fb86fb936314fd2d28c5bf92a9f4f8870c7b17032e61f0f15ac415f0f176afd2",
+    "inputs": [
+      {
+        "path": "apps/obsidian-plugin/esbuild.config.mjs",
+        "sha256": "6498bed079949a143691d125fb199b26c29158d634841c4c8cba20993f76b876"
+      },
+      {
+        "path": "package-lock.json",
+        "sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704"
+      }
+    ],
+    "main_js_reproduced": true,
+    "main_js_sha256": "637d2f8ca0b970b09d0d9dcea2952892de18ecc5c7d51c19790a1265026d383f",
+    "main_js_bytes": 737234
+  },
   "assets": {
-    "manifest_sha256": "2d950fafdd5c35a95769234025e535e7b0aec9ba83305ad06207727ed2a8094d",
-    "main_js_sha256": "8e974dd79d4e9c0d87ae94d6a9752f3c73f340c4e353b81920b262e14a3f2938",
+    "manifest_sha256": "fb6565b1e78d9369596ed4ec2a9ac9af63d55ee2c3de94644352dabbd72a97c9",
+    "main_js_sha256": "637d2f8ca0b970b09d0d9dcea2952892de18ecc5c7d51c19790a1265026d383f",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 737044
+    "main_js_bytes": 737234
   }
 }
