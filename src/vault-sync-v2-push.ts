@@ -199,6 +199,7 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
     original: VaultSyncOutboxOperation,
     path: string,
     allowWindowRecovery = true,
+    assertReviewContextCurrent?: () => void,
   ): Promise<PushOperationOutcome> {
     let operation = original;
     let receipt: any;
@@ -207,7 +208,7 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
       if (receipt.receiptStatus === "expired") {
         if (allowWindowRecovery) {
           const replacement = await rebindExpiredDelete(operation);
-          return processDeleteOperation(replacement, path, false);
+          return processDeleteOperation(replacement, path, false, assertReviewContextCurrent);
         }
         await options.journal.transition(operation.operationId, "conflict");
         return { status: "conflict", operationId: operation.operationId };
@@ -236,6 +237,7 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
     if (operation.state !== "committing") return { status: "skipped", operationId: operation.operationId };
     try {
       await options.assertInitializationLease?.();
+      assertReviewContextCurrent?.();
       const committed = await commitRemote(operation);
       if (committed.status === "conflict") {
         await options.journal.transition(operation.operationId, "conflict");
@@ -249,6 +251,10 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
         },
       };
     } catch (error: any) {
+      if (error?.code === "delete_review_stale") {
+        await options.journal.transition(operation.operationId, "needs_rebase", "delete_review_context_changed");
+        return { status: "needs_rebase", operationId: operation.operationId };
+      }
       if (["operation_window_expired", "operation_window_exhausted"].includes(error?.code)) {
         const recovered: any = await options.remote.getOperationReceipt(operation.operationId);
         if (recovered?.status === "committed") {
@@ -1742,11 +1748,22 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
       }));
   }
 
-  async function commitReviewedDeletion(input: VaultSyncV2PendingDeletion): Promise<PushOperationOutcome> {
-    return withVaultSyncV2FileOperationLock(options.identity, input.fileId, () => commitReviewedDeletionLocked(input));
+  async function commitReviewedDeletion(
+    input: VaultSyncV2PendingDeletion,
+    assertReviewContextCurrent?: () => void,
+  ): Promise<PushOperationOutcome> {
+    return withVaultSyncV2FileOperationLock(options.identity, input.fileId, () => {
+      // This callback may have waited behind active same-file work. Recheck
+      // only after acquiring the lock, before reading or creating durable work.
+      assertReviewContextCurrent?.();
+      return commitReviewedDeletionLocked(input, assertReviewContextCurrent);
+    });
   }
 
-  async function commitReviewedDeletionLocked(input: VaultSyncV2PendingDeletion): Promise<PushOperationOutcome> {
+  async function commitReviewedDeletionLocked(
+    input: VaultSyncV2PendingDeletion,
+    assertReviewContextCurrent?: () => void,
+  ): Promise<PushOperationOutcome> {
     const baseline = await options.baseline.get(input.fileId);
     if (!baseline || baseline.isDeleted || baseline.path !== input.path
       || baseline.fileVersionId !== input.expectedVersionId || baseline.plaintextHash !== input.plaintextHash
@@ -1768,10 +1785,12 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
     if (existing?.state === "conflict") return { status: "conflict", operationId: existing.operationId };
     if (existing?.state === "needs_rebase") return { status: "needs_rebase", operationId: existing.operationId };
     if (!operation) {
+      assertReviewContextCurrent?.();
       const window = await options.remote.createOperationWindow();
       if (window.protocolEpoch !== options.identity.protocolEpoch || Date.parse(window.expiresAt) <= now().getTime()) {
         throw fail("operation_window_expired", "远端写入窗口不可用");
       }
+      assertReviewContextCurrent?.();
       const operationId = globalThis.crypto.randomUUID();
       const request: VaultSyncV2Request = {
         protocolVersion: 2, protocolEpoch: options.identity.protocolEpoch,
@@ -1784,7 +1803,10 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
         localContentHash: input.plaintextHash, localByteSize: input.byteSize, localGeneration: 0, request,
       });
     }
-    const outcome = await processOperation(operation, input.path, undefined, undefined, true, true, true);
+    const outcome = operation.request.operation.type === "delete"
+      ? await withVaultPathWriteLocks([input.path], () => processDeleteOperation(operation!, input.path, true,
+        assertReviewContextCurrent))
+      : await processOperation(operation, input.path, undefined, undefined, true, true, true);
     if (outcome.status !== "committed" || !outcome.baseline) return outcome;
     await options.baseline.setMany([outcome.baseline]);
     await options.journal.transition(outcome.operationId, "confirmed");

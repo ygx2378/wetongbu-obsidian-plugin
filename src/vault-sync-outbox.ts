@@ -39,6 +39,7 @@ export type VaultSyncNeedsRebaseReason =
   | "prepared_content_mismatch"
   | "operation_path_unavailable"
   | "operation_recovery_unresolved"
+  | "delete_review_context_changed"
   | "snapshot_rebuilt"
   | "unknown";
 
@@ -333,7 +334,8 @@ function validOperation(value: unknown, identity: VaultSyncV2Identity): value is
   if (!baseValid) return false;
   if ("needsRebaseReason" in value && (value.state !== "needs_rebase"
     || !["local_file_missing", "local_content_mismatch", "baseline_unavailable", "operation_receipt_expired",
-      "prepared_content_mismatch", "operation_path_unavailable", "operation_recovery_unresolved", "snapshot_rebuilt", "unknown"]
+      "prepared_content_mismatch", "operation_path_unavailable", "operation_recovery_unresolved",
+      "delete_review_context_changed", "snapshot_rebuilt", "unknown"]
       .includes(String(value.needsRebaseReason)))) return false;
   const request = value.request as VaultSyncV2Request;
   if ("createResolution" in value) {
@@ -724,7 +726,8 @@ export function createVaultSyncOutboxStore(app: App, rawIdentity: VaultSyncV2Ide
       return runExclusive(async () => {
         if ((state === "needs_rebase" && needsRebaseReason !== undefined
           && !["local_file_missing", "local_content_mismatch", "baseline_unavailable", "operation_receipt_expired",
-            "prepared_content_mismatch", "operation_path_unavailable", "operation_recovery_unresolved", "snapshot_rebuilt", "unknown"]
+            "prepared_content_mismatch", "operation_path_unavailable", "operation_recovery_unresolved",
+            "delete_review_context_changed", "snapshot_rebuilt", "unknown"]
             .includes(needsRebaseReason)) || (state !== "needs_rebase" && needsRebaseReason !== undefined)) {
           throw fail("outbox_rebase_reason_invalid", "需重基原因只能使用已知类别并绑定 needs_rebase 状态");
         }

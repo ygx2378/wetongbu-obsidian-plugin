@@ -29,7 +29,7 @@ import { unzipWebclipArchive } from "./webclip-zip";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
 import {
-  commitPendingDeletionReviewIfCurrent,
+  assertPendingDeletionReviewContextCurrent,
   DeletionReviewConfirmationLane,
   localDeletionReminderSuppressionKey,
   nextDeletionReviewNotice,
@@ -3143,25 +3143,22 @@ export default class WeTongbuPlugin extends Plugin {
           };
           this.pendingV2DeletionHandler = async (item) => {
             const laneKey = `${identity.targetId}:${item.fileId}`;
+            const assertReviewContextCurrent = () => {
+              const currentScope = this.settings.vaultSyncScope === "root_folder"
+                ? "root_folder" : "whole_vault";
+              assertPendingDeletionReviewContextCurrent(reviewContext, {
+                targetKey: this.currentVaultSyncProtocolTargetKey(),
+                scope: currentScope,
+                rootFolder: currentScope === "root_folder"
+                  ? normalizeVaultPath(this.settings.rootFolder) ?? "" : "",
+                vaultSyncEnabled: this.settings.vaultSyncEnabled,
+                accountLoggedIn: this.accountLoggedIn,
+                lifecycleActive: this.vaultSyncLifecycleActive,
+              });
+            };
             const outcome = await this.deletionReviewConfirmationLane.run(
               laneKey,
-              () => commitPendingDeletionReviewIfCurrent(
-                reviewContext,
-                (() => {
-                  const currentScope = this.settings.vaultSyncScope === "root_folder"
-                    ? "root_folder" : "whole_vault";
-                  return {
-                    targetKey: this.currentVaultSyncProtocolTargetKey(),
-                    scope: currentScope,
-                    rootFolder: currentScope === "root_folder"
-                      ? normalizeVaultPath(this.settings.rootFolder) ?? "" : "",
-                    vaultSyncEnabled: this.settings.vaultSyncEnabled,
-                    accountLoggedIn: this.accountLoggedIn,
-                    lifecycleActive: this.vaultSyncLifecycleActive,
-                  };
-                })(),
-                () => push.commitReviewedDeletion(item),
-              ),
+              () => push.commitReviewedDeletion(item, assertReviewContextCurrent),
             );
             if (outcome.status === "committed") {
               new Notice(outcome.supersededOperationCount

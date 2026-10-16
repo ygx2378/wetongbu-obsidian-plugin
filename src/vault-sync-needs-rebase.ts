@@ -25,6 +25,7 @@ const REASON_LABELS: Record<VaultSyncNeedsRebaseReason, string> = {
   prepared_content_mismatch: "准备上传的内容校验不一致",
   operation_path_unavailable: "无法从本机基线定位文件",
   operation_recovery_unresolved: "恢复后仍需核对云端提交结果",
+  delete_review_context_changed: "确认期间账号、同步目标或范围已变化；需重新检查删除",
   snapshot_rebuilt: "重建同步快照时保留的旧请求",
   unknown: "原因未记录（旧版本或未分类记录）",
 };
