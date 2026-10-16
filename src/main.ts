@@ -43,6 +43,7 @@ import {
 } from "./vault-sync-deletion-notice";
 import { createVaultSyncRetryScheduler, getVaultSyncFailureNotice, isRetryableVaultSyncError, isVaultSyncActiveEditorBusyError, shouldScheduleVaultSyncFailureRetry } from "./vault-sync-retry";
 import { createDebouncedVaultSyncScheduler, createPausableIntervalScheduler } from "./vault-sync-scheduler";
+import { createVaultSyncLifecycleHandlers } from "./vault-sync-lifecycle";
 import {
   assertSafeTextReplacement,
   cleanupTextReplacementArtifacts,
@@ -585,46 +586,28 @@ export default class WeTongbuPlugin extends Plugin {
     void this.refreshAccountStatus();
     void this.refreshCaptureReceiverStatus();
     void this.resumeAccountLogin().catch(() => undefined);
-    this.registerDomEvent(window, "focus", () => {
-      void this.resumeAccountLogin().catch(() => undefined);
-      if (typeof document === "undefined" || !document.hidden) this.vaultSyncRetry?.wake();
-      this.requestAutomaticVaultSync();
+    const vaultSyncLifecycle = createVaultSyncLifecycleHandlers({
+      isOnline: () => typeof navigator === "undefined" || navigator.onLine,
+      isHidden: () => typeof document !== "undefined" && document.hidden,
+      setEventOnline: (online) => this.vaultSyncV2Events?.setOnline(online),
+      setEventForeground: (foreground) => this.vaultSyncV2Events?.setForeground(foreground),
+      eventScheduler: {
+        pause: () => this.vaultSyncEventScheduler?.pause(),
+        resume: () => this.vaultSyncEventScheduler?.resume(),
+      },
+      retryScheduler: {
+        clear: () => this.vaultSyncRetry?.clear(),
+        wake: () => this.vaultSyncRetry?.wake(),
+      },
+      intervalScheduler: { pause: () => this.vaultSyncTimer?.pause() },
+      restartIntervalScheduler: () => this.restartVaultSyncTimer(),
+      resumeAccountLogin: () => { void this.resumeAccountLogin().catch(() => undefined); },
+      requestAutomaticSync: () => this.requestAutomaticVaultSync(),
     });
-    this.registerDomEvent(window, "online", () => {
-      this.vaultSyncV2Events?.setOnline(true);
-      if (typeof document === "undefined" || !document.hidden) {
-        this.vaultSyncEventScheduler?.resume();
-        this.vaultSyncRetry?.wake();
-        this.restartVaultSyncTimer();
-      } else {
-        this.vaultSyncEventScheduler?.pause();
-        this.vaultSyncRetry?.clear();
-        this.vaultSyncTimer?.pause();
-      }
-      this.requestAutomaticVaultSync();
-    });
-    this.registerDomEvent(window, "offline", () => {
-      this.vaultSyncV2Events?.setOnline(false);
-      this.vaultSyncEventScheduler?.pause();
-      this.vaultSyncRetry?.clear();
-      this.vaultSyncTimer?.pause();
-    });
-    this.registerDomEvent(document, "visibilitychange", () => {
-      this.vaultSyncV2Events?.setForeground(!document.hidden);
-      if (document.hidden) {
-        this.vaultSyncEventScheduler?.pause();
-        this.vaultSyncRetry?.clear();
-        this.vaultSyncTimer?.pause();
-        return;
-      }
-      if (typeof navigator === "undefined" || navigator.onLine) {
-        this.vaultSyncEventScheduler?.resume();
-        this.restartVaultSyncTimer();
-      }
-      void this.resumeAccountLogin().catch(() => undefined);
-      this.vaultSyncRetry?.wake();
-      this.requestAutomaticVaultSync();
-    });
+    this.registerDomEvent(window, "focus", vaultSyncLifecycle.focus);
+    this.registerDomEvent(window, "online", vaultSyncLifecycle.online);
+    this.registerDomEvent(window, "offline", vaultSyncLifecycle.offline);
+    this.registerDomEvent(document, "visibilitychange", vaultSyncLifecycle.visibilityChange);
     this.settingTab = new WeTongbuSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
     const pendingDeletionStatusBarItem = this.addStatusBarItem();
