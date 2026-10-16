@@ -19,6 +19,15 @@ export const VAULT_SYNC_SCOPE_ROOT = "root_folder";
 // SHA-256 十六进制（小写），与 hosted_media_objects / feishu-package 一致。
 export const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
+// PostgreSQL BIGINT is signed 64-bit. Wire cursors stay decimal strings so
+// clients never round them through Number, but must still fit that storage
+// range before parsing or sending them back to the server.
+export function isValidVaultSyncInt8Decimal(value, { allowZero = true } = {}) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value) || value.length > 19) return false;
+  if (!allowZero && value === "0") return false;
+  return value.length < 19 || value <= "9223372036854775807";
+}
+
 export const VAULT_FILE_BLOCK_STATUS = Object.freeze({
   ACTIVE: "active",
   DELETING: "deleting",
@@ -26,11 +35,15 @@ export const VAULT_FILE_BLOCK_STATUS = Object.freeze({
 });
 
 /**
- * 规范化 vault 内相对路径：去前导 / 、折叠 ./.. 、转 POSIX 分隔。
- * 返回 null 表示路径非法（越界或命中跳过前缀）。
+ * 规范化 Vault 内相对路径：统一分隔符与 NFC，移除一个前导/尾随斜杠。
+ * 回溯段、越界路径和命中跳过前缀的路径均返回 null。
  */
 export function normalizeVaultPath(rawPath) {
-  if (typeof rawPath !== "string" || rawPath.length === 0 || rawPath.length > 1024) return null;
+  if (typeof rawPath !== "string" || rawPath.length === 0) return null;
+  // JSON Schema maxLength counts Unicode code points; keep the shared runtime
+  // validator on the same boundary instead of JavaScript UTF-16 code units.
+  let codePointLength = 0;
+  for (const _codePoint of rawPath) if (++codePointLength > 1024) return null;
   let p = rawPath.replace(/\\/g, "/").normalize("NFC");
   if (p.startsWith("/")) p = p.slice(1);
   if (p.endsWith("/")) p = p.slice(0, -1);
@@ -40,11 +53,14 @@ export function normalizeVaultPath(rawPath) {
   for (const part of parts) {
     if (part === "" || part === "." || part === "..") return null;
     if (/[\x00-\x1f]/.test(part)) return null;
+    // Windows volume APIs commonly cap a single path component at 255 UTF-16
+    // code units even when long-path support is enabled for the full path.
+    if (part.length > 255) return null;
     // The Vault can be opened on Windows, macOS, iOS, and Android. Reject
-    // names that cannot round-trip on Windows, including reserved device
-    // names and trailing dots/spaces.
+    // names that cannot round-trip on Windows, including reserved DOS device
+    // names (also CONIN$/CONOUT$) and trailing dots/spaces.
     if (/[<>:"|?*]/.test(part) || /[. ]$/.test(part)
-      || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(part)) return null;
+      || /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i.test(part)) return null;
   }
   // 命中跳过前缀（.obsidian/ 等）则不同步。
   for (const skip of VAULT_SYNC_SKIP_PREFIXES) {
@@ -53,10 +69,25 @@ export function normalizeVaultPath(rawPath) {
   return p;
 }
 
-/** A collision key for filesystems that are case-insensitive or NFD-based. */
+/** Persisted path key. Keep its format stable unless an additive backfill migration is added. */
 export function portableVaultPathKey(rawPath) {
   const normalized = normalizeVaultPath(rawPath);
   return normalized ? normalized.normalize("NFC").toLocaleLowerCase("en-US") : null;
+}
+
+/**
+ * Write-time comparison key for portable case-insensitive path aliases. Keep
+ * this separate from the persisted key so comparisons can improve without
+ * rewriting existing rows. Invariant uppercasing coalesces aliases that
+ * lowercase mapping leaves distinct, including Greek final sigma and dotless I.
+ * Full Unicode casing can conservatively merge additional forms; native
+ * Windows/iPad path behavior remains a device acceptance gate.
+ */
+export function portableVaultPathComparisonKey(rawPath) {
+  const normalized = normalizeVaultPath(rawPath);
+  return normalized
+    ? normalized.normalize("NFC").toLocaleUpperCase("en-US").normalize("NFC")
+    : null;
 }
 
 /**
