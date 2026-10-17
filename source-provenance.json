@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "candidate": "0.11.35-prodtest1.0.275",
+  "candidate": "0.11.35-prodtest1.0.276",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 74,
-    "source_fingerprint_sha256": "6d4e9b5d707d36adcf716a7c11e44de661d108fbc9d6e88b90ea3363dd2ddaaf",
+    "source_fingerprint_sha256": "ebd1fea02ed5b873cc55048173b038110b87f07bdcf7b324e38ab2b8efdeb8ad",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -55,11 +55,11 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-local.ts",
-        "sha256": "c6ac9918e8ab3d43342567cb3e8a65d0d5c07e4f781a2551422e5e6664aa8443"
+        "sha256": "eea1041dafed3caecdca639529f4d7aee1a086b3dcc2f15338460639c0bc2208"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-index.ts",
-        "sha256": "e2ff592f31f29f06eaaff58406e636cf2e82213ff69dee6a81c062429478b2cc"
+        "sha256": "7afff77a613a6618d10317f53a32f84f4a204b2ec82a79dbe2f1236fb45a2aa5"
       },
       {
         "path": "apps/obsidian-plugin/src/capture-handoff.ts",
@@ -115,7 +115,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync.ts",
-        "sha256": "59cb0f29c5d929bfe1e9f663d455c56dfe32d5c85bcc483f58681404d15ec79f"
+        "sha256": "7f57b82384555078c89ee1f4f744661b44189ef8a287a8f025b53206b828306c"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-deletion-notice.ts",
@@ -307,7 +307,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/main.ts",
-        "sha256": "da49b42494b7fa8c55aebb5b20f4d3c84f1566add6c77b2cd793e09b2762bb69"
+        "sha256": "708369a09ba3797bd5eca26941a3136c4cc5d35d54c25c999b2757de5d2d3d52"
       }
     ]
   },
@@ -326,14 +326,14 @@
       }
     ],
     "main_js_reproduced": true,
-    "main_js_sha256": "6c62ba634978e9c2b5c14ee4f29f69a1f1932be6d6206d2074ac96b44ef04e6d",
-    "main_js_bytes": 757091
+    "main_js_sha256": "c555358ddd4d9220812c7b8d4052a3771fc5612ac3329a33985f2bf631fa767f",
+    "main_js_bytes": 757440
   },
   "assets": {
-    "manifest_sha256": "d36405f0929d167da92ce1c7aeba5004b29fb0a4e76e75d7ee42206605186cad",
-    "main_js_sha256": "6c62ba634978e9c2b5c14ee4f29f69a1f1932be6d6206d2074ac96b44ef04e6d",
+    "manifest_sha256": "bf9e5f96a6e679f99e44b1b6ab9c842472a43bfc41138f410c34f3e9787e019b",
+    "main_js_sha256": "c555358ddd4d9220812c7b8d4052a3771fc5612ac3329a33985f2bf631fa767f",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 757091
+    "main_js_bytes": 757440
   }
 }
