@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "candidate": "0.11.35-prodtest1.0.270",
+  "candidate": "0.11.35-prodtest1.0.271",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 74,
-    "source_fingerprint_sha256": "c408937aa94cc9df27e60dc66e4e1837323588dd519830302f95473916c871b8",
+    "source_fingerprint_sha256": "449cc24270387b1ac316b5dd1188f2a8ab9c3ea99585c03a0fca1044aeb3b45a",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -203,7 +203,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-apply.ts",
-        "sha256": "ade89b44be05955b4d91828f42c3e17996af6bfb4a72738c661ec6e534251d71"
+        "sha256": "6ce2790b6d47831891cb3eb7312e9e17d4c2355ebe6992956dc40cf55de87c23"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-pull.ts",
@@ -271,7 +271,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-path-intents.ts",
-        "sha256": "53b2613da64e0d0e5dda2e30416e40ba6a23a28fa9d350292fd6238c679de587"
+        "sha256": "06e6b8749346b0984d8d52a1cf2aaa8fe00366a7854af2f3b1e216ed62f25c9b"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-path-events.ts",
@@ -326,14 +326,14 @@
       }
     ],
     "main_js_reproduced": true,
-    "main_js_sha256": "8d16e236647912e0853e1074fb4632013084d570eb197d32287b44db99172c61",
-    "main_js_bytes": 755224
+    "main_js_sha256": "5f39c21f3edbb182b817e75bdb837980aa0359d6b08c408c9db670906c55f607",
+    "main_js_bytes": 755547
   },
   "assets": {
-    "manifest_sha256": "fa0f0ab90da1ad6e15d6f14b03fce536dc1884c301bf60c54e6d752ecd240e0d",
-    "main_js_sha256": "8d16e236647912e0853e1074fb4632013084d570eb197d32287b44db99172c61",
+    "manifest_sha256": "cbb2e09c7ce98bd35dae9d8425d93e4a4a40b0a914ac01741d3d9f0a4dd873c8",
+    "main_js_sha256": "5f39c21f3edbb182b817e75bdb837980aa0359d6b08c408c9db670906c55f607",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 755224
+    "main_js_bytes": 755547
   }
 }
