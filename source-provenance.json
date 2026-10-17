@@ -1,17 +1,17 @@
 {
   "schema_version": 2,
-  "candidate": "0.11.35-prodtest1.0.268",
+  "candidate": "0.11.35-prodtest1.0.269",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
     "working_tree_dirty": true,
     "node_version": "v26.11.0",
     "esbuild_version": "0.28.1",
-    "package_lock_sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704",
+    "package_lock_sha256": "a09d9021670fbf443ebaec4fad4b483190bc39f3575db72ee24154d0dc5209bc",
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 74,
-    "source_fingerprint_sha256": "f76f72dafc00a6d70da1e00844dcccdb1803ed2cf74395468b01d6c10ab1a03f",
+    "source_fingerprint_sha256": "2faaf01f891fa4d4659ffa8c045b40eda91c347b4767fe88d35d9a6e3c3f9008",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -203,7 +203,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-apply.ts",
-        "sha256": "09d7885c5c65511d9df805fd8e746e6d8e211fe19208277e69932ce7671abd2c"
+        "sha256": "bc07d5896d1db24c5614d70d4bc32fdbc396d3e9ccc74d6b4563246d860a941f"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-pull.ts",
@@ -314,7 +314,7 @@
   "build": {
     "input_count": 2,
     "fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in provenance build input order",
-    "fingerprint_sha256": "fb86fb936314fd2d28c5bf92a9f4f8870c7b17032e61f0f15ac415f0f176afd2",
+    "fingerprint_sha256": "317578a35a01e1007fdf1f2998d87b1f25a928d1dee16594ac68083bb343a327",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/esbuild.config.mjs",
@@ -322,18 +322,18 @@
       },
       {
         "path": "package-lock.json",
-        "sha256": "addeb6a60460d4fb5460d7a3b910350fc4f36730c13ab2c57f2a99ff0dc50704"
+        "sha256": "a09d9021670fbf443ebaec4fad4b483190bc39f3575db72ee24154d0dc5209bc"
       }
     ],
     "main_js_reproduced": true,
-    "main_js_sha256": "45b9c083494c78a7e6782d501853d9fc13597fbbd8e3336e4367c80741b9e796",
-    "main_js_bytes": 754011
+    "main_js_sha256": "36e35a1ccc2ab93a6fc79ad132f4f6f1c60bd28c0df55438d4c6fb499236d8c5",
+    "main_js_bytes": 754629
   },
   "assets": {
-    "manifest_sha256": "9676fee30913a788fe59e18cec9b9cf04f5f82b0feb0f147d2cdb697af73feab",
-    "main_js_sha256": "45b9c083494c78a7e6782d501853d9fc13597fbbd8e3336e4367c80741b9e796",
+    "manifest_sha256": "5150524d49f79fb78c2f9c782df568ef3acf7adebd3a076be7c54bb6bf518b6d",
+    "main_js_sha256": "36e35a1ccc2ab93a6fc79ad132f4f6f1c60bd28c0df55438d4c6fb499236d8c5",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 754011
+    "main_js_bytes": 754629
   }
 }
