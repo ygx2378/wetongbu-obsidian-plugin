@@ -170,9 +170,9 @@ export async function writeTextAtomically(
       if (typeof adapter.rename === "function" && !destinationExists) {
         await adapter.rename(temporary, path);
       } else {
-        // Verify the overwrite and restore the original on a torn/corrupted
-        // write. The backup above still gives us a recovery copy during this
-        // non-atomic replacement window.
+        // Verify the overwrite. The backup above preserves the original during
+        // this non-atomic replacement window; the failure path below classifies
+        // the target before deciding whether the scratch files are safe to drop.
         await adapter.write(path, content);
         if ((await adapter.read(path)) !== content) throw new Error("文章更新替换校验失败");
       }
@@ -182,11 +182,35 @@ export async function writeTextAtomically(
       if (!replacementStarted) {
         safeToCleanup = true;
       } else {
+        // A failed write/readback does not prove that the target is still ours
+        // to roll back: an editor or external process may have saved after the
+        // remote replacement began. Classify the on-disk bytes first and never
+        // overwrite a state that matches neither side of this transaction.
+        let current: string | undefined;
+        let targetRead = false;
         try {
-          await adapter.write(path, original);
-          safeToCleanup = (await adapter.read(path)) === original;
+          current = await adapter.read(path);
+          targetRead = true;
         } catch {
-          safeToCleanup = false;
+          // An unreadable or missing target is ambiguous. Leave both recovery
+          // artifacts in place so startup recovery can fail closed.
+        }
+        if (targetRead && current === content) {
+          // The adapter reported an error after the intended bytes reached the
+          // target. Treat the replacement as committed so callers can advance
+          // their durable sync state without rewriting the note.
+          safeToCleanup = true;
+          return;
+        }
+        if (targetRead && current === original) {
+          // The replacement did not alter the target; retain the original
+          // failure while removing scratch files that are no longer needed.
+          safeToCleanup = true;
+        } else {
+          throw Object.assign(
+            fail("vault_write_recovery_ambiguous", "笔记更新结果无法确认；已保留本机内容和恢复文件，暂停此路径自动覆盖"),
+            { path, cause: error },
+          );
         }
       }
       throw error;

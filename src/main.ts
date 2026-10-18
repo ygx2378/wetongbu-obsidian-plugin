@@ -3403,13 +3403,24 @@ export default class WeTongbuPlugin extends Plugin {
       }
     } catch (error) {
       const editorBusy = isVaultSyncActiveEditorBusyError(error);
+      const writeRecoveryAmbiguous = String((error as any)?.code ?? "") === "vault_write_recovery_ambiguous";
       diagnosticOutcome = editorBusy ? "incomplete" : "failed";
       diagnosticFailureCode = String((error as any)?.code ?? "vault_sync_failed");
       this.vaultSafetyOverrideFingerprint = "";
       const message = error instanceof Error ? error.message : String(error);
       const upgradeNotice = getVaultSyncFailureNotice(error);
-      this.lastSafeErrorCode = upgradeNotice ? "protocol_upgrade_required"
+      this.lastSafeErrorCode = writeRecoveryAmbiguous ? diagnosticFailureCode
+        : upgradeNotice ? "protocol_upgrade_required"
         : editorBusy ? diagnosticFailureCode : "vault_sync_failed";
+      if (writeRecoveryAmbiguous) {
+        this.vaultSyncWriteRecoveryBlocked = true;
+        const path = normalizeVaultPath((error as any)?.path ?? "");
+        if (path && !this.vaultSyncWriteRecoveryBlockedPaths.includes(path)) {
+          this.vaultSyncWriteRecoveryBlockedPaths.push(path);
+        }
+        this.vaultSyncRetry?.clear();
+        this.stopVaultSyncV2Events();
+      }
       if (editorBusy) {
         const deferredPath = normalizeVaultPath((error as any)?.path ?? "");
         if (deferredPath) this.vaultSyncEditorDeferredPaths.add(deferredPath);
@@ -3423,7 +3434,9 @@ export default class WeTongbuPlugin extends Plugin {
       } else if (shouldScheduleVaultSyncFailureRetry(error, this.settings.vaultSyncIntervalMinutes !== null)) {
         this.vaultSyncRetry?.scheduleRetry(error);
       }
-      if (!quiet) new Notice(upgradeNotice ?? (editorBusy
+      if (!quiet) new Notice(upgradeNotice ?? (writeRecoveryAmbiguous
+        ? `笔记写入结果无法确认，已保留本机内容和恢复文件并暂停 Vault 同步；请检查 ${(error as any)?.path ?? "目标笔记"} 及同目录 .wetongbu-update 临时文件后重载 Obsidian`
+        : editorBusy
         ? (this.settings.vaultSyncIntervalMinutes === null
           ? "该笔记仍在编辑器中打开，远端更新已安全暂缓；关闭该笔记后点击“立即同步”继续，本机内容已保留"
           : "该笔记仍在编辑器中打开，远端更新已安全暂缓；关闭该笔记后将自动继续，本机内容已保留")
