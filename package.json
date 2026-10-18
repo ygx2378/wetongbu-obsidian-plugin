@@ -18,6 +18,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "fflate": "^0.8.3"
+    "fflate": "^0.8.3",
+    "node-diff3": "3.2.1"
   }
 }

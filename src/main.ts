@@ -12,22 +12,117 @@ import {
   type App,
 } from "obsidian";
 import { buildVaultPaths } from "./shared/vault-layout.mjs";
+import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
 import { validateWebclipManifest, verifyWebclipPackageFiles } from "./shared/feishu-package.mjs";
 import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
-import { VaultSyncRemoteClient } from "./vault-sync-remote";
-import { createPrevSyncStore } from "./vault-sync-local";
-import { createCaptureHandoffStore, type CaptureHandoffStore } from "./capture-handoff";
+import { VaultSyncRemoteClient, type VaultSyncClientOptions } from "./vault-sync-remote";
+import type { VaultSyncV2DeviceProgress, VaultSyncV2FileVersion, VaultSyncV2FileVersionsPage } from "./vault-sync-v2-remote";
+import {
+  createPrevSyncStore,
+  runV2PushAfterCompleteLocalScan,
+  scanLocalFiles,
+  shouldSyncPath,
+  VAULT_SYNC_PERIODIC_AUDIT_BATCH_SIZE,
+} from "./vault-sync-local";
+import { createVaultSyncIndex, type VaultSyncLocalIndex } from "./vault-sync-index";
+import { captureHandoffFilesForExistingTask, captureHandoffFilesHaveCommittedSuccessors, captureHandoffStatusSummary, createCaptureHandoffStore, type CaptureHandoffStore } from "./capture-handoff";
 import { selectCompletionNote, updateCompletionNoteMetadata } from "./completion-note";
 import { assertCompletionTaskIdentity, normalizeCompletionSourceUrl } from "./completion-task-validation";
 import { resolveAssetTarget } from "./asset-target";
-import { replaceMarkdownDestination } from "./media-continuation";
+import { applyMediaContinuationAsset, commitMediaContinuationNoteAndEvidence, localClipImageLayoutAssets, processLocalClipImages, replaceMarkdownDestination } from "./media-continuation";
 import { completeLocalClipTaskWithRetry } from "./local-clip-completion";
 import { unzipWebclipArchive } from "./webclip-zip";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
-import { createVaultSyncRetryScheduler, isRetryableVaultSyncError } from "./vault-sync-retry";
+import {
+  createPendingV2DeletionReviewHandler,
+  DeletionReviewConfirmationLane,
+  DeletionReviewModalLifetime,
+  localDeletionReminderSuppressionKey,
+  nextDeletionReviewNotice,
+  PendingDeletionReviewOpener,
+  shouldCloseDeletionReviewModal,
+  shouldDismissDeletionReviewOnError,
+  shouldNotifyEmptyDeletionReview,
+  shouldShowDeletionReviewNotice,
+  type DeletionReviewNoticeEntry,
+} from "./vault-sync-deletion-notice";
+import { createVaultSyncRetryScheduler, getVaultSyncFailureNotice, isRetryableVaultSyncError, isVaultSyncActiveEditorBusyError, shouldScheduleVaultSyncFailureRetry } from "./vault-sync-retry";
+import { createDebouncedVaultSyncScheduler, createPausableIntervalScheduler } from "./vault-sync-scheduler";
+import { createVaultSyncLifecycleHandlers, deferVaultSyncAutomaticRunForRetry } from "./vault-sync-lifecycle";
+import {
+  assertVaultPathGeneration,
+  assertSafeTextReplacement,
+  cleanupTextReplacementArtifacts,
+  removeBinaryAssetIfUnchanged,
+  withVaultPathWriteLock,
+  withVaultPathWriteLocks,
+  writeBinaryAssetSafely,
+  writeTextAtomically,
+  recoverInterruptedTextReplacementsAfterLayoutReady,
+  getConflictActionAvailability,
+  isVaultPathOpenInMarkdownEditor,
+} from "./vault-sync-write-safety";
 import { sha256Hex } from "./shared/hash";
-import { createVaultSyncCrypto } from "./shared/vault-sync-crypto";
+import { assertVaultEncryptionCredentialChangeSafe, createVaultSyncCrypto, type VaultSyncCrypto, type VaultSyncCryptoKeyring } from "./shared/vault-sync-crypto";
+import { addVaultSyncCryptoKeyDescriptor, assertVaultSyncEncryptionVersionCompatible, loadVaultSyncCryptoKeyring, normalizeVaultSyncCryptoKeyDescriptors, validateVaultSyncRemoteKeyVersionCatalog, type VaultSyncCryptoKeyDescriptor } from "./vault-sync-crypto-keyring";
+import { createVaultSyncOutboxStore, loadLatestVaultSyncOutboxSnapshot, type VaultSyncInboxEntry, type VaultSyncOutboxOperation, type VaultSyncOutboxSnapshot, type VaultSyncV2Identity } from "./vault-sync-outbox";
+import { summarizeVaultSyncNeedsRebase } from "./vault-sync-needs-rebase";
+import { createVaultSyncV2BaselineStore, loadLatestVaultSyncV2Baseline } from "./vault-sync-v2-baseline";
+import { createVaultSyncV2BaseContentStore } from "./vault-sync-v2-base-content";
+import { archiveLegacyPrevSyncStateForV2 } from "./vault-sync-v2-legacy-migration";
+import { createVaultSyncV2SnapshotStageStore } from "./vault-sync-v2-snapshot-store";
+import { canPushIndependentFilesAfterBlockedPull, classifyVaultSyncV2PullResult, createVaultSyncV2PullEngine } from "./vault-sync-v2-pull";
+import { createVaultSyncV2PushEngine, type VaultSyncV2PendingDeletion } from "./vault-sync-v2-push";
+import { createVaultSyncV2ApplyEngine } from "./vault-sync-v2-apply";
+import { createVaultSyncRemoteRenameEventGuard } from "./vault-sync-remote-rename-event-guard";
+import { createVaultSyncRemoteDeleteEventGuard } from "./vault-sync-remote-delete-event-guard";
+import { createV2HostedObjectTransport, VAULT_SYNC_DOWNLOAD_RANGE_BYTES } from "./vault-sync-v2-storage";
+import { createVaultSyncV2DownloadStageStore } from "./vault-sync-v2-download-stage";
+import { downloadVaultSyncV2ToVerifiedStage } from "./vault-sync-v2-plaintext-stage";
+import { createVaultSyncV2EventsClient } from "./vault-sync-v2-events";
+import {
+  canPreviewHistoryVersion,
+  canRestoreHistoryVersion,
+  formatVaultSyncHistoryError,
+  HISTORY_PREVIEW_MAX_BYTES,
+  HISTORY_RESTORE_MAX_BYTES,
+  historyRestoreTargetPath,
+  isVaultSyncContentWithinPlaintextLimit,
+  isVaultSyncPlaintextSizeCompatible,
+  VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
+} from "./vault-sync-history";
+import { createVaultSyncObjectWorkGate } from "./vault-sync-object-work-gate";
+import { saveVaultSyncScopeAfterRemoteConfirmation, type VaultSyncScope } from "./vault-sync-scope-update";
+import { restoreConflictEditorTextFormat, submitManualConflictMerge } from "./vault-sync-conflict-merge";
+import { resolveConflictAndScheduleFollowUp } from "./vault-sync-conflict-actions";
+import {
+  classifyRemoteRenameTargetIdentity,
+  describeRemoteRenameConflictHint,
+  type RemoteRenameTargetIdentity,
+} from "./vault-sync-conflict-hint";
+import { createVaultSyncKeyRotationStore, type VaultSyncKeyRotationIdentity } from "./vault-sync-key-rotation";
+import { runVaultSyncKeyRotation } from "./vault-sync-key-rotation-runner";
+import {
+  createVaultSyncDiagnostics,
+  type VaultSyncDiagnosticOutcome,
+  type VaultSyncDiagnosticProtocol,
+  type VaultSyncDiagnosticStage,
+  type VaultSyncDiagnosticWorkSummary,
+} from "./vault-sync-diagnostics";
+import { createVaultSyncPathIntentStore, resolveVaultSyncPathMoveIdentities } from "./vault-sync-path-intents";
+import { registerVaultSyncPathEvents } from "./vault-sync-path-events";
+import { createVaultSyncOrderedQueue } from "./vault-sync-ordered-queue";
+import { canAutomaticallyPropagateDeletes, type VaultSyncDeleteMode } from "./vault-sync-deletion-policy";
+import { loadVaultSyncInterval, normalizeVaultSyncInterval, VAULT_SYNC_INTERVAL_OPTIONS } from "./vault-sync-preferences";
+import { createVaultSyncScopeStateStore } from "./vault-sync-scope-state";
+import { formatPendingDeletionDeviceProgress, formatVaultSyncDeviceCursors } from "./vault-sync-device-progress";
+import { createVaultSyncInitializationLeaseKeeper } from "./vault-sync-initialization-lease";
+import {
+  dismissConflictActionForActiveEditorBusy,
+  registerVaultSyncEditorRetryEvents,
+  shouldSchedulePendingVaultSyncRetry,
+} from "./vault-sync-editor-retry";
 import {
   articleCandidate,
   articleAssetFingerprintFromBodies,
@@ -56,6 +151,13 @@ import {
   resolvePersistedApiBaseUrl,
   shouldResetEnvironmentCredentials,
 } from "./shared/security";
+
+function createVaultSyncRemoteClient(options: Omit<VaultSyncClientOptions, "requestTransport">) {
+  return new VaultSyncRemoteClient({
+    ...options,
+    requestTransport: (request: any) => requestUrl(request),
+  });
+}
 
 interface WeTongbuSettings {
   apiBaseUrl: string;
@@ -101,6 +203,8 @@ interface WeTongbuSettings {
   /** Vault automatic sync interval in minutes; null means disabled. */
   vaultSyncIntervalMinutes: number | null;
   vaultSyncScope: VaultSyncScope;
+  vaultSyncMergeMode: VaultSyncMergeMode;
+  vaultSyncDeleteMode: VaultSyncDeleteMode;
   vaultSafetyEnabled: boolean;
   vaultSafetyRatio: number;
   /** 首次双侧都有内容时的同步方向；ask 表示先让用户选择。 */
@@ -116,6 +220,15 @@ interface WeTongbuSettings {
   vaultEncryptionEnabled: boolean;
   vaultEncryptionSecretId: string;
   vaultEncryptionSaltHex: string;
+  vaultEncryptionKeyVersion: number;
+  vaultEncryptionKeyring: VaultSyncCryptoKeyDescriptor[];
+  vaultEncryptionRotationOperationId: string;
+  vaultEncryptionRotationId: string;
+  vaultEncryptionRotationSecretId: string;
+  vaultEncryptionRotationSourceVersion: number;
+  vaultEncryptionRotationSourceSaltHex: string;
+  vaultEncryptionRotationTargetVersion: number;
+  vaultEncryptionRotationTargetSaltHex: string;
   /** Pending account device authorization survives mobile backgrounding. */
   pendingDeviceCode: string;
   pendingDeviceVerificationUri: string;
@@ -123,8 +236,8 @@ interface WeTongbuSettings {
 
 type StorageProvider = "cloudflare_r2" | "aws_s3" | "aliyun_oss" | "tencent_cos";
 type ImageDeliveryMode = "local" | "hosted_link";
-type VaultSyncScope = "whole_vault" | "root_folder";
 type VaultFirstSyncDirection = "ask" | "auto" | "remote" | "local";
+type VaultSyncMergeMode = "automatic" | "manual";
 
 function currentDeviceName() {
   if (Platform.isIosApp) return "iOS";
@@ -141,6 +254,8 @@ function currentDeviceClass(): "desktop" | "mobile" {
 type PersistedSettings = Partial<WeTongbuSettings> & {
   noteFolder?: string;
   attachmentFolder?: string;
+  vaultSyncRetryAfterNotBeforeMs?: number;
+  vaultSyncRetryTargetKey?: string;
 };
 
 const PROVIDER_DEFAULT_REGION: Record<StorageProvider, string> = {
@@ -158,8 +273,9 @@ const PROVIDER_LABEL: Record<StorageProvider, string> = {
 };
 
 const ARTICLE_SYNC_INTERVAL_OPTIONS = [15, 30, 60, 300] as const;
-const VAULT_SYNC_INTERVAL_OPTIONS = [1, 5, 10, 20, 30] as const;
 const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
+// Retry-After is device scheduling state; keep it out of plugin data.json, which may sync between devices.
+const VAULT_SYNC_RETRY_AFTER_LOCAL_STORAGE_KEY = "wetongbu-vault-sync-retry-after-v1";
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -176,14 +292,6 @@ function normalizeArticleSyncInterval(value: unknown) {
   return ARTICLE_SYNC_INTERVAL_OPTIONS.includes(numeric as typeof ARTICLE_SYNC_INTERVAL_OPTIONS[number])
     ? numeric
     : 30;
-}
-
-function normalizeVaultSyncInterval(value: unknown): number | null {
-  if (value === null || value === undefined || value === "" || value === "unlimited") return null;
-  const numeric = Number(value);
-  return VAULT_SYNC_INTERVAL_OPTIONS.includes(numeric as typeof VAULT_SYNC_INTERVAL_OPTIONS[number])
-    ? numeric
-    : null;
 }
 
 function normalizeVaultSafetyRatio(value: unknown) {
@@ -209,6 +317,8 @@ function formatBytes(value: number) {
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
+
+const vaultSyncObjectWorkGate = createVaultSyncObjectWorkGate();
 
 const DEFAULT_SETTINGS: WeTongbuSettings = {
   apiBaseUrl: DEFAULT_API_BASE_URL,
@@ -249,8 +359,10 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   articleSyncIntervalSeconds: 30,
   vaultSyncEnabled: false,
   vaultSyncAutoEnablePending: false,
-  vaultSyncIntervalMinutes: null,
+  vaultSyncIntervalMinutes: 1,
   vaultSyncScope: "whole_vault",
+  vaultSyncMergeMode: "automatic",
+  vaultSyncDeleteMode: "review",
   vaultSafetyEnabled: true,
   vaultSafetyRatio: 0.5,
   vaultFirstSyncDirection: "auto",
@@ -261,6 +373,15 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   vaultEncryptionEnabled: false,
   vaultEncryptionSecretId: "",
   vaultEncryptionSaltHex: "",
+  vaultEncryptionKeyVersion: 1,
+  vaultEncryptionKeyring: [],
+  vaultEncryptionRotationOperationId: "",
+  vaultEncryptionRotationId: "",
+  vaultEncryptionRotationSecretId: "",
+  vaultEncryptionRotationSourceVersion: 0,
+  vaultEncryptionRotationSourceSaltHex: "",
+  vaultEncryptionRotationTargetVersion: 0,
+  vaultEncryptionRotationTargetSaltHex: "",
   pendingDeviceCode: "",
   pendingDeviceVerificationUri: "",
 };
@@ -324,6 +445,12 @@ export default class WeTongbuPlugin extends Plugin {
   accountStatus = "当前账号：未登录；登录后可使用多端同步";
   accountLoggedIn = false;
   accountPlanType: "free" | "pro" = "free";
+  private accountStatusRefreshGeneration = 0;
+  vaultEncryptionRotationAvailable = false;
+  vaultEncryptionRotationStatus = "";
+  private vaultEncryptionRotationCapabilitiesFetchedAt = 0;
+  private vaultEncryptionRotationCapabilitiesRequest: Promise<boolean> | null = null;
+  vaultEncryptionRotationRunning = false;
   // User-managed object storage is retired. Keep the persisted compatibility
   // fields for non-destructive upgrades, but never use them to enable sync.
   accountLegacyFreeStorageCompat = false;
@@ -333,29 +460,86 @@ export default class WeTongbuPlugin extends Plugin {
   hostedMediaUsedBytes = 0;
   lastSafeErrorCode = "";
   private vaultSyncing = false;
+  private vaultSyncScopeChanging = false;
   private vaultDeviceTokenCache = "";
   private accountPollTimer: number | null = null;
   private articleSyncTimer: number | null = null;
-  private vaultSyncTimer: number | null = null;
+  private vaultSyncTimer: ReturnType<typeof createPausableIntervalScheduler> | null = null;
   private articleSyncSchedulerStarted = false;
   private vaultSyncRetry: ReturnType<typeof createVaultSyncRetryScheduler> | null = null;
+  private vaultSyncEventScheduler: ReturnType<typeof createDebouncedVaultSyncScheduler> | null = null;
+  private vaultSyncLifecycleActive = false;
+  private vaultSyncLifecycleGeneration = 0;
+  private vaultSyncWriteRecoveryReady = false;
+  private vaultSyncWriteRecoveryBlocked = false;
+  private vaultSyncWriteRecoveryBlockedPaths: string[] = [];
+  private vaultSyncV2Events: ReturnType<typeof createVaultSyncV2EventsClient> | null = null;
+  private vaultSyncEventPending = false;
+  private readonly vaultSyncEditorDeferredPaths = new Set<string>();
+  private vaultSyncProtocolUpgradeTargetKey = "";
+  readonly vaultSyncDiagnostics = createVaultSyncDiagnostics();
   private vaultSafetyOverrideFingerprint = "";
   private pendingDeletionReview: SyncResult | null = null;
+  private pendingV2DeletionReview: VaultSyncV2PendingDeletion[] = [];
+  private pendingV2DeletionHandler: ((item: VaultSyncV2PendingDeletion) => Promise<VaultSyncV2PendingDeletion[]>) | null = null;
+  private readonly deletionReviewConfirmationLane = new DeletionReviewConfirmationLane();
+  private pendingDeletionReviewNoticeKey = "";
+  private pendingDeletionReviewNoticeSuppressedKey = "";
+  private pendingDeletionReviewNotice: Notice | null = null;
+  private readonly pendingDeletionReviewOpener = new PendingDeletionReviewOpener();
+  private localDeletionReminderNotice: Notice | null = null;
+  private readonly localDeletionReminderPaths = new Set<string>();
+  private pendingDeletionStatusBarItem: HTMLElement | null = null;
+  private readonly remoteDeleteEventGuard = createVaultSyncRemoteDeleteEventGuard();
+  private pendingV2DeletionReviewModalOpen = false;
+  private pendingV2DeletionReviewModal: VaultSyncV2DeletionReviewModal | null = null;
+  private vaultSyncPathIntentFailure = false;
+  private vaultSyncPathIntentWrites = 0;
+  private readonly vaultSyncPathIntentQueue = createVaultSyncOrderedQueue();
+  private readonly vaultSyncRemoteRenameEventGuard = createVaultSyncRemoteRenameEventGuard();
   private storageSwitching = false;
   private captureHandoffs!: CaptureHandoffStore;
+  private vaultSyncIndex!: VaultSyncLocalIndex;
   private localClipImageQueue: Promise<void> = Promise.resolve();
   private settingTab: WeTongbuSettingTab | null = null;
   captureReceiverStatus: { device_name: string | null; is_current_device: boolean } | null = null;
   vaultEncryptionInput = "";
+  vaultEncryptionRotationInput = "";
+  vaultSyncDeviceProgress: VaultSyncV2DeviceProgress | null = null;
+  vaultSyncDeviceProgressFetchedAt = "";
   private pluginTokenMissingNoticeShown = false;
 
   async onload() {
+    this.vaultSyncLifecycleGeneration += 1;
+    this.vaultSyncLifecycleActive = true;
     this.captureHandoffs = createCaptureHandoffStore(this.app);
+    this.vaultSyncIndex = await createVaultSyncIndex(this.app);
+    this.vaultSyncEventScheduler = createDebouncedVaultSyncScheduler(async ({ queueWaitMs, activeQueueWaitMs }) => {
+      if (!this.settings.vaultSyncEnabled || this.settings.vaultSyncIntervalMinutes === null) return;
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        this.vaultSyncEventPending = true;
+        return;
+      }
+      if (this.vaultSyncing) {
+        this.vaultSyncEventPending = true;
+        return;
+      }
+      if (deferVaultSyncAutomaticRunForRetry(this.vaultSyncRetry)) {
+        this.vaultSyncEventPending = true;
+        return;
+      }
+      this.vaultSyncEventPending = false;
+      await this.runVaultSync(true, undefined, { queueWaitMs, activeQueueWaitMs });
+    });
+    if (typeof navigator !== "undefined" && !navigator.onLine) this.vaultSyncEventScheduler.pause();
+    if (typeof document !== "undefined" && document.hidden) this.vaultSyncEventScheduler.pause();
     const rawSaved = await this.loadData();
     const saved = (rawSaved ?? {}) as PersistedSettings;
     const {
       noteFolder: _legacyNoteFolder,
       attachmentFolder: _legacyAttachmentFolder,
+      vaultSyncRetryAfterNotBeforeMs: _legacySyncedRetryDeadline,
+      vaultSyncRetryTargetKey: _legacySyncedRetryTargetKey,
       ...currentSettings
     } = saved;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, currentSettings);
@@ -375,7 +559,9 @@ export default class WeTongbuPlugin extends Plugin {
     // never turn the switch on implicitly.
     this.settings.vaultSyncAutoEnablePending = false;
     this.settings.articleSyncIntervalSeconds = normalizeArticleSyncInterval(this.settings.articleSyncIntervalSeconds);
-    this.settings.vaultSyncIntervalMinutes = normalizeVaultSyncInterval(this.settings.vaultSyncIntervalMinutes);
+    this.settings.vaultSyncIntervalMinutes = loadVaultSyncInterval(currentSettings);
+    this.settings.vaultSyncMergeMode = this.settings.vaultSyncMergeMode === "manual" ? "manual" : "automatic";
+    this.settings.vaultSyncDeleteMode = this.settings.vaultSyncDeleteMode === "automatic" ? "automatic" : "review";
     this.settings.vaultSafetyRatio = normalizeVaultSafetyRatio(this.settings.vaultSafetyRatio);
     // The API base is not a user-facing setting. Normalize old/manual data so
     // plugin credentials can never be sent to an arbitrary endpoint. When a
@@ -390,11 +576,38 @@ export default class WeTongbuPlugin extends Plugin {
       await this.resetEnvironmentScopedCredentials();
     }
     this.settings.apiBaseUrl = resolvedApiBaseUrl;
+    const retryAfterState = this.app.loadLocalStorage(VAULT_SYNC_RETRY_AFTER_LOCAL_STORAGE_KEY) as {
+      deadlineMs?: unknown;
+      targetKey?: unknown;
+    } | null;
+    const savedRetryDeadline = Number(retryAfterState?.deadlineMs);
+    const savedRetryTargetKey = typeof retryAfterState?.targetKey === "string"
+      ? retryAfterState.targetKey : "";
+    let initialRetryAfterNotBeforeMs = 0;
+    if (!this.settings.vaultSyncEnabled || this.settings.vaultSyncIntervalMinutes === null
+      || !Number.isSafeInteger(savedRetryDeadline) || savedRetryDeadline <= Date.now()
+      || savedRetryTargetKey !== this.currentVaultSyncProtocolTargetKey()) {
+      this.app.saveLocalStorage(VAULT_SYNC_RETRY_AFTER_LOCAL_STORAGE_KEY, null);
+    } else {
+      initialRetryAfterNotBeforeMs = savedRetryDeadline;
+    }
     if (!this.settings.vaultInstallationId) {
       this.settings.vaultInstallationId = crypto.randomUUID();
     }
     await this.ensureVaultIdentityId();
     await this.saveSettings();
+    for (const event of registerVaultSyncPathEvents(this.app.vault, {
+      onPathChange: (path, deleted) => this.onVaultSyncPathChange(path, deleted),
+      onDelete: (path) => {
+        if (this.remoteDeleteEventGuard.shouldNotifyLocalDelete(path)) this.notifyLocalVaultNoteDeleted(path);
+      },
+      onRename: (file, oldPath) => { void this.onVaultSyncRename(file, oldPath); },
+    })) this.registerEvent(event);
+    for (const event of registerVaultSyncEditorRetryEvents(
+      this.app,
+      () => [...this.vaultSyncEditorDeferredPaths],
+      () => this.requestAutomaticVaultSync(),
+    )) this.registerEvent(event);
     this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
       void this.handleLocalClipImport(params as Record<string, unknown>);
     });
@@ -402,23 +615,62 @@ export default class WeTongbuPlugin extends Plugin {
       run: () => this.settings.vaultSyncIntervalMinutes === null
         ? Promise.resolve()
         : this.runVaultSync(true),
+      initialRetryAfterNotBeforeMs,
+      onRetryAfterNotBeforeChange: (deadlineMs) => {
+        this.app.saveLocalStorage(VAULT_SYNC_RETRY_AFTER_LOCAL_STORAGE_KEY, deadlineMs === null ? null : {
+          deadlineMs,
+          targetKey: this.currentVaultSyncProtocolTargetKey(),
+        });
+      },
     });
     void this.refreshAccountStatus();
     void this.refreshCaptureReceiverStatus();
     void this.resumeAccountLogin().catch(() => undefined);
-    this.registerDomEvent(window, "focus", () => {
-      void this.resumeAccountLogin().catch(() => undefined);
-      this.vaultSyncRetry?.wake();
+    const vaultSyncLifecycle = createVaultSyncLifecycleHandlers({
+      isOnline: () => typeof navigator === "undefined" || navigator.onLine,
+      isHidden: () => typeof document !== "undefined" && document.hidden,
+      setEventOnline: (online) => this.vaultSyncV2Events?.setOnline(online),
+      setEventForeground: (foreground) => this.vaultSyncV2Events?.setForeground(foreground),
+      eventScheduler: {
+        pause: () => this.vaultSyncEventScheduler?.pause(),
+        resume: () => this.vaultSyncEventScheduler?.resume(),
+      },
+      retryScheduler: {
+        clear: () => this.vaultSyncRetry?.clear(),
+        pause: () => this.vaultSyncRetry?.pause(),
+        resume: () => this.vaultSyncRetry?.resume(),
+        wake: () => this.vaultSyncRetry?.wake(),
+        hasPendingRetry: () => this.vaultSyncRetry?.hasPendingRetry() ?? false,
+      },
+      intervalScheduler: { pause: () => this.vaultSyncTimer?.pause() },
+      restartIntervalScheduler: () => this.restartVaultSyncTimer(),
+      resumeAccountLogin: () => { void this.resumeAccountLogin().catch(() => undefined); },
+      requestAutomaticSync: () => this.requestAutomaticVaultSync(),
     });
-    this.registerDomEvent(window, "online", () => { this.vaultSyncRetry?.wake(); });
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) {
-        void this.resumeAccountLogin().catch(() => undefined);
-        this.vaultSyncRetry?.wake();
-      }
-    });
+    this.registerDomEvent(window, "focus", vaultSyncLifecycle.focus);
+    this.registerDomEvent(window, "online", vaultSyncLifecycle.online);
+    this.registerDomEvent(window, "offline", vaultSyncLifecycle.offline);
+    this.registerDomEvent(document, "visibilitychange", vaultSyncLifecycle.visibilityChange);
     this.settingTab = new WeTongbuSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
+    const pendingDeletionStatusBarItem = this.addStatusBarItem();
+    pendingDeletionStatusBarItem.addClass("mod-clickable");
+    pendingDeletionStatusBarItem.setAttribute("role", "button");
+    pendingDeletionStatusBarItem.setAttribute("tabindex", "0");
+    pendingDeletionStatusBarItem.addEventListener("click", () => { void this.openPendingDeletionReview(); });
+    pendingDeletionStatusBarItem.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        void this.openPendingDeletionReview();
+      }
+    });
+    this.pendingDeletionStatusBarItem = pendingDeletionStatusBarItem;
+    this.refreshPendingDeletionStatusBarItem();
+    this.addCommand({
+      id: "vault-sync-review-deletions",
+      name: "微同步：处理待确认删除",
+      callback: () => { void this.openPendingDeletionReview(); },
+    });
     addIcon("wetongbu-sync", WETONGBU_RIBBON_ICON);
     this.addRibbonIcon("wetongbu-sync", "微同步：立即同步", () => {
       void this.manualSync();
@@ -433,13 +685,46 @@ export default class WeTongbuPlugin extends Plugin {
       name: "微同步：仅同步 Vault 文件（高级）",
       callback: () => void this.runVaultSync(false),
     });
-    this.app.workspace.onLayoutReady(() => {
-      this.articleSyncSchedulerStarted = true;
-      void this.ensureWorkspace();
-      void this.syncNow(true).then(() => this.recoverCaptureHandoffs());
-      this.restartArticleSyncTimer();
-      this.restartVaultSyncTimer();
+    this.addCommand({
+      id: "vault-sync-history",
+      name: "微同步：查看当前文件的云端历史版本",
+      callback: () => void this.openVaultHistory(),
     });
+    this.addCommand({
+      id: "vault-sync-deleted-history",
+      name: "微同步：恢复已删除文件的历史版本",
+      callback: () => void this.openDeletedVaultHistory(),
+    });
+    this.addCommand({
+      id: "vault-sync-conflicts",
+      name: "微同步：处理待解决同步冲突",
+      callback: () => void this.openVaultSyncConflictCenter(),
+    });
+    void recoverInterruptedTextReplacementsAfterLayoutReady(this.app).then(
+      (textRecovery) => this.startAfterVaultWriteRecovery(textRecovery),
+      () => this.startAfterVaultWriteRecovery({
+        cleanedPaths: [],
+        unresolved: [{ path: "无法读取本地 Vault 文件索引", artifacts: [] }],
+      }),
+    );
+  }
+
+  private startAfterVaultWriteRecovery(
+    textRecovery: Awaited<ReturnType<typeof recoverInterruptedTextReplacementsAfterLayoutReady>>,
+  ) {
+    if (textRecovery.unresolved.length) {
+      this.vaultSyncWriteRecoveryBlocked = true;
+      this.vaultSyncWriteRecoveryBlockedPaths = textRecovery.unresolved.map((entry) => entry.path);
+      const paths = this.vaultSyncWriteRecoveryBlockedPaths.slice(0, 3).join("、");
+      new Notice(`检测到 ${textRecovery.unresolved.length} 个笔记写入中断现场，Vault 同步已暂停以保留文件。请检查目标及同目录 .wetongbu-update/.wetongbu-complete 临时文件后重载；${paths}`, 15000);
+    }
+    this.vaultSyncWriteRecoveryReady = true;
+    this.articleSyncSchedulerStarted = true;
+    void this.ensureWorkspace();
+    void this.syncNow(true).then(() => this.recoverCaptureHandoffs());
+    this.restartArticleSyncTimer();
+    this.restartVaultSyncTimer();
+    this.requestAutomaticVaultSync();
   }
 
   /**
@@ -463,14 +748,27 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   onunload() {
+    this.vaultSyncLifecycleGeneration += 1;
+    this.vaultSyncLifecycleActive = false;
+    const deletionReviewModal = this.pendingV2DeletionReviewModal;
+    this.pendingV2DeletionReviewModal = null;
+    this.pendingV2DeletionReviewModalOpen = false;
+    deletionReviewModal?.close();
+    this.hidePendingDeletionReviewNotice();
+    this.hideLocalDeletionReminderNotice();
     if (this.accountPollTimer !== null) window.clearInterval(this.accountPollTimer);
     this.accountPollTimer = null;
     if (this.articleSyncTimer !== null) window.clearInterval(this.articleSyncTimer);
     this.articleSyncTimer = null;
-    if (this.vaultSyncTimer !== null) window.clearInterval(this.vaultSyncTimer);
+    this.vaultSyncTimer?.stop();
     this.vaultSyncTimer = null;
-    this.vaultSyncRetry?.clear();
+    // Cancel the OS timer, but keep the persisted server deadline so a plugin
+    // reload cannot immediately bypass an active Retry-After response.
+    this.vaultSyncRetry?.pause();
     this.vaultSyncRetry = null;
+    this.vaultSyncEventScheduler?.stop();
+    this.vaultSyncEventScheduler = null;
+    this.stopVaultSyncV2Events();
   }
 
   async saveSettings() {
@@ -603,9 +901,8 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   /**
-   * Download local clip images after the note is visible.  Downloads within a
-   * task run in parallel, while note/asset writes are serialized across tasks
-   * to avoid two URI handoffs racing on the same source article.
+   * Download local clip images after the note is visible.  Tasks and images
+   * are serialized so a batch never retains many full-size response bodies.
    */
   private scheduleLocalClipImageProcessing(
     task: any,
@@ -613,50 +910,39 @@ export default class WeTongbuPlugin extends Plugin {
     notePath: string,
   ) {
     const run = this.localClipImageQueue.then(async () => {
-      const results = await Promise.all(imageUrls.map(async (image, index) => {
-        if (!image?.url) return { index, asset: null, failed: false };
-        try {
-          const downloaded = await requestUrl({ url: image.url, method: "GET", throw: false });
-          if (downloaded.status < 200 || downloaded.status >= 300 || !downloaded.arrayBuffer.byteLength) {
+      const sourceImagePaths = imageUrls.map((image) => image?.url ?? "");
+      const result = await processLocalClipImages({
+        images: imageUrls,
+        download: async (url) => {
+          const downloaded = await requestUrl({ url, method: "GET", throw: false });
+          if (downloaded.status < 200 || downloaded.status >= 300) {
             throw new Error(`HTTP ${downloaded.status}`);
           }
           return {
-            index,
-            failed: false,
-            asset: {
-              relativePath: image.url,
-              body: new Uint8Array(downloaded.arrayBuffer),
-              kind: "image" as const,
-              contentType: downloaded.headers["content-type"] ?? "image/*",
-              clipIndex: index,
-            },
+            body: new Uint8Array(downloaded.arrayBuffer),
+            contentType: downloaded.headers["content-type"] ?? "image/*",
           };
-        } catch (error) {
-          return {
-            index,
-            asset: null,
-            failed: true,
-            error: error instanceof Error ? error.message : "网络错误",
-          };
-        }
-      }));
-      const assets = results.flatMap((result) => result.asset ? [result.asset] : []);
-      const failedImages = results.filter((result) => result.failed).length;
-      const failureReason = results.find((result) => result.failed)?.error;
-      if (!assets.length) {
-        if (failedImages) new Notice(`文章已打开；${failedImages} 张图片下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
+        },
+        createAsset: ({ url, body, contentType, index }) => ({
+          relativePath: url,
+          body,
+          kind: "image" as const,
+          contentType: contentType ?? "image/*",
+          clipIndex: index,
+        }),
+        persist: async (asset) => this.persistLocalClipImages({
+          ...task,
+          localClipImageSourcePaths: sourceImagePaths,
+        }, [asset], notePath),
+      });
+      if (!result.saved) {
+        if (result.failed) new Notice(`文章已打开；${result.failed} 张图片下载失败${result.firstFailure ? `（${result.firstFailure}）` : ""}，已保留原文地址`, 10000);
         return;
       }
-      try {
-        await this.persistLocalClipImages(task, assets, notePath);
-        if (failedImages) {
-          new Notice(`图片已保存 ${assets.length} 张；${failedImages} 张下载失败${failureReason ? `（${failureReason}）` : ""}，已保留原文地址`, 10000);
-        } else {
-          new Notice(`文章图片已保存 ${assets.length} 张`, 6000);
-        }
-      } catch (error) {
-        new Notice(`文章已打开；图片保存失败：${error instanceof Error ? error.message : String(error)}`, 10000);
-        console.error("WeTongbu local clip image processing failed", error);
+      if (result.failed) {
+        new Notice(`图片已保存 ${result.saved} 张；${result.failed} 张下载或落盘失败${result.firstFailure ? `（${result.firstFailure}）` : ""}，已保留原文地址`, 10000);
+      } else {
+        new Notice(`文章图片已保存 ${result.saved} 张`, 6000);
       }
     });
     this.localClipImageQueue = run.catch((error) => {
@@ -672,18 +958,25 @@ export default class WeTongbuPlugin extends Plugin {
   private async persistLocalClipImages(task: any, assets: any[], notePath: string) {
     const note = this.app.vault.getAbstractFileByPath(notePath);
     if (!(note instanceof TFile)) throw new Error("剪藏文章已不存在，无法更新图片");
+    const expectedGeneration = this.vaultSyncIndex.getGeneration(notePath);
     const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+    const sourcePaths = Array.isArray(task.localClipImageSourcePaths)
+      ? task.localClipImageSourcePaths as string[]
+      : assets.map((asset) => asset.relativePath);
     const layout = buildVaultPaths({
       rootFolder: normalizePath(this.settings.rootFolder),
       title: task.manifest.title,
       capturedAt: task.manifest.capturedAt,
       taskId: task.manifest.taskId,
-      assets,
+      assets: localClipImageLayoutAssets(sourcePaths, assets),
     });
     const attachmentFolder = normalizePath(layout.attachmentFolder);
     const plans: Array<{ asset: any; targetPath: string; writeLocal: boolean; relativePath: string }> = [];
     for (const [index, asset] of assets.entries()) {
-      const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[index]}`);
+      const clipIndex = Number.isInteger(asset.clipIndex) && asset.clipIndex >= 0 && asset.clipIndex < layout.assetNames.length
+        ? asset.clipIndex
+        : index;
+      const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[clipIndex] ?? layout.assetNames[index]}`);
       const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
       plans.push({
         asset,
@@ -693,12 +986,13 @@ export default class WeTongbuPlugin extends Plugin {
       });
     }
     if (plans.some((plan) => plan.writeLocal)) await ensureFolder(this, attachmentFolder);
-    const created: string[] = [];
+    const created: Array<{ path: string; body: Uint8Array; mtime: number | null }> = [];
     try {
       for (const plan of plans) {
         if (!plan.writeLocal) continue;
-        created.push(plan.targetPath);
-        await this.app.vault.adapter.writeBinary(plan.targetPath, toArrayBuffer(new Uint8Array(plan.asset.body)));
+        const body = new Uint8Array(plan.asset.body);
+        const write = await writeBinaryAssetSafely(this.app, plan.targetPath, body);
+        if (write.created) created.push({ path: plan.targetPath, body, mtime: write.mtime });
         const persisted = await this.app.vault.adapter.stat(plan.targetPath);
         if (!persisted || persisted.type !== "file" || persisted.size !== plan.asset.body.length) {
           throw new Error(`附件写入校验失败：${plan.targetPath}`);
@@ -736,10 +1030,13 @@ export default class WeTongbuPlugin extends Plugin {
         if (!legacy) continue;
         updated = updated.split(`<${legacy}>`).join(plan.relativePath).split(legacy).join(plan.relativePath);
       }
-      if (updated !== original) await writeTextAtomically(this.app, notePath, updated);
+      if (updated !== original) await writeTextAtomically(this.app, notePath, updated, original, {
+        expectedGeneration,
+        getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+      });
     } catch (error) {
-      for (const path of created) {
-        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path).catch(() => {});
+      for (const file of created) {
+        await removeBinaryAssetIfUnchanged(this.app, file.path, file.body, file.mtime).catch(() => false);
       }
       throw error;
     }
@@ -762,20 +1059,273 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   private restartVaultSyncTimer() {
-    if (this.vaultSyncTimer !== null) window.clearInterval(this.vaultSyncTimer);
+    this.vaultSyncTimer?.stop();
     this.vaultSyncTimer = null;
     const minutes = this.settings.vaultSyncIntervalMinutes;
-    if (!this.articleSyncSchedulerStarted || !this.settings.vaultSyncEnabled || minutes === null) return;
-    this.vaultSyncTimer = window.setInterval(
-      () => { void this.runVaultSync(true); },
+    if (!this.settings.vaultSyncEnabled || minutes === null) {
+      this.stopVaultSyncV2Events();
+      return;
+    }
+    if (!this.articleSyncSchedulerStarted) return;
+    if ((typeof document !== "undefined" && document.hidden)
+      || (typeof navigator !== "undefined" && !navigator.onLine)) return;
+    this.vaultSyncTimer = createPausableIntervalScheduler(
+      () => {
+        if (deferVaultSyncAutomaticRunForRetry(this.vaultSyncRetry)) return;
+        return this.runVaultSync(true, undefined, { auditBatchSize: VAULT_SYNC_PERIODIC_AUDIT_BATCH_SIZE });
+      },
       minutes * 60 * 1000,
     );
+    this.vaultSyncTimer.resume();
+  }
+
+  private currentVaultSyncProtocolTargetKey() {
+    return `${normalizeApiBaseUrl(this.settings.apiBaseUrl)}\n${this.settings.syncTargetId}`;
+  }
+
+  private onVaultSyncPathChange(path: string, deleted = false, schedule = true) {
+    if (deleted) this.vaultSyncIndex.remove(path);
+    else this.vaultSyncIndex.invalidate(path);
+    const rootFolder = this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined;
+    if (!schedule || !shouldSyncPath(path, rootFolder)) return;
+    this.requestAutomaticVaultSync();
+  }
+
+  private notifyLocalVaultNoteDeleted(path: string) {
+    const normalized = normalizeVaultPath(path);
+    const rootFolder = this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined;
+    if (!this.settings.vaultSyncEnabled || !normalized?.toLowerCase().endsWith(".md")
+      || !shouldSyncPath(normalized, rootFolder)) return;
+    this.localDeletionReminderPaths.add(normalized);
+    // A pending-review notice may have been emitted by an earlier sync pass
+    // before this Vault delete event arrived. Replace it so the same queue
+    // never leaves two visible actions that open the same confirmation modal.
+    this.hidePendingDeletionReviewNotice();
+    this.localDeletionReminderNotice?.hide();
+    const message = document.createDocumentFragment();
+    const paths = [...this.localDeletionReminderPaths];
+    const deletedSummary = paths.length === 1
+      ? `已删除本机笔记：${paths[0]}。`
+      : `已删除本机笔记 ${paths.length} 篇：${paths.slice(0, 3).join("、")}${paths.length > 3 ? " 等" : ""}。`;
+    const explanation = this.settings.vaultSyncDeleteMode === "review"
+      ? `${deletedSummary}如果这些笔记曾同步到云端，云端和其他设备会暂时保留副本；同步检查后，请在这里确认是否同步删除。`
+      : `${deletedSummary}微同步会按自动删除策略检查；若大批量保护要求人工确认，会在这里显示待处理入口。`;
+    message.createEl("div", {
+      text: explanation,
+    });
+    message.createEl("div", {
+      text: "若关闭提醒，可在命令面板搜索“微同步：处理待确认删除”重新检查并处理。",
+    });
+    const actions = message.createEl("div", { cls: "wetongbu-deletion-notice-actions" });
+    actions.style.display = "flex";
+    actions.style.flexWrap = "wrap";
+    actions.style.gap = "0.5em";
+    const action = actions.createEl("button", { text: "立即同步检查" });
+    action.addClass("mod-cta");
+    const dismiss = actions.createEl("button", { text: "关闭提醒" });
+    // Keep the action visible until a sync determines whether a remote copy
+    // needs review. A short toast is easy to miss, which leaves cloud copies
+    // behind without making the required confirmation discoverable.
+    const notice = new Notice(message, 0);
+    this.localDeletionReminderNotice = notice;
+    action.addEventListener("click", () => {
+      notice.hide();
+      if (this.localDeletionReminderNotice === notice) this.localDeletionReminderNotice = null;
+      void this.openPendingDeletionReview();
+    });
+    dismiss.addEventListener("click", () => {
+      if (this.localDeletionReminderNotice === notice) this.hideLocalDeletionReminderNotice();
+      else notice.hide();
+    });
+  }
+
+  private hideLocalDeletionReminderNotice() {
+    this.localDeletionReminderNotice?.hide();
+    this.localDeletionReminderNotice = null;
+    this.localDeletionReminderPaths.clear();
+  }
+
+  private async trashRemoteVaultFile(file: any) {
+    const path = String(file?.path ?? "");
+    await this.remoteDeleteEventGuard.trash(path, () => this.app.fileManager.trashFile(file));
+  }
+
+  private async trashRemoteVaultPath(path: string) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file) await this.trashRemoteVaultFile(file);
+  }
+
+  private isVaultSyncCaseRenameStagePath(path: string): boolean {
+    return /^\.wetongbu\/sync-v2\/case-rename-\d+-[0-9a-f-]{36}-\d{1,19}\.stage$/i
+      .test(normalizeVaultPath(path) ?? "");
+  }
+
+  private renameRemoteVaultFileAndUpdateLinks(file: any, newPath: string): Promise<void> {
+    return this.vaultSyncRemoteRenameEventGuard.rename(file, newPath,
+      (source, target) => this.app.fileManager.renameFile(source, target));
+  }
+
+  private async onVaultSyncRename(file: any, oldPath: string) {
+    const newPath = String(file?.path ?? "");
+    const rootFolder = this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined;
+    const rootFolderScope = this.settings.vaultSyncScope === "root_folder";
+    const oldInScope = shouldSyncPath(oldPath, rootFolder);
+    const newInScope = shouldSyncPath(newPath, rootFolder);
+    this.onVaultSyncPathChange(oldPath, true, false);
+    this.onVaultSyncPathChange(newPath, false, false);
+    if (this.vaultSyncRemoteRenameEventGuard.consume(file, oldPath)) return;
+    if (this.isVaultSyncCaseRenameStagePath(oldPath) || this.isVaultSyncCaseRenameStagePath(newPath)) return;
+    const isFolder = Array.isArray(file?.children);
+    const leavesSelectedFolder = rootFolderScope && oldInScope && !newInScope;
+    const isTrackedRename = (file instanceof TFile || isFolder) && this.settings.syncTargetId
+      && oldInScope && (newInScope || leavesSelectedFolder);
+    if (isFolder && isTrackedRename) {
+      const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
+      const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
+      const pending: Array<{ fromPath: string; toPath: string }> = [];
+      let exitedScopeFiles = 0;
+      const visit = (node: any) => {
+        if (Array.isArray(node?.children)) {
+          for (const child of node.children) visit(child);
+        } else if (node instanceof TFile) {
+          const currentPath = String(node.path ?? "");
+          if (!currentPath.startsWith(newPrefix)) return;
+          const fromPath = oldPrefix + currentPath.slice(newPrefix.length);
+          this.onVaultSyncPathChange(fromPath, true, false);
+          this.onVaultSyncPathChange(currentPath, false, false);
+          const fromInScope = shouldSyncPath(fromPath, rootFolder);
+          const toInScope = shouldSyncPath(currentPath, rootFolder);
+          if (fromInScope && !toInScope) exitedScopeFiles += 1;
+          if (fromInScope && (toInScope || (rootFolderScope && normalizeVaultPath(currentPath)))) {
+            pending.push({ fromPath, toPath: currentPath });
+          }
+        }
+      };
+      visit(file);
+      this.vaultSyncPathIntentWrites += 1;
+      try {
+        if (pending.length) {
+          const apiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
+          const targetId = this.settings.syncTargetId;
+          const installationId = this.settings.vaultInstallationId;
+          const deviceId = this.settings.vaultDeviceId || installationId;
+          const pathIntentStore = createVaultSyncPathIntentStore(this.app, { apiBaseUrl, targetId, installationId });
+          const moves = await this.vaultSyncPathIntentQueue.run(async () => {
+            const [tracked, existingMoves] = await Promise.all([
+              loadLatestVaultSyncV2Baseline(this.app, { apiBaseUrl, targetId, deviceId }),
+              pathIntentStore.load(),
+            ]);
+            const fileIdByPath = resolveVaultSyncPathMoveIdentities(tracked, existingMoves);
+            const resolvedMoves = pending.flatMap((entry) => {
+              const fileId = fileIdByPath.get(entry.fromPath);
+              return fileId ? [{ ...entry, fileId }] : [];
+            });
+            await pathIntentStore.recordMany(resolvedMoves, globalThis.crypto.randomUUID());
+            return resolvedMoves;
+          });
+          if (moves.length >= 20 && !(leavesSelectedFolder && exitedScopeFiles > 0)) {
+            new Notice(`${moves.length} 项目录路径变更已加入可恢复队列；可在多端同步设置查看处理进度。`, 9000);
+          }
+          if (leavesSelectedFolder && exitedScopeFiles > 0) {
+            const deferredCount = moves.length;
+            new Notice(
+              `目录移出“${this.settings.rootFolder}”同步范围；云端文件不会因此自动删除。${deferredCount} 个已同步文件的改名待办会在范围扩大后继续；进度可在多端同步设置查看。`,
+              12000,
+            );
+          }
+        }
+      } catch (error) {
+        this.vaultSyncPathIntentFailure = true;
+        new Notice(`目录改名待办未能安全写入本地；Vault 同步已暂停以防文件被误判（${error instanceof Error ? error.message : String(error)}）`, 12000);
+      } finally {
+        this.vaultSyncPathIntentWrites -= 1;
+        if (this.vaultSyncPathIntentWrites === 0 && !this.vaultSyncPathIntentFailure) this.requestAutomaticVaultSync();
+      }
+      return;
+    }
+    if (file instanceof TFile && isTrackedRename) {
+      if (!normalizeVaultPath(newPath)) {
+        if (leavesSelectedFolder) {
+          new Notice(`文件移入 Obsidian 内部忽略目录；云端旧路径将按当前删除策略处理，请在删除审核中确认。`, 12000);
+          this.requestAutomaticVaultSync();
+          return;
+        }
+      } else {
+        const apiBaseUrl = normalizeApiBaseUrl(this.settings.apiBaseUrl);
+        const targetId = this.settings.syncTargetId;
+        const installationId = this.settings.vaultInstallationId;
+        this.vaultSyncPathIntentWrites += 1;
+        try {
+          await this.vaultSyncPathIntentQueue.run(() => createVaultSyncPathIntentStore(this.app, {
+            apiBaseUrl, targetId, installationId,
+          }).record(oldPath, newPath));
+        } catch (error) {
+          this.vaultSyncPathIntentFailure = true;
+          new Notice(`改名待办未能安全写入本地；Vault 同步已暂停以防改名被误判为新建/删除（${error instanceof Error ? error.message : String(error)}）`, 12000);
+        } finally {
+          this.vaultSyncPathIntentWrites -= 1;
+          if (this.vaultSyncPathIntentWrites === 0 && !this.vaultSyncPathIntentFailure) this.requestAutomaticVaultSync();
+        }
+        if (leavesSelectedFolder) {
+          new Notice(`文件移出“${this.settings.rootFolder}”同步范围；云端文件会保留，改名待办将在范围扩大后继续。`, 10000);
+        }
+        return;
+      }
+    }
+    if (shouldSyncPath(oldPath, rootFolder) || shouldSyncPath(newPath, rootFolder)) this.requestAutomaticVaultSync();
+  }
+
+  private requestAutomaticVaultSync() {
+    if (!this.settings.vaultSyncEnabled || this.settings.vaultSyncIntervalMinutes === null) return;
+    this.vaultSyncEventPending = true;
+    if (!this.vaultSyncWriteRecoveryReady) return;
+    if ((typeof navigator !== "undefined" && !navigator.onLine)
+      || (typeof document !== "undefined" && document.hidden)) {
+      this.vaultSyncEventScheduler?.pause();
+      this.vaultSyncRetry?.pause();
+      this.vaultSyncTimer?.pause();
+      return;
+    }
+    if (deferVaultSyncAutomaticRunForRetry(this.vaultSyncRetry)) return;
+    this.vaultSyncEventScheduler?.notify();
+  }
+
+  private startVaultSyncV2Events(
+    remote: VaultSyncRemoteClient,
+    identity: VaultSyncV2Identity,
+    sessionGeneration: string,
+    knownCursor: string,
+  ) {
+    this.stopVaultSyncV2Events();
+    const client = createVaultSyncV2EventsClient({
+      apiBaseUrl: identity.apiBaseUrl,
+      targetId: identity.targetId,
+      protocolEpoch: identity.protocolEpoch,
+      sessionGeneration,
+      knownCursor,
+      remote,
+      onWake: () => this.requestAutomaticVaultSync(),
+      onStatus: (status) => this.vaultSyncDiagnostics.setConnectionStatus(status),
+      onIssue: (issue) => this.vaultSyncDiagnostics.setLastEventIssue(issue),
+      onReconnect: () => this.vaultSyncDiagnostics.recordSuccessfulReconnect(),
+    });
+    this.vaultSyncV2Events = client;
+    client.setOnline(typeof navigator === "undefined" || navigator.onLine);
+    client.setForeground(typeof document === "undefined" || !document.hidden);
+    client.start();
+  }
+
+  private stopVaultSyncV2Events() {
+    const current = this.vaultSyncV2Events as ReturnType<typeof createVaultSyncV2EventsClient> | null;
+    if (current) current.stop();
+    this.vaultSyncV2Events = null;
   }
 
   async setVaultSyncInterval(minutes: number | null) {
     this.settings.vaultSyncIntervalMinutes = normalizeVaultSyncInterval(minutes);
     await this.saveSettings();
     this.restartVaultSyncTimer();
+    this.requestAutomaticVaultSync();
   }
 
   private hasConfiguredUserStorage() {
@@ -792,12 +1342,57 @@ export default class WeTongbuPlugin extends Plugin {
     return `wetongbu-plugin-${this.settings.authSecretSuffix}`;
   }
 
+  private currentVaultEncryptionDescriptor(): VaultSyncCryptoKeyDescriptor | null {
+    if (!this.settings.vaultEncryptionEnabled || !this.settings.vaultEncryptionSecretId || !this.settings.vaultEncryptionSaltHex) return null;
+    return {
+      keyVersion: Number.isSafeInteger(this.settings.vaultEncryptionKeyVersion) && this.settings.vaultEncryptionKeyVersion >= 1
+        ? this.settings.vaultEncryptionKeyVersion : 1,
+      saltHex: this.settings.vaultEncryptionSaltHex,
+      secretId: this.settings.vaultEncryptionSecretId,
+    };
+  }
+
+  private vaultEncryptionKeyDescriptors(): VaultSyncCryptoKeyDescriptor[] {
+    return normalizeVaultSyncCryptoKeyDescriptors(
+      this.settings.vaultEncryptionKeyring,
+      this.currentVaultEncryptionDescriptor(),
+    );
+  }
+
+  private async loadVaultSyncCryptoContext() {
+    if (!this.settings.vaultEncryptionEnabled) return null;
+    const activeKeyVersion = Number.isSafeInteger(this.settings.vaultEncryptionKeyVersion)
+      && this.settings.vaultEncryptionKeyVersion >= 1 ? this.settings.vaultEncryptionKeyVersion : 1;
+    const descriptors = this.vaultEncryptionKeyDescriptors();
+    if (JSON.stringify(this.settings.vaultEncryptionKeyring ?? []) !== JSON.stringify(descriptors)) {
+      this.settings.vaultEncryptionKeyring = descriptors;
+      await this.saveSettings();
+    }
+    return loadVaultSyncCryptoKeyring({
+      activeKeyVersion,
+      descriptors,
+      secretStorage: this.app.secretStorage,
+    });
+  }
+
+  private rememberVaultEncryptionKey(descriptor: VaultSyncCryptoKeyDescriptor) {
+    this.settings.vaultEncryptionKeyring = addVaultSyncCryptoKeyDescriptor(
+      this.settings.vaultEncryptionKeyring,
+      descriptor,
+    );
+  }
+
   private async resetEnvironmentScopedCredentials() {
+    this.accountStatusRefreshGeneration += 1;
     if (this.settings.authSecretSuffix) {
       this.app.secretStorage.setSecret(this.pluginTokenSecretId(), "");
     }
     if (this.settings.vaultDeviceTokenSecretId) {
       this.app.secretStorage.setSecret(this.settings.vaultDeviceTokenSecretId, "");
+    }
+    if (this.settings.vaultEncryptionRotationSecretId
+      && this.settings.vaultEncryptionRotationSecretId !== this.settings.vaultEncryptionSecretId) {
+      this.app.secretStorage.setSecret(this.settings.vaultEncryptionRotationSecretId, "");
     }
     this.settings.userId = "";
     this.settings.syncTargetId = "";
@@ -806,6 +1401,15 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.accountPlanType = "free";
     this.settings.vaultDeviceTokenSecretId = "";
     this.settings.vaultDeviceId = "";
+    this.settings.vaultEncryptionRotationOperationId = "";
+    this.settings.vaultEncryptionRotationId = "";
+    this.settings.vaultEncryptionRotationSecretId = "";
+    this.settings.vaultEncryptionRotationSourceVersion = 0;
+    this.settings.vaultEncryptionRotationSourceSaltHex = "";
+    this.settings.vaultEncryptionRotationTargetVersion = 0;
+    this.settings.vaultEncryptionRotationTargetSaltHex = "";
+    this.vaultEncryptionRotationAvailable = false;
+    this.vaultEncryptionRotationStatus = "";
     this.settings.vaultSyncEnabled = false;
     this.settings.pendingDeviceCode = "";
     this.settings.pendingDeviceVerificationUri = "";
@@ -814,12 +1418,17 @@ export default class WeTongbuPlugin extends Plugin {
     this.accountPlanType = "free";
     this.accountCanVaultSync = false;
     this.accountLegacyFreeStorageCompat = false;
+    this.pendingV2DeletionReview = [];
+    this.pendingV2DeletionHandler = null;
+    this.pendingDeletionReviewNoticeKey = "";
+    this.pendingDeletionReviewNoticeSuppressedKey = "";
+    this.hidePendingDeletionReviewNotice();
     this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
     await this.saveSettings();
   }
 
   async logoutAccount(): Promise<{ remoteRevoked: boolean }> {
-    const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const token = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     let remoteRevoked = !token || !this.settings.syncTargetId;
     if (token && this.settings.syncTargetId) {
       const response = await requestUrl({
@@ -977,7 +1586,16 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.syncTargetName = targetName || this.settings.syncTargetName;
     if (recoveryToken) this.recoveryToken = recoveryToken;
     if (changed) {
+      // A Retry-After response belongs to the old API/target pair. Clear the
+      // in-memory timer and its persisted deadline before another target can
+      // reuse this plugin instance.
+      this.vaultSyncRetry?.clear();
       this.settings.vaultSyncEnabled = false;
+      this.pendingV2DeletionReview = [];
+      this.pendingV2DeletionHandler = null;
+      this.pendingDeletionReviewNoticeKey = "";
+      this.pendingDeletionReviewNoticeSuppressedKey = "";
+      this.hidePendingDeletionReviewNotice();
       this.settings.vaultDeviceTokenSecretId = "";
       this.settings.vaultDeviceId = "";
       this.vaultDeviceTokenCache = "";
@@ -1171,23 +1789,32 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async refreshAccountStatus() {
+    const refreshGeneration = ++this.accountStatusRefreshGeneration;
+    const previousViewState = JSON.stringify([
+      this.accountStatus,
+      this.accountLoggedIn,
+      this.accountCanVaultSync,
+      this.accountPlanType,
+      this.canHostImages,
+    ]);
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    if (!this.settings.syncTargetId || !token) {
-      this.accountLoggedIn = false;
-      this.accountPlanType = this.settings.accountPlanType = "free";
-      this.accountLegacyFreeStorageCompat = false;
-      this.accountCanVaultSync = false;
-      this.canHostImages = false;
-      this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
-      return;
-    }
     try {
+      if (!this.settings.syncTargetId || !token) {
+        this.accountLoggedIn = false;
+        this.accountPlanType = this.settings.accountPlanType = "free";
+        this.accountLegacyFreeStorageCompat = false;
+        this.accountCanVaultSync = false;
+        this.canHostImages = false;
+        this.accountStatus = "当前账号：未登录；登录后可使用多端同步";
+        return;
+      }
       const response = await requestUrl({
         url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/plugin/account`,
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
         throw: false,
       });
+      if (refreshGeneration !== this.accountStatusRefreshGeneration) return;
       if (response.status !== 200) {
         this.accountLoggedIn = false;
         this.accountPlanType = this.settings.accountPlanType = "free";
@@ -1215,9 +1842,23 @@ export default class WeTongbuPlugin extends Plugin {
         ? `当前账号：${account.email}，${plusActive ? "Plus" : "免费账号"}`
         : "当前账号：未登录；登录后可使用多端同步";
       await this.refreshImageDeliveryPreference(token);
+      if (refreshGeneration !== this.accountStatusRefreshGeneration) return;
       await this.saveSettings();
     } catch {
-      this.accountStatus = this.accountLoggedIn ? this.accountStatus : "当前账号：未登录；登录后可使用多端同步";
+      if (refreshGeneration === this.accountStatusRefreshGeneration) {
+        this.accountStatus = this.accountLoggedIn ? this.accountStatus : "当前账号：未登录；登录后可使用多端同步";
+      }
+    } finally {
+      const currentViewState = JSON.stringify([
+        this.accountStatus,
+        this.accountLoggedIn,
+        this.accountCanVaultSync,
+        this.accountPlanType,
+        this.canHostImages,
+      ]);
+      if (refreshGeneration === this.accountStatusRefreshGeneration && previousViewState !== currentViewState) {
+        this.settingTab?.refreshFromPlugin();
+      }
     }
   }
 
@@ -1282,22 +1923,41 @@ export default class WeTongbuPlugin extends Plugin {
       }
       throw new Error("请先连接当前 Vault");
     }
-    const remote = new VaultSyncRemoteClient({
+    const remote = createVaultSyncRemoteClient({
       apiBaseUrl: this.settings.apiBaseUrl,
       targetId: this.settings.syncTargetId,
       pluginToken,
     });
     const current = await remote.getStatus();
     const remoteEncryption = current.encryption;
+    if (enabled && remoteEncryption?.enabled && !remoteEncryption.salt_hex) {
+      throw Object.assign(new Error("云端 Vault 已启用加密，但没有返回有效盐值；已暂停同步以保护数据"), {
+        code: "encryption_key_material_mismatch",
+      });
+    }
     if (enabled && remoteEncryption?.enabled && remoteEncryption.salt_hex) {
+      assertVaultSyncEncryptionVersionCompatible({
+        remoteVersion: Number(remoteEncryption.version ?? 1),
+        localVersion: Number(this.settings.vaultEncryptionKeyVersion ?? 1),
+        remoteSaltHex: remoteEncryption.salt_hex,
+        localSaltHex: this.settings.vaultEncryptionSaltHex,
+        localCredentialConfigured: this.settings.vaultEncryptionEnabled && Boolean(this.settings.vaultEncryptionSecretId),
+      });
+      validateVaultSyncRemoteKeyVersionCatalog({
+        catalog: remoteEncryption.key_versions,
+        activeVersion: Number(remoteEncryption.version ?? 1),
+        activeSaltHex: remoteEncryption.salt_hex,
+        localDescriptors: this.vaultEncryptionKeyDescriptors(),
+      });
       this.settings.vaultEncryptionEnabled = true;
       this.settings.vaultEncryptionSaltHex = remoteEncryption.salt_hex;
+      this.settings.vaultEncryptionKeyVersion = Number(remoteEncryption.version ?? 1);
     }
     const result = await remote.enable(
       enabled,
       this.settings.vaultSyncScope,
       this.settings.vaultEncryptionEnabled
-        ? { enabled: true, saltHex: this.settings.vaultEncryptionSaltHex, version: 1 }
+        ? { enabled: true, saltHex: this.settings.vaultEncryptionSaltHex, version: this.settings.vaultEncryptionKeyVersion || 1 }
         : undefined,
     );
     this.settings.vaultSyncEnabled = result.enabled;
@@ -1315,38 +1975,398 @@ export default class WeTongbuPlugin extends Plugin {
     }
     await this.saveSettings();
     this.restartVaultSyncTimer();
+    this.requestAutomaticVaultSync();
+  }
+
+  async setVaultSyncScope(scope: VaultSyncScope) {
+    if (scope !== "whole_vault" && scope !== "root_folder") throw new Error("Vault 同步范围无效");
+    if (scope === this.settings.vaultSyncScope) return;
+    if (this.vaultSyncing || this.vaultSyncScopeChanging) {
+      throw new Error("当前 Vault 同步正在运行；完成后再更改同步范围");
+    }
+    if (scope === "root_folder" && !normalizeVaultPath(this.settings.rootFolder)) {
+      throw new Error("微同步目录无效或为空；请先设置有效目录，避免把整个 Vault 当作微同步范围");
+    }
+
+    this.vaultSyncScopeChanging = true;
+    const previousScope = this.settings.vaultSyncScope;
+    try {
+      await saveVaultSyncScopeAfterRemoteConfirmation(
+        this.settings,
+        scope,
+        async () => {
+          if (!this.settings.vaultSyncEnabled) return;
+          const pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+          if (!this.settings.syncTargetId || !pluginToken) throw new Error("请先连接当前 Vault 后再更改云端同步范围");
+          const remote = createVaultSyncRemoteClient({
+            apiBaseUrl: this.settings.apiBaseUrl,
+            targetId: this.settings.syncTargetId,
+            pluginToken,
+          });
+          const current = await remote.getStatus();
+          if (!current.enabled) throw new Error("云端 Vault 同步已关闭；请先重新连接后再更改范围");
+          const result = await remote.enable(true, scope);
+          if (!result.enabled || result.scope !== scope) throw new Error("云端没有确认新的 Vault 同步范围");
+        },
+        () => this.saveSettings(),
+      );
+    } finally {
+      this.vaultSyncScopeChanging = false;
+    }
+
+    this.stopVaultSyncV2Events();
+    if (previousScope === "whole_vault" && scope === "root_folder") {
+      new Notice("同步范围已缩小；范围外云端文件会保留，不会被当作删除同步", 10000);
+    } else if (previousScope === "root_folder" && scope === "whole_vault") {
+      new Notice("同步范围已扩大；下一轮快照会纳入整个 Vault", 8000);
+    }
+    if (this.settings.vaultSyncEnabled) void this.runVaultSync(false);
   }
 
   async enableVaultEncryption(passphrase: string) {
     if (passphrase.length < 8) throw new Error("Vault 加密密码至少需要 8 个字符");
-    const derived = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex || undefined);
     const secretId = this.settings.vaultEncryptionSecretId || `wetongbu-vault-encryption-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-    await this.app.secretStorage.setSecret(secretId, passphrase);
-    this.settings.vaultEncryptionEnabled = true;
-    this.settings.vaultEncryptionSecretId = secretId;
-    this.settings.vaultEncryptionSaltHex = derived.saltHex;
-    this.vaultEncryptionInput = "";
-    await this.saveSettings();
     const token = this.settings.syncTargetId
       ? this.app.secretStorage.getSecret(this.pluginTokenSecretId())
       : null;
     if (token && this.settings.syncTargetId) {
-      const remote = new VaultSyncRemoteClient({
+      const remote = createVaultSyncRemoteClient({
         apiBaseUrl: this.settings.apiBaseUrl,
         targetId: this.settings.syncTargetId,
         pluginToken: token,
       });
-      await remote.enable(this.settings.vaultSyncEnabled, this.settings.vaultSyncScope, {
-        enabled: true,
-        saltHex: derived.saltHex,
-        version: 1,
+      const current = await remote.getStatus();
+      if (current.encryption?.enabled) {
+        if (Number(current.encryption.version ?? 1) !== 1) {
+          throw Object.assign(new Error("云端 Vault 已进入新的加密密钥版本；此客户端尚未完成可恢复的轮换迁移，不能在此设备解锁"), {
+            code: "encryption_key_version_required",
+          });
+        }
+        if (!current.encryption.salt_hex) throw new Error("云端 Vault 缺少加密盐值，无法安全解锁");
+        assertVaultSyncEncryptionVersionCompatible({
+          remoteVersion: Number(current.encryption.version ?? 1),
+          localVersion: Number(this.settings.vaultEncryptionKeyVersion ?? 1),
+          remoteSaltHex: current.encryption.salt_hex,
+          localSaltHex: this.settings.vaultEncryptionSaltHex,
+          localCredentialConfigured: this.settings.vaultEncryptionEnabled && Boolean(this.settings.vaultEncryptionSecretId),
+        });
+        validateVaultSyncRemoteKeyVersionCatalog({
+          catalog: current.encryption.key_versions,
+          activeVersion: Number(current.encryption.version ?? 1),
+          activeSaltHex: current.encryption.salt_hex,
+          localDescriptors: this.vaultEncryptionKeyDescriptors(),
+        });
+        const existingPassphrase = this.settings.vaultEncryptionSecretId
+          ? await this.app.secretStorage.getSecret(this.settings.vaultEncryptionSecretId) : "";
+        assertVaultEncryptionCredentialChangeSafe({
+          currentVaultEncrypted: this.settings.vaultEncryptionEnabled,
+          storedPassphrase: existingPassphrase ?? "", submittedPassphrase: passphrase,
+        });
+        const derived = await createVaultSyncCrypto(passphrase, current.encryption.salt_hex, current.encryption.version);
+        await this.app.secretStorage.setSecret(secretId, passphrase);
+        this.settings.vaultEncryptionEnabled = true;
+        this.settings.vaultEncryptionSecretId = secretId;
+        this.settings.vaultEncryptionSaltHex = derived.saltHex;
+        this.settings.vaultEncryptionKeyVersion = Number(current.encryption.version ?? 1);
+        this.rememberVaultEncryptionKey({
+          keyVersion: this.settings.vaultEncryptionKeyVersion,
+          saltHex: derived.saltHex,
+          secretId,
+        });
+        this.vaultEncryptionInput = "";
+        await this.saveSettings();
+        return;
+      }
+
+      const derived = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex || undefined, 1);
+      const result = await remote.enable(this.settings.vaultSyncEnabled, this.settings.vaultSyncScope, {
+        enabled: true, saltHex: derived.saltHex, version: 1,
+      });
+      if (!result.encryption?.enabled || result.encryption.version !== 1
+        || result.encryption.saltHex?.toLowerCase() !== derived.saltHex.toLowerCase()) {
+        throw new Error("服务端没有确认当前 Vault 加密参数；本设备密码未更换");
+      }
+      await this.app.secretStorage.setSecret(secretId, passphrase);
+      this.settings.vaultEncryptionEnabled = true;
+      this.settings.vaultEncryptionSecretId = secretId;
+      this.settings.vaultEncryptionSaltHex = derived.saltHex;
+      this.settings.vaultEncryptionKeyVersion = 1;
+      this.rememberVaultEncryptionKey({ keyVersion: 1, saltHex: derived.saltHex, secretId });
+      this.vaultEncryptionInput = "";
+      await this.saveSettings();
+      return;
+    }
+
+    if (this.settings.vaultEncryptionEnabled) {
+      const existingPassphrase = this.settings.vaultEncryptionSecretId
+        ? await this.app.secretStorage.getSecret(this.settings.vaultEncryptionSecretId) : "";
+      assertVaultEncryptionCredentialChangeSafe({
+        currentVaultEncrypted: true, storedPassphrase: existingPassphrase ?? "", submittedPassphrase: passphrase,
       });
     }
+    const derived = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex || undefined, 1);
+    await this.app.secretStorage.setSecret(secretId, passphrase);
+    this.settings.vaultEncryptionEnabled = true;
+    this.settings.vaultEncryptionSecretId = secretId;
+    this.settings.vaultEncryptionSaltHex = derived.saltHex;
+    this.settings.vaultEncryptionKeyVersion = 1;
+    this.rememberVaultEncryptionKey({ keyVersion: 1, saltHex: derived.saltHex, secretId });
+    this.vaultEncryptionInput = "";
+    await this.saveSettings();
   }
 
   async disableVaultEncryption() {
     this.settings.vaultEncryptionEnabled = false;
     await this.saveSettings();
+  }
+
+  private hasPendingVaultEncryptionRotation() {
+    return Boolean(this.settings.vaultEncryptionRotationOperationId
+      || this.settings.vaultEncryptionRotationId
+      || this.settings.vaultEncryptionRotationSecretId);
+  }
+
+  private clearVaultEncryptionRotationIntent() {
+    this.settings.vaultEncryptionRotationOperationId = "";
+    this.settings.vaultEncryptionRotationId = "";
+    this.settings.vaultEncryptionRotationSecretId = "";
+    this.settings.vaultEncryptionRotationSourceVersion = 0;
+    this.settings.vaultEncryptionRotationSourceSaltHex = "";
+    this.settings.vaultEncryptionRotationTargetVersion = 0;
+    this.settings.vaultEncryptionRotationTargetSaltHex = "";
+  }
+
+  async refreshVaultEncryptionRotationAvailability(force = false): Promise<boolean> {
+    if (!this.settings.vaultEncryptionEnabled || !this.settings.vaultSyncEnabled
+      || !this.settings.syncTargetId || !this.settings.vaultDeviceId
+      || !this.accountLoggedIn) {
+      this.vaultEncryptionRotationAvailable = false;
+      return false;
+    }
+    const now = Date.now();
+    if (!force && now - this.vaultEncryptionRotationCapabilitiesFetchedAt < 30_000) {
+      return this.vaultEncryptionRotationAvailable;
+    }
+    if (this.vaultEncryptionRotationCapabilitiesRequest) return this.vaultEncryptionRotationCapabilitiesRequest;
+    const request = (async () => {
+      const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+      if (!pluginToken) return false;
+      const remote = createVaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId: this.settings.syncTargetId,
+        pluginToken,
+      });
+      const capabilities = await remote.getCapabilities();
+      return capabilities.supportedFeatures.includes("encryption_key_rotation");
+    })();
+    this.vaultEncryptionRotationCapabilitiesRequest = request;
+    try {
+      const previous = this.vaultEncryptionRotationAvailable;
+      this.vaultEncryptionRotationAvailable = await request;
+      this.vaultEncryptionRotationCapabilitiesFetchedAt = Date.now();
+      if (previous !== this.vaultEncryptionRotationAvailable) this.settingTab?.refreshFromPlugin();
+      return this.vaultEncryptionRotationAvailable;
+    } catch {
+      this.vaultEncryptionRotationAvailable = false;
+      this.vaultEncryptionRotationCapabilitiesFetchedAt = Date.now();
+      return false;
+    } finally {
+      if (this.vaultEncryptionRotationCapabilitiesRequest === request) {
+        this.vaultEncryptionRotationCapabilitiesRequest = null;
+      }
+    }
+  }
+
+  async rotateVaultEncryptionKey(passphrase: string): Promise<{ completed: boolean; remainingSourceObjects: string }> {
+    if (this.vaultEncryptionRotationRunning) throw new Error("Vault 密钥迁移正在运行");
+    if (this.vaultSyncing) throw new Error("请等待当前 Vault 同步完成，再开始密钥迁移");
+    if (!this.settings.vaultSyncEnabled || !this.settings.vaultEncryptionEnabled) {
+      throw new Error("请先开启 Vault 同步和端到端加密");
+    }
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
+      ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) : "");
+    if (!pluginToken || !deviceToken || !this.settings.syncTargetId || !this.settings.vaultDeviceId) {
+      throw new Error("请先完成账号登录并在此设备同步当前 Vault");
+    }
+    const remote = createVaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+      deviceToken,
+    });
+    const capabilities = await remote.getCapabilities();
+    const pending = this.hasPendingVaultEncryptionRotation();
+    if (!pending && !capabilities.supportedFeatures.includes("encryption_key_rotation")) {
+      throw new Error("服务端尚未为此 Vault 开放密钥迁移");
+    }
+    const status = await remote.getStatus();
+    const activeVersion = Number(this.settings.vaultEncryptionKeyVersion || 1);
+    let sourceVersion = pending ? this.settings.vaultEncryptionRotationSourceVersion : activeVersion;
+    let sourceSaltHex = (pending ? this.settings.vaultEncryptionRotationSourceSaltHex : this.settings.vaultEncryptionSaltHex).toLowerCase();
+    let targetVersion = this.settings.vaultEncryptionRotationTargetVersion;
+    let targetSaltHex = this.settings.vaultEncryptionRotationTargetSaltHex.toLowerCase();
+    const serverVersion = Number(status.encryption?.version ?? 0);
+    const serverSaltHex = status.encryption?.salt_hex?.toLowerCase();
+    const serverStillUsesSource = serverVersion === sourceVersion && serverSaltHex === sourceSaltHex;
+    const serverAlreadyActivatedTarget = pending && serverVersion === targetVersion && serverSaltHex === targetSaltHex;
+    if (!status.encryption?.enabled || (!serverStillUsesSource && !serverAlreadyActivatedTarget)) {
+      throw new Error("云端当前加密版本与本机不一致；请先刷新 Vault 状态并解锁当前密钥");
+    }
+
+    if (!pending) {
+      const newPassphrase = passphrase.trim();
+      if (newPassphrase.length < 8) throw new Error("新密码至少需要 8 个字符");
+      const newTargetVersion = activeVersion + 1;
+      const targetCrypto = await createVaultSyncCrypto(newPassphrase, undefined, newTargetVersion);
+      const targetSecretId = `wetongbu-vault-rotation-${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      this.settings.vaultEncryptionRotationOperationId = crypto.randomUUID();
+      this.settings.vaultEncryptionRotationId = "";
+      this.settings.vaultEncryptionRotationSecretId = targetSecretId;
+      this.settings.vaultEncryptionRotationSourceVersion = activeVersion;
+      this.settings.vaultEncryptionRotationSourceSaltHex = this.settings.vaultEncryptionSaltHex.toLowerCase();
+      this.settings.vaultEncryptionRotationTargetVersion = newTargetVersion;
+      this.settings.vaultEncryptionRotationTargetSaltHex = targetCrypto.saltHex;
+      sourceVersion = activeVersion;
+      sourceSaltHex = this.settings.vaultEncryptionSaltHex.toLowerCase();
+      targetVersion = newTargetVersion;
+      targetSaltHex = targetCrypto.saltHex.toLowerCase();
+      this.app.secretStorage.setSecret(targetSecretId, newPassphrase);
+      await this.saveSettings();
+      this.vaultEncryptionRotationInput = "";
+    }
+
+    const targetSecretId = this.settings.vaultEncryptionRotationSecretId;
+    const targetPassphrase = targetSecretId ? await this.app.secretStorage.getSecret(targetSecretId) : "";
+    if (!this.settings.vaultEncryptionRotationOperationId || !targetSecretId || !targetPassphrase
+      || !sourceVersion || !sourceSaltHex || targetVersion !== sourceVersion + 1 || !targetSaltHex) {
+      throw new Error("本机没有完整的密钥迁移凭据；保留现有数据并重新输入迁移密码");
+    }
+    const sourceKeyring = await loadVaultSyncCryptoKeyring({
+      activeKeyVersion: sourceVersion,
+      descriptors: this.vaultEncryptionKeyDescriptors(),
+      secretStorage: this.app.secretStorage,
+    });
+    if (sourceKeyring.active.saltHex.toLowerCase() !== sourceSaltHex) {
+      throw new Error("当前 Vault 密钥与已保存的迁移源版本不一致");
+    }
+    const targetCrypto = await createVaultSyncCrypto(targetPassphrase, targetSaltHex, targetVersion);
+    if (targetCrypto.saltHex.toLowerCase() !== targetSaltHex) throw new Error("新密钥材料与本机迁移记录不一致");
+
+    let rotation;
+    if (this.settings.vaultEncryptionRotationId) {
+      rotation = await remote.getEncryptionKeyRotation(this.settings.vaultEncryptionRotationId);
+    } else {
+      rotation = await remote.startEncryptionKeyRotation({
+        operationId: this.settings.vaultEncryptionRotationOperationId,
+        sourceKeyVersion: sourceVersion,
+        sourceSaltHex,
+        targetKeyVersion: targetVersion,
+        targetSaltHex,
+      });
+      this.settings.vaultEncryptionRotationId = rotation.rotationId;
+      await this.saveSettings();
+    }
+    if (rotation.operationId.toLowerCase() !== this.settings.vaultEncryptionRotationOperationId.toLowerCase()
+      || rotation.sourceKeyVersion !== sourceVersion || rotation.sourceSaltHex.toLowerCase() !== sourceSaltHex
+      || rotation.targetKeyVersion !== targetVersion || rotation.targetSaltHex.toLowerCase() !== targetSaltHex) {
+      throw new Error("服务端密钥迁移任务与本机保存的凭据不一致；已暂停以保护 Vault");
+    }
+    const identity: VaultSyncKeyRotationIdentity = {
+      apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+      targetId: this.settings.syncTargetId,
+      deviceId: this.settings.vaultDeviceId,
+      protocolEpoch: capabilities.protocolEpoch,
+      encryptionDomainId: rotation.encryptionDomainId,
+    };
+    const store = createVaultSyncKeyRotationStore(this.app, identity);
+    this.vaultEncryptionRotationRunning = true;
+    this.vaultSyncing = true;
+    this.vaultEncryptionRotationStatus = `正在迁移 ${rotation.completedObjects} / ${rotation.totalObjects} 个对象…`;
+    try {
+      const result = await runVaultSyncKeyRotation({
+        remote,
+        requestObject: async (input) => {
+          const response = await requestUrl({
+            url: input.url, method: input.method, body: input.body, throw: false,
+          });
+          return { status: response.status, headers: response.headers, arrayBuffer: response.arrayBuffer };
+        },
+        store,
+        rotation,
+        sourceKeyring: sourceKeyring.keyring,
+        targetCrypto,
+        onProgress: (progress) => {
+          this.vaultEncryptionRotationStatus = `已迁移 ${progress.completedObjects} / ${progress.totalObjects} 个对象；处理字节 ${progress.completedSourceBytes} / ${progress.totalSourceBytes}`;
+          this.settingTab?.refreshFromPlugin();
+        },
+        onActivated: async (activated) => {
+          this.rememberVaultEncryptionKey({
+            keyVersion: activated.targetKeyVersion,
+            saltHex: activated.targetSaltHex,
+            secretId: targetSecretId,
+          });
+          this.settings.vaultEncryptionEnabled = true;
+          this.settings.vaultEncryptionKeyVersion = activated.targetKeyVersion;
+          this.settings.vaultEncryptionSaltHex = activated.targetSaltHex;
+          this.settings.vaultEncryptionSecretId = targetSecretId;
+          await this.saveSettings();
+        },
+      });
+      if (result.completed) {
+        this.clearVaultEncryptionRotationIntent();
+        this.vaultEncryptionRotationStatus = "密钥迁移完成；所有旧对象已安全清理";
+        await this.saveSettings();
+      } else {
+        this.vaultEncryptionRotationStatus = `新密钥已启用；等待下载 lease 到期后清理 ${result.remainingSourceObjects} 个旧对象，稍后可继续`;
+      }
+      return { completed: result.completed, remainingSourceObjects: result.remainingSourceObjects };
+    } finally {
+      this.vaultEncryptionRotationRunning = false;
+      this.vaultSyncing = false;
+      this.settingTab?.refreshFromPlugin();
+      this.requestAutomaticVaultSync();
+    }
+  }
+
+  async abortVaultEncryptionKeyRotation() {
+    if (!this.settings.vaultEncryptionRotationId) throw new Error("当前没有可中止的服务端密钥迁移");
+    if (this.vaultEncryptionRotationRunning || this.vaultSyncing) throw new Error("当前 Vault 操作正在运行，请稍后再试");
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
+      ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) : "");
+    if (!pluginToken || !deviceToken || !this.settings.syncTargetId || !this.settings.vaultDeviceId) {
+      throw new Error("请先登录并在发起迁移的设备上恢复当前 Vault");
+    }
+    const remote = createVaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+      deviceToken,
+    });
+    const current = await remote.getEncryptionKeyRotation(this.settings.vaultEncryptionRotationId);
+    if (["activation_unknown", "activated", "complete"].includes(current.status)) {
+      throw new Error("服务端密钥已激活或正在确认激活结果，不能回退；请继续迁移完成旧对象清理");
+    }
+    await remote.abortEncryptionKeyRotation(current.rotationId);
+    const capabilities = await remote.getCapabilities();
+    const identity: VaultSyncKeyRotationIdentity = {
+      apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+      targetId: this.settings.syncTargetId,
+      deviceId: this.settings.vaultDeviceId,
+      protocolEpoch: capabilities.protocolEpoch,
+      encryptionDomainId: current.encryptionDomainId,
+    };
+    const checkpointStore = createVaultSyncKeyRotationStore(this.app, identity);
+    if (await checkpointStore.load()) await checkpointStore.markAborted({ rotationId: current.rotationId });
+    const pendingSecretId = this.settings.vaultEncryptionRotationSecretId;
+    if (pendingSecretId && pendingSecretId !== this.settings.vaultEncryptionSecretId) {
+      this.app.secretStorage.setSecret(pendingSecretId, "");
+    }
+    this.clearVaultEncryptionRotationIntent();
+    this.vaultEncryptionRotationStatus = "密钥迁移已中止，旧密钥和旧对象保持可用";
+    await this.saveSettings();
+    this.settingTab?.refreshFromPlugin();
   }
 
   openPromotionCenter() {
@@ -1499,7 +2519,7 @@ export default class WeTongbuPlugin extends Plugin {
           || (this.settings.vaultDeviceTokenSecretId
             ? (await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) ?? "")
             : "");
-        const registerRemote = new VaultSyncRemoteClient({
+        const registerRemote = createVaultSyncRemoteClient({
           apiBaseUrl: this.settings.apiBaseUrl,
           targetId: this.settings.syncTargetId,
           pluginToken,
@@ -1515,7 +2535,7 @@ export default class WeTongbuPlugin extends Plugin {
           this.vaultDeviceTokenCache = deviceToken;
           await this.saveSettings();
         }
-        const remote = new VaultSyncRemoteClient({
+        const remote = createVaultSyncRemoteClient({
           apiBaseUrl: this.settings.apiBaseUrl,
           targetId: this.settings.syncTargetId,
           pluginToken,
@@ -1637,9 +2657,84 @@ export default class WeTongbuPlugin extends Plugin {
    * quiet=true 时静默；false 时弹 Notice。
    * 前置条件：vaultSyncEnabled + 已注册（syncTargetId）+ 已登录且有云端同步权益。
    */
-  async runVaultSync(quiet = false, deletionResolution?: DeletionResolution) {
+  async runVaultSync(
+    quiet = false,
+    deletionResolution?: DeletionResolution,
+    diagnosticsContext?: { queueWaitMs?: number; activeQueueWaitMs?: number; auditBatchSize?: number },
+  ) {
+    if (!this.vaultSyncLifecycleActive) return;
+    if (!this.vaultSyncWriteRecoveryReady) {
+      this.vaultSyncEventPending = true;
+      if (!quiet) new Notice("Vault 正在检查本地写入恢复，请稍后再同步", 8000);
+      return;
+    }
+    if (this.vaultSyncWriteRecoveryBlocked) {
+      if (!quiet) {
+        const paths = this.vaultSyncWriteRecoveryBlockedPaths.slice(0, 3).join("、");
+        new Notice(`笔记写入中断现场尚未处理，Vault 同步仍暂停；请先检查 ${paths} 并重载 Obsidian`, 12000);
+      }
+      return;
+    }
+    const lifecycleGeneration = this.vaultSyncLifecycleGeneration;
+    const queuedBehindOtherWork = vaultSyncObjectWorkGate.active || vaultSyncObjectWorkGate.queuedCount > 0;
+    if (queuedBehindOtherWork && !quiet) {
+      new Notice("已有 Vault 操作正在运行；本次同步检查已排队，当前操作结束后会继续", 8000);
+    }
+    await vaultSyncObjectWorkGate.runQueued(() => {
+      if (!this.vaultSyncLifecycleActive || lifecycleGeneration !== this.vaultSyncLifecycleGeneration) {
+        return Promise.resolve();
+      }
+      return this.runVaultSyncUnderObjectWorkGate(quiet, deletionResolution, diagnosticsContext);
+    });
+    if (!this.vaultSyncLifecycleActive || lifecycleGeneration !== this.vaultSyncLifecycleGeneration) return;
+    if (shouldSchedulePendingVaultSyncRetry(
+      this.app,
+      this.vaultSyncEventPending,
+      [...this.vaultSyncEditorDeferredPaths],
+    ) && this.settings.vaultSyncEnabled && this.settings.syncTargetId
+      && this.accountLoggedIn && this.accountCanVaultSync && !this.vaultSyncScopeChanging
+      && this.vaultSyncPathIntentWrites === 0 && !this.vaultSyncPathIntentFailure
+      && !(typeof document !== "undefined" && document.hidden)
+      && !(typeof navigator !== "undefined" && !navigator.onLine)) {
+      this.requestAutomaticVaultSync();
+    }
+  }
+
+  private async runVaultSyncUnderObjectWorkGate(
+    quiet = false,
+    deletionResolution?: DeletionResolution,
+    diagnosticsContext?: { queueWaitMs?: number; activeQueueWaitMs?: number; auditBatchSize?: number },
+  ) {
     if (!this.settings.vaultSyncEnabled) return;
     if (!this.settings.syncTargetId) return;
+    if (this.vaultSyncScopeChanging) {
+      this.vaultSyncEventPending = true;
+      return;
+    }
+    if (quiet && typeof document !== "undefined" && document.hidden) {
+      this.vaultSyncEventPending = true;
+      this.vaultSyncEventScheduler?.pause();
+      this.vaultSyncRetry?.pause();
+      return;
+    }
+    if (quiet && typeof navigator !== "undefined" && !navigator.onLine) {
+      this.vaultSyncEventPending = true;
+      this.vaultSyncEventScheduler?.pause();
+      this.vaultSyncRetry?.pause();
+      return;
+    }
+    if (this.vaultSyncPathIntentWrites > 0) {
+      if (!quiet) new Notice("本机文件改名正在安全登记；请稍后重试同步", 8000);
+      return;
+    }
+    if (this.vaultSyncPathIntentFailure) {
+      if (!quiet) new Notice("本地改名待办没有安全保存；请先重载 Obsidian 后检查 Vault 再同步", 12000);
+      return;
+    }
+    if (this.vaultSyncProtocolUpgradeTargetKey === this.currentVaultSyncProtocolTargetKey()) {
+      if (!quiet) new Notice("此 Vault 需要更新 Obsidian 插件后才能继续同步", 12000);
+      return;
+    }
     // Refresh server-side entitlement before a background run so expiry and
     // future free-sync rollouts are reflected without restarting Obsidian.
     await this.refreshAccountStatus();
@@ -1660,8 +2755,25 @@ export default class WeTongbuPlugin extends Plugin {
       if (!quiet) new Notice("Vault 同步正在运行");
       return;
     }
+    this.vaultSyncEventPending = false;
+    this.vaultSyncEditorDeferredPaths.clear();
     this.vaultSyncing = true;
+    const diagnosticClock = () => globalThis.performance?.now?.() ?? Date.now();
+    const diagnosticStartedAt = diagnosticClock();
+    let diagnosticProtocol: VaultSyncDiagnosticProtocol = "v1";
+    let diagnosticOutcome: VaultSyncDiagnosticOutcome = "paused";
+    let diagnosticFailureCode: string | undefined;
+    let diagnosticStage: VaultSyncDiagnosticStage = "device_auth";
+    let diagnosticPullMs: number | undefined;
+    let diagnosticPushMs: number | undefined;
+    let diagnosticQueueWaitMs = diagnosticsContext?.queueWaitMs;
+    let diagnosticActiveQueueWaitMs = diagnosticsContext?.activeQueueWaitMs;
+    let diagnosticV2Journal: ReturnType<typeof createVaultSyncOutboxStore> | null = null;
+    let diagnosticWork: VaultSyncDiagnosticWorkSummary | undefined;
+    let initializationLeaseKeeper: ReturnType<typeof createVaultSyncInitializationLeaseKeeper> | null = null;
+    this.stopVaultSyncV2Events();
     try {
+      diagnosticStage = "device_auth";
       const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
       if (!pluginToken) throw new Error("Vault 连接已失效，请重新连接");
 
@@ -1671,7 +2783,7 @@ export default class WeTongbuPlugin extends Plugin {
           ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId)
           : "");
       if (!deviceToken) {
-        const remote = new VaultSyncRemoteClient({
+        const remote = createVaultSyncRemoteClient({
           apiBaseUrl: this.settings.apiBaseUrl,
           targetId: this.settings.syncTargetId,
           pluginToken,
@@ -1687,25 +2799,48 @@ export default class WeTongbuPlugin extends Plugin {
       }
 
       // 构造 remote 客户端（先建，Pro storage 需要它注入 prepare 回调）。
-      const remote = new VaultSyncRemoteClient({
+      const remote = createVaultSyncRemoteClient({
         apiBaseUrl: this.settings.apiBaseUrl,
         targetId: this.settings.syncTargetId,
         pluginToken,
         deviceToken,
+        onAppliedLatencyMs: (durationMs) => this.vaultSyncDiagnostics.recordAppliedLatency(durationMs),
       });
+      diagnosticStage = "remote_status";
       const status = await remote.getStatus();
       if (status.can_sync === false || status.storage_type !== "hosted_s3") {
         throw new Error("当前账号的云端同步存储未就绪，请刷新账号状态后重试");
       }
+      if (status.encryption?.enabled && !status.encryption.salt_hex) {
+        throw Object.assign(new Error("云端 Vault 已启用加密，但没有返回有效盐值；已暂停同步以保护数据"), {
+          code: "encryption_key_material_mismatch",
+        });
+      }
       if (status.storage_switch_state && status.storage_switch_state !== "active") {
+        diagnosticFailureCode = "storage_switch_in_progress";
         this.storageStatus = "云端同步存储正在切换，Vault 同步已暂停，请稍后重试";
         this.vaultSyncRetry?.clear();
         if (!quiet) new Notice(this.storageStatus, 10000);
         return;
       }
       if (status.encryption?.enabled && status.encryption.salt_hex) {
+        diagnosticStage = "encryption_setup";
+        assertVaultSyncEncryptionVersionCompatible({
+          remoteVersion: Number(status.encryption.version ?? 1),
+          localVersion: Number(this.settings.vaultEncryptionKeyVersion ?? 1),
+          remoteSaltHex: status.encryption.salt_hex,
+          localSaltHex: this.settings.vaultEncryptionSaltHex,
+          localCredentialConfigured: this.settings.vaultEncryptionEnabled && Boolean(this.settings.vaultEncryptionSecretId),
+        });
+        validateVaultSyncRemoteKeyVersionCatalog({
+          catalog: status.encryption.key_versions,
+          activeVersion: Number(status.encryption.version ?? 1),
+          activeSaltHex: status.encryption.salt_hex,
+          localDescriptors: this.vaultEncryptionKeyDescriptors(),
+        });
         this.settings.vaultEncryptionEnabled = true;
         this.settings.vaultEncryptionSaltHex = status.encryption.salt_hex;
+        this.settings.vaultEncryptionKeyVersion = Number(status.encryption.version ?? 1);
         await this.saveSettings();
       }
 
@@ -1724,14 +2859,460 @@ export default class WeTongbuPlugin extends Plugin {
         verifyHash: !this.settings.vaultEncryptionEnabled,
       });
 
+      let vaultCrypto: VaultSyncCrypto | undefined;
+      let vaultCryptoKeyring: VaultSyncCryptoKeyring | undefined;
+      diagnosticStage = "encryption_setup";
       if (this.settings.vaultEncryptionEnabled) {
-        const passphrase = this.settings.vaultEncryptionSecretId
-          ? await this.app.secretStorage.getSecret(this.settings.vaultEncryptionSecretId)
-          : "";
-        if (!passphrase) throw new Error("缺少 Vault 加密密码，请在当前设备输入并启用端到端加密");
-        const vaultCrypto = await createVaultSyncCrypto(passphrase, this.settings.vaultEncryptionSaltHex);
+        const context = await this.loadVaultSyncCryptoContext();
+        if (!context) throw new Error("Vault 加密密钥尚未加载");
+        vaultCrypto = context.active;
+        vaultCryptoKeyring = context.keyring;
         storage = createEncryptedVaultStorage(storage, vaultCrypto);
       }
+
+      let capabilities: Awaited<ReturnType<VaultSyncRemoteClient["getCapabilities"]>> | null = null;
+      try {
+        diagnosticStage = "capability_read";
+        capabilities = await remote.getCapabilities();
+      } catch (error: any) {
+        // Keep older API deployments usable until their capability route is upgraded.
+        // All non-404 failures still stop the run instead of silently changing protocol.
+        if (error?.status !== 404) throw error;
+      }
+      diagnosticProtocol = capabilities?.activeProtocolVersion === 2 ? "v2" : "v1";
+      diagnosticStage = "local_prepare";
+      if (capabilities?.activeProtocolVersion === 2 && !capabilities.canRead) {
+        throw Object.assign(new Error("服务端已切换到 Vault 同步 v2，但当前设备没有读取权限；为保护本地数据，已暂停同步"), {
+          code: "vault_sync_v2_read_unavailable",
+        });
+      }
+      let configuredScope: VaultSyncScope = this.settings.vaultSyncScope === "root_folder" ? "root_folder" : "whole_vault";
+      if (capabilities?.activeProtocolVersion === 2 && capabilities.scopePolicy
+        && capabilities.scopePolicy.scope !== configuredScope) {
+        // Scope mode is target-wide. Another device may have changed it; follow
+        // the server policy locally, then force a snapshot below before writing.
+        const remoteScope = capabilities.scopePolicy.scope;
+        if (remoteScope !== "whole_vault" && remoteScope !== "root_folder") {
+          throw Object.assign(new Error("服务端返回未知的 Vault 同步范围；已暂停以避免误应用文件"), {
+            code: "vault_sync_v2_scope_invalid",
+          });
+        }
+        configuredScope = remoteScope;
+        this.settings.vaultSyncScope = configuredScope;
+        await this.saveSettings();
+        this.stopVaultSyncV2Events();
+        if (!quiet) new Notice("Vault 同步范围已在另一台设备更新；本机已跟随云端策略并将重建快照", 10000);
+      }
+      if (capabilities?.activeProtocolVersion === 2 && capabilities.canRead && capabilities.baselineReady) {
+        this.pendingDeletionReview = null;
+        const deviceId = this.settings.vaultDeviceId || this.settings.vaultInstallationId;
+        const identity: VaultSyncV2Identity = {
+          apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+          targetId: this.settings.syncTargetId,
+          deviceId,
+          protocolEpoch: capabilities.protocolEpoch,
+        };
+        const rootFolder = configuredScope === "root_folder" ? normalizeVaultPath(this.settings.rootFolder) ?? "" : "";
+        if (configuredScope === "root_folder" && !rootFolder) {
+          throw Object.assign(new Error("微同步目录无效或为空；已暂停同步，避免把整个 Vault 当作范围"), {
+            code: "vault_sync_scope_root_invalid",
+          });
+        }
+        const scopeSelection = {
+          scope: configuredScope,
+          rootFolder,
+          scopeVersion: capabilities.scopePolicy.version,
+        } as const;
+        const scopeState = createVaultSyncScopeStateStore(this.app, identity);
+        const savedScope = await scopeState.load();
+        let forceScopeSnapshot = !savedScope
+          || savedScope.scope !== scopeSelection.scope
+          || savedScope.rootFolder !== scopeSelection.rootFolder
+          || savedScope.scopeVersion !== scopeSelection.scopeVersion;
+        const bootstrapCollisionCopies: string[] = [];
+        let initializationLeaseId: string | null = null;
+        if (capabilities.canWrite && capabilities.supportedFeatures.includes("initialization_lease")) {
+          const initialization = await remote.claimV2Initialization(capabilities.protocolEpoch);
+          if (initialization.scope !== scopeSelection.scope || initialization.scopeVersion !== scopeSelection.scopeVersion) {
+            throw Object.assign(new Error("Vault 同步范围在初始化期间发生变化；已暂停同步并要求重新读取能力"), {
+              code: "initialization_scope_changed",
+            });
+          }
+          if (initialization.status === "waiting") {
+            diagnosticOutcome = "incomplete";
+            diagnosticFailureCode = "vault_sync_initialization_waiting";
+            this.lastSafeErrorCode = diagnosticFailureCode;
+            this.vaultSyncRetry?.scheduleRetry();
+            if (!quiet) new Notice(`另一台设备正在建立 Vault 初始基线；本机文件已保留，将在稍后继续（租约至 ${new Date(initialization.leaseExpiresAt).toLocaleTimeString()}）`, 12000);
+            return;
+          }
+          if (initialization.status === "owner") {
+            initializationLeaseId = initialization.leaseId;
+            initializationLeaseKeeper = createVaultSyncInitializationLeaseKeeper({
+              protocolEpoch: capabilities.protocolEpoch,
+              scope: scopeSelection.scope,
+              scopeVersion: scopeSelection.scopeVersion,
+              leaseId: initialization.leaseId,
+              leaseExpiresAt: initialization.leaseExpiresAt,
+              claimInitialization: (protocolEpoch) => remote.claimV2Initialization(protocolEpoch),
+            });
+            forceScopeSnapshot = forceScopeSnapshot || initialization.requiresSnapshot;
+          }
+        }
+        await archiveLegacyPrevSyncStateForV2(this.app, identity);
+        const journal = createVaultSyncOutboxStore(this.app, identity);
+        diagnosticV2Journal = journal;
+        diagnosticWork = {};
+        const pathIntents = createVaultSyncPathIntentStore(this.app, {
+          apiBaseUrl: identity.apiBaseUrl, targetId: identity.targetId, installationId: this.settings.vaultInstallationId,
+        });
+        const baseline = createVaultSyncV2BaselineStore(this.app, identity);
+        const baseContent = createVaultSyncV2BaseContentStore(this.app, identity, vaultCryptoKeyring ?? vaultCrypto);
+        const staging = createVaultSyncV2SnapshotStageStore(this.app, identity);
+        const objectTransport = createV2HostedObjectTransport(remote, async (input) => {
+          const response = await requestUrl({
+            url: input.url,
+            method: input.method,
+            headers: input.headers,
+            body: input.body,
+            throw: false,
+          });
+          return { status: response.status, headers: response.headers, arrayBuffer: response.arrayBuffer };
+        }, vaultCryptoKeyring ?? vaultCrypto, { downloadStage: createVaultSyncV2DownloadStageStore(this.app, identity) });
+        const pluginApp = this.app;
+        const pull = createVaultSyncV2PullEngine({
+          remote, journal, staging,
+          snapshotApplyLeaseEnabled: capabilities.supportedFeatures.includes("snapshot_apply_lease"),
+          apply: {
+          app: pluginApp, identity, baseline, baseContent, pathIntents, rootFolder,
+          allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+          autoMergeEnabled: this.settings.vaultSyncMergeMode === "automatic",
+          preserveUntrackedSnapshotCollisions: !savedScope,
+          onBootstrapCollisionPreserved: (_sourcePath, copyPath) => bootstrapCollisionCopies.push(copyPath),
+          deleteMode: this.settings.vaultSyncDeleteMode,
+          deleteSafetyEnabled: this.settings.vaultSafetyEnabled,
+          deleteSafetyRatio: this.settings.vaultSafetyRatio,
+          trashLocalFile: (file) => this.trashRemoteVaultFile(file),
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+          renameFileAndUpdateLinks: (file, path) => this.renameRemoteVaultFileAndUpdateLinks(file, path),
+            async downloadToStage(item) {
+              const content = item.content;
+              if (!content || content.kind !== "object" || content.byteSize < VAULT_SYNC_DOWNLOAD_RANGE_BYTES
+                || !(vaultCryptoKeyring || vaultCrypto)
+                || typeof (pluginApp.vault.adapter as any).appendBinary !== "function") return null;
+              return downloadVaultSyncV2ToVerifiedStage(pluginApp, identity, {
+                objectId: content.objectId,
+                ciphertextHash: content.ciphertextHash,
+                maxPlaintextBytes: VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
+              }, (writePlaintextChunk) => objectTransport.downloadChunkedToSink(
+                content, undefined, writePlaintextChunk,
+              ));
+            },
+            async download(item) {
+              const content = item.content;
+              if (!content) throw Object.assign(new Error("远端版本缺少内容对象"), { code: "content_object_unavailable" });
+              if (content.kind === "legacy") {
+                if (!content.contentHash) throw Object.assign(new Error("旧版对象缺少内容摘要"), { code: "content_object_unavailable" });
+                return storage.get(content.contentHash);
+              }
+              const downloaded = await objectTransport.download({ reservationId: "", ...content });
+              return downloaded.plaintext;
+            },
+          },
+        });
+        diagnosticStage = "pull";
+        const pullStartedAt = diagnosticClock();
+        let pullHasUnresolvedConflict = false;
+        let unresolvedPullConflictCount = 0;
+        let pullDeferredPaths: string[] = [];
+        const pullResult = await pull.runOnce({ forceSnapshot: forceScopeSnapshot });
+        diagnosticPullMs = diagnosticClock() - pullStartedAt;
+        const pullDisposition = classifyVaultSyncV2PullResult(pullResult);
+        if (pullDisposition === "resolve_conflict") {
+          const deferredPaths = (pullResult.deferredPaths ?? []).map(normalizeVaultPath)
+            .filter((path): path is string => typeof path === "string");
+          const unresolvedConflictCount = Math.max(0, pullResult.blocked - deferredPaths.length);
+          const canPushIndependentFiles = canPushIndependentFilesAfterBlockedPull(pullResult, forceScopeSnapshot);
+          if (deferredPaths.length) {
+            for (const path of deferredPaths) this.vaultSyncEditorDeferredPaths.add(path);
+            this.vaultSyncEventPending = true;
+          }
+          diagnosticOutcome = "incomplete";
+          diagnosticFailureCode = unresolvedConflictCount === 0 && deferredPaths.length
+            ? "vault_sync_v2_editor_deferred" : "vault_sync_v2_conflict";
+          this.stopVaultSyncV2Events();
+          this.lastSafeErrorCode = diagnosticFailureCode;
+          this.vaultSyncRetry?.clear();
+          if (!canPushIndependentFiles && !quiet) {
+            if (deferredPaths.length && unresolvedConflictCount === 0) {
+              const resume = this.settings.vaultSyncIntervalMinutes !== null
+                ? "关闭笔记后会自动继续"
+                : "关闭笔记后再次运行同步即可继续";
+              new Notice(`云端删除已确认；接收端笔记仍在编辑器中，已安全暂缓。${resume}，无需再次确认删除。`, 12000);
+            } else {
+              const blockedCount = unresolvedConflictCount > 0 ? `${unresolvedConflictCount} 项` : "部分";
+              const deferredHint = deferredPaths.length ? "；打开中的笔记关闭后会自动重试对应删除" : "";
+              new Notice(`${blockedCount}远端变更暂不能安全应用；双方内容均已保留。${deferredHint} 请运行“微同步：处理待解决同步冲突”查看并处理其他冲突。`, 12000);
+            }
+          }
+          if (!canPushIndependentFiles) return;
+          pullHasUnresolvedConflict = true;
+          unresolvedPullConflictCount = unresolvedConflictCount;
+          pullDeferredPaths = deferredPaths;
+        }
+        if (pullDisposition === "continue_snapshot") {
+          diagnosticOutcome = "incomplete";
+          diagnosticFailureCode = `vault_sync_v2_${pullResult.status}`;
+          this.stopVaultSyncV2Events();
+          this.lastSafeErrorCode = `vault_sync_v2_${pullResult.status}`;
+          if (this.settings.vaultSyncIntervalMinutes !== null) this.vaultSyncRetry?.scheduleRetry();
+          if (!quiet) {
+            const continuation = this.settings.vaultSyncIntervalMinutes !== null ? "后台会自动继续" : "再次启动同步即可继续";
+            new Notice(pullResult.status === "snapshot_building"
+              ? `Vault 正在准备同步快照；${continuation}`
+              : `Vault 快照较大，进度已保存并分批处理；${continuation}`, 10000);
+            if (bootstrapCollisionCopies.length) {
+              new Notice(`首次加入已保留 ${bootstrapCollisionCopies.length} 份同路径本机文件副本：${bootstrapCollisionCopies.slice(0, 3).join("、")}`, 12000);
+            }
+          }
+          return;
+        }
+        await initializationLeaseKeeper?.assertValid();
+        const sessionGeneration = pullResult.snapshotState?.sessionGeneration;
+        if (sessionGeneration && this.settings.vaultSyncIntervalMinutes !== null) {
+          this.startVaultSyncV2Events(remote, identity, sessionGeneration, pullResult.snapshotState?.receivedCursor ?? "0");
+        } else {
+          this.stopVaultSyncV2Events();
+        }
+        await scopeState.save(scopeSelection);
+
+        let pushResult: Awaited<ReturnType<ReturnType<typeof createVaultSyncV2PushEngine>["runOnce"]>> | null = null;
+        if (capabilities.canWrite) {
+          diagnosticStage = "push";
+          const scan = await scanLocalFiles(this.app, rootFolder, undefined, this.vaultSyncIndex, {
+            maxFileBytes: VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
+            auditBatchSize: diagnosticsContext?.auditBatchSize,
+          });
+          diagnosticWork = {
+            ...diagnosticWork,
+            scanEntryCount: scan.index.size,
+            scanIssueCount: scan.unreadablePaths.length + scan.oversizedPaths.length
+              + scan.invalidPaths.length + scan.pathCollisions.length,
+          };
+          const push = createVaultSyncV2PushEngine({
+          app: this.app, identity, remote, journal, baseline, pathIntents, transport: objectTransport,
+          baseContent, autoMergeEnabled: this.settings.vaultSyncMergeMode === "automatic",
+          allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+          onAutoMergePhase: (phase) => this.vaultSyncDiagnostics.recordPushCasAutoMergePhase(phase),
+          rootFolder,
+            maxConcurrent: 1,
+            assertInitializationLease: initializationLeaseKeeper
+              ? () => initializationLeaseKeeper!.assertValid()
+              : undefined,
+            getForegroundPath: () => {
+              if (typeof document === "undefined" || document.visibilityState !== "visible") return null;
+              const activePath = this.app.workspace.getActiveFile()?.path ?? "";
+              return activePath.toLowerCase().endsWith(".md") ? activePath : null;
+            },
+            // requestUrl buffers whole objects. Keep one transfer under a bounded
+            // memory budget until multipart/streaming upload is implemented.
+            maxInFlightBytes: 96 * 1024 * 1024,
+          });
+          let pushStartedAt = 0;
+          pushResult = await runV2PushAfterCompleteLocalScan(scan, async (index) => {
+            pushStartedAt = diagnosticClock();
+            return push.runOnce(index);
+          });
+          diagnosticWork = {
+            ...diagnosticWork,
+            pushCommittedCount: pushResult.uploaded,
+            pushRenamedCount: pushResult.renamed,
+            pushDeletedCount: pushResult.deleted,
+            pushConflictCount: pushResult.conflicts,
+            pushFailedCount: pushResult.failed,
+            pushNeedsRebaseCount: pushResult.needsRebase,
+            pushSkippedForBudgetCount: pushResult.skippedForBudget,
+            pendingDeletionReviewCount: pushResult.deletionsPendingReview,
+          };
+          await initializationLeaseKeeper?.assertValid();
+          if (canAutomaticallyPropagateDeletes({
+            mode: this.settings.vaultSyncDeleteMode,
+            safetyEnabled: this.settings.vaultSafetyEnabled,
+            safetyRatio: this.settings.vaultSafetyRatio,
+            pendingDeleteCount: pushResult.pendingDeletions.length,
+            trackedLiveFileCount: (await baseline.load()).filter((entry) => !entry.isDeleted
+              && shouldSyncPath(entry.path, rootFolder)).length,
+          })) {
+            const pendingAfterAutomatic: VaultSyncV2PendingDeletion[] = [];
+            for (const deletion of pushResult.pendingDeletions) {
+              try {
+                const outcome = await push.commitReviewedDeletion(deletion);
+                if (outcome.status === "committed") pushResult.deleted += 1;
+                else if (outcome.status === "conflict") pushResult.conflicts += 1;
+                else if (outcome.status === "needs_rebase") pushResult.needsRebase += 1;
+                else {
+                  pendingAfterAutomatic.push(deletion);
+                  pushResult.failed += 1;
+                  if (pushResult.failureCodes.length < 5) pushResult.failureCodes.push(outcome.failureCode ?? outcome.status);
+                }
+              } catch (error) {
+                pendingAfterAutomatic.push(deletion);
+                pushResult.failed += 1;
+                if (pushResult.failureCodes.length < 5) {
+                  pushResult.failureCodes.push(String((error as any)?.code ?? "delete_auto_commit_failed"));
+                }
+              }
+            }
+            pushResult.pendingDeletions = pendingAfterAutomatic;
+            pushResult.deletionsPendingReview = pendingAfterAutomatic.length;
+          }
+          diagnosticWork = {
+            ...diagnosticWork,
+            pushCommittedCount: pushResult.uploaded,
+            pushRenamedCount: pushResult.renamed,
+            pushDeletedCount: pushResult.deleted,
+            pushConflictCount: pushResult.conflicts,
+            pushFailedCount: pushResult.failed,
+            pushNeedsRebaseCount: pushResult.needsRebase,
+            pushSkippedForBudgetCount: pushResult.skippedForBudget,
+            pendingDeletionReviewCount: pushResult.deletionsPendingReview,
+          };
+          diagnosticPushMs = diagnosticClock() - pushStartedAt;
+          this.pendingV2DeletionReview = pushResult.pendingDeletions;
+          this.notifyPendingDeletionReview(
+            pushResult.pendingDeletions,
+            shouldShowDeletionReviewNotice("v2", quiet),
+          );
+          const reviewContext = {
+            targetKey: `${identity.apiBaseUrl}\n${identity.targetId}`,
+            scope: scopeSelection.scope,
+            rootFolder: scopeSelection.rootFolder,
+          };
+          this.pendingV2DeletionHandler = createPendingV2DeletionReviewHandler({
+            targetId: identity.targetId,
+            expectedContext: reviewContext,
+            lane: this.deletionReviewConfirmationLane,
+            getCurrentContext: () => {
+              const currentScope = this.settings.vaultSyncScope === "root_folder"
+                ? "root_folder" : "whole_vault";
+              return {
+                targetKey: this.currentVaultSyncProtocolTargetKey(),
+                scope: currentScope,
+                rootFolder: currentScope === "root_folder"
+                  ? normalizeVaultPath(this.settings.rootFolder) ?? "" : "",
+                vaultSyncEnabled: this.settings.vaultSyncEnabled,
+                accountLoggedIn: this.accountLoggedIn,
+                lifecycleActive: this.vaultSyncLifecycleActive,
+              };
+            },
+            getPendingItems: () => this.pendingV2DeletionReview,
+            setPendingItems: (items) => { this.pendingV2DeletionReview = items; },
+            commit: async (item, assertReviewContextCurrent) => {
+              const outcome = await push.commitReviewedDeletion(item, assertReviewContextCurrent);
+              return {
+                status: outcome.status,
+                failureCode: outcome.failureCode,
+                supersededOperationCount: outcome.supersededOperationCount,
+                changeCursor: outcome.status === "committed" ? outcome.baseline?.cursor : undefined,
+              };
+            },
+            showNotice: (message, timeoutMs) => { new Notice(message, timeoutMs); },
+            runSync: () => this.runVaultSync(true),
+            notifyPendingItems: (items) => this.notifyPendingDeletionReview(items, true),
+          });
+        } else {
+          this.pendingV2DeletionReview = [];
+          this.pendingV2DeletionHandler = null;
+          this.notifyPendingDeletionReview([], quiet);
+        }
+
+        diagnosticStage = "finalize";
+        const baselineEntries = await baseline.load();
+        const remoteFiles: Record<string, { contentHash: string | null; byteSize: number; revision: number; isDeleted: boolean }> = {};
+        for (const entry of baselineEntries) {
+          remoteFiles[entry.path] = {
+            contentHash: entry.plaintextHash,
+            byteSize: entry.byteSize,
+            revision: Number(entry.cursor),
+            isDeleted: entry.isDeleted,
+          };
+        }
+        await this.reconcileCaptureHandoffsWithRemoteFiles(remoteFiles);
+
+        if (!capabilities.canWrite) {
+          diagnosticOutcome = "read_only";
+          diagnosticFailureCode = "vault_sync_v2_read_only";
+          this.lastSafeErrorCode = "vault_sync_v2_read_only";
+          this.vaultSyncRetry?.clear();
+          if (!quiet) new Notice(`Vault 只读同步完成：已应用 ${pullResult.applied} 项远端变化；此设备当前没有云端写权限`, 10000);
+          return;
+        }
+        const pushIncomplete = !!pushResult && (pushResult.failed > 0 || pushResult.conflicts > 0
+          || pushResult.needsRebase > 0 || pushResult.skippedForBudget > 0 || pushResult.deletionsPendingReview > 0);
+        const incomplete = pullHasUnresolvedConflict || pushIncomplete;
+        if (incomplete) {
+          diagnosticOutcome = "incomplete";
+          if (pushIncomplete) {
+            diagnosticFailureCode = "vault_sync_v2_incomplete";
+            this.lastSafeErrorCode = "vault_sync_v2_incomplete";
+          }
+          if ((pushResult?.failed ?? 0) > 0 && this.settings.vaultSyncIntervalMinutes !== null) {
+            this.vaultSyncRetry?.scheduleRetry(pushResult?.retryAfterMs === undefined
+              ? undefined : { retryAfterMs: pushResult.retryAfterMs });
+          }
+          else if (!pullHasUnresolvedConflict) this.vaultSyncRetry?.clear();
+          if (!quiet) {
+            const parts = [`拉取 ${pullResult.applied} 项`];
+            if (pushResult) {
+              parts.push(`上传 ${pushResult.uploaded} 项`, `推送冲突 ${pushResult.conflicts}`,
+                `需重新对齐 ${pushResult.needsRebase}`, `失败 ${pushResult.failed}`);
+              if (pushResult.renamed) parts.push(`改名 ${pushResult.renamed}`);
+              if (pushResult.deleted) parts.push(`已删除 ${pushResult.deleted}`);
+              if (pushResult.deletionsPendingReview) parts.push(`删除待审核 ${pushResult.deletionsPendingReview}`);
+              if (pushResult.skippedForBudget) parts.push(`大文件暂缓 ${pushResult.skippedForBudget}`);
+            }
+            if (unresolvedPullConflictCount) parts.push(`待处理远端变更 ${unresolvedPullConflictCount} 项`);
+            if (pullDeferredPaths.length) parts.push(`打开中的笔记暂缓 ${pullDeferredPaths.length} 项`);
+            const reason = pushResult?.failureCodes[0];
+            const preserved = bootstrapCollisionCopies.length
+              ? `；首次加入已保留 ${bootstrapCollisionCopies.length} 份本机文件副本：${bootstrapCollisionCopies.slice(0, 3).join("、")}` : "";
+            const conflictHint = pullHasUnresolvedConflict
+              ? "；有冲突的文件已暂缓，其他无冲突笔记仍继续同步，请处理待解决同步冲突"
+              : "";
+            new Notice(`Vault 同步部分完成：${parts.join(" · ")}${reason ? `（${reason}）` : ""}${preserved}${conflictHint}`, 12000);
+            if (pushResult?.pendingDeletions.length && this.pendingV2DeletionHandler) {
+              this.openVaultV2DeletionReviewModal(pushResult.pendingDeletions, this.pendingV2DeletionHandler);
+            }
+          }
+          return;
+        }
+        if (initializationLeaseId) {
+          await initializationLeaseKeeper?.assertValid();
+          const initialized = await remote.completeV2Initialization({
+            protocolEpoch: capabilities.protocolEpoch,
+            leaseId: initializationLeaseId,
+          });
+          if (initialized.status !== "ready" || initialized.scopeVersion !== scopeSelection.scopeVersion) {
+            throw Object.assign(new Error("Vault 初始基线完成回执与当前同步范围不一致"), {
+              code: "vault_sync_initialization_receipt_mismatch",
+            });
+          }
+          initializationLeaseKeeper?.markCompleted();
+        }
+        diagnosticOutcome = "complete";
+        this.lastSafeErrorCode = "";
+        this.vaultSyncRetry?.clear();
+        if (!quiet) {
+          const preserved = bootstrapCollisionCopies.length
+            ? `；首次加入保留本机同路径文件 ${bootstrapCollisionCopies.length} 份` : "";
+          new Notice(`Vault 同步完成：拉取 ${pullResult.applied} 项，上传 ${pushResult?.uploaded ?? 0} 项，改名 ${pushResult?.renamed ?? 0} 项，删除 ${pushResult?.deleted ?? 0} 项${preserved}`, 8000);
+        }
+        return;
+      }
+      this.stopVaultSyncV2Events();
+      this.pendingV2DeletionReview = [];
+      this.pendingV2DeletionHandler = null;
 
       const store = createPrevSyncStore(this.app);
       const safetyOverrideFingerprint = this.vaultSafetyOverrideFingerprint;
@@ -1740,6 +3321,10 @@ export default class WeTongbuPlugin extends Plugin {
         storage,
         remote,
         store,
+        localHashCache: this.vaultSyncIndex,
+        auditBatchSize: diagnosticsContext?.auditBatchSize,
+        getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+        trashLocalFile: (path) => this.trashRemoteVaultPath(path),
         deviceId: this.settings.vaultDeviceId || this.settings.vaultInstallationId,
         rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
         bootstrapDirection: this.settings.vaultFirstSyncDirection === "ask" || this.settings.vaultFirstSyncDirection === "auto"
@@ -1753,7 +3338,14 @@ export default class WeTongbuPlugin extends Plugin {
         safetyOverrideFingerprint,
         deletionResolution,
       });
+      diagnosticStage = "legacy_sync";
       const result = await orchestrator.runOnce();
+      if (result.aborted || result.failed > 0 || result.conflicts > 0 || result.safetyBlocked || result.deletionReviewRequired) {
+        diagnosticOutcome = "incomplete";
+        diagnosticFailureCode = "vault_sync_v1_incomplete";
+      } else {
+        diagnosticOutcome = "complete";
+      }
       if (safetyOverrideFingerprint) this.vaultSafetyOverrideFingerprint = "";
       if (result.safetyBlocked) {
         this.lastSafeErrorCode = "vault_sync_safety_blocked";
@@ -1764,17 +3356,23 @@ export default class WeTongbuPlugin extends Plugin {
       if (result.deletionReviewRequired) {
         this.lastSafeErrorCode = "vault_sync_deletion_review";
         this.pendingDeletionReview = result;
+        this.notifyPendingDeletionReview(
+          result.pendingDeletions ?? [],
+          shouldShowDeletionReviewNotice("v1", quiet),
+        );
         this.vaultSyncRetry?.clear();
         if (!quiet) this.openVaultDeletionReviewModal(result);
         return;
       }
       if (!result.failed) this.pendingDeletionReview = null;
+      this.notifyPendingDeletionReview([], quiet);
       if (result.aborted) {
         this.vaultSyncRetry?.clear();
       } else if (this.settings.vaultSyncIntervalMinutes !== null
         && result.failed > 0
-        && result.failureMessages?.some(isRetryableVaultSyncError)) {
-        this.vaultSyncRetry?.scheduleRetry();
+        && (result.hasRetryableFailure || result.failureMessages?.some(isRetryableVaultSyncError))) {
+        this.vaultSyncRetry?.scheduleRetry(result.retryAfterMs === undefined
+          ? undefined : { retryAfterMs: result.retryAfterMs });
       } else if (result.failed === 0) {
         this.vaultSyncRetry?.clear();
       }
@@ -1804,15 +3402,74 @@ export default class WeTongbuPlugin extends Plugin {
         }
       }
     } catch (error) {
+      const editorBusy = isVaultSyncActiveEditorBusyError(error);
+      diagnosticOutcome = editorBusy ? "incomplete" : "failed";
+      diagnosticFailureCode = String((error as any)?.code ?? "vault_sync_failed");
       this.vaultSafetyOverrideFingerprint = "";
       const message = error instanceof Error ? error.message : String(error);
-      this.lastSafeErrorCode = "vault_sync_failed";
-      if (this.settings.vaultSyncIntervalMinutes !== null && isRetryableVaultSyncError(error)) {
-        this.vaultSyncRetry?.scheduleRetry();
+      const upgradeNotice = getVaultSyncFailureNotice(error);
+      this.lastSafeErrorCode = upgradeNotice ? "protocol_upgrade_required"
+        : editorBusy ? diagnosticFailureCode : "vault_sync_failed";
+      if (editorBusy) {
+        const deferredPath = normalizeVaultPath((error as any)?.path ?? "");
+        if (deferredPath) this.vaultSyncEditorDeferredPaths.add(deferredPath);
+        this.vaultSyncEventPending = true;
+        this.vaultSyncRetry?.clear();
       }
-      if (!quiet) new Notice(`Vault 同步失败：${message}`, 10000);
-      console.error("WeTongbu vault sync failed", error);
+      if (upgradeNotice) {
+        this.vaultSyncProtocolUpgradeTargetKey = this.currentVaultSyncProtocolTargetKey();
+        this.vaultSyncRetry?.clear();
+        this.stopVaultSyncV2Events();
+      } else if (shouldScheduleVaultSyncFailureRetry(error, this.settings.vaultSyncIntervalMinutes !== null)) {
+        this.vaultSyncRetry?.scheduleRetry(error);
+      }
+      if (!quiet) new Notice(upgradeNotice ?? (editorBusy
+        ? (this.settings.vaultSyncIntervalMinutes === null
+          ? "该笔记仍在编辑器中打开，远端更新已安全暂缓；关闭该笔记后点击“立即同步”继续，本机内容已保留"
+          : "该笔记仍在编辑器中打开，远端更新已安全暂缓；关闭该笔记后将自动继续，本机内容已保留")
+        : `Vault 同步失败：${message}`), 12000);
+      if (!editorBusy) console.error("WeTongbu vault sync failed", error);
     } finally {
+      initializationLeaseKeeper?.stop();
+      const diagnosticDurationMs = diagnosticClock() - diagnosticStartedAt;
+      if (diagnosticV2Journal && diagnosticWork) {
+        try {
+          const snapshot = await diagnosticV2Journal.load();
+          const operations = snapshot?.operations ?? [];
+          const inbox = snapshot?.inbox ?? [];
+          const outboxCount = (state: VaultSyncOutboxOperation["state"]) => operations.filter((item) => item.state === state).length;
+          diagnosticWork = {
+            ...diagnosticWork,
+            outboxReadable: true,
+            outboxSnapshotPresent: snapshot !== null,
+            ...(snapshot ? {
+              outboxQueuedCount: outboxCount("queued"),
+              outboxPreparingCount: outboxCount("preparing"),
+              outboxUploadedCount: outboxCount("uploaded"),
+              outboxCommittingCount: outboxCount("committing"),
+              outboxConfirmedCount: outboxCount("confirmed"),
+              outboxConflictCount: outboxCount("conflict"),
+              outboxNeedsRebaseCount: outboxCount("needs_rebase"),
+              inboxReceivedCount: inbox.filter((item) => item.state === "received").length,
+              inboxNeedsResolutionCount: inbox.filter((item) => item.state === "needs_resolution").length,
+            } : {}),
+          };
+        } catch {
+          diagnosticWork = { ...diagnosticWork, outboxReadable: false, outboxSnapshotPresent: false };
+        }
+      }
+      this.vaultSyncDiagnostics.record({
+        durationMs: diagnosticDurationMs,
+        outcome: diagnosticOutcome,
+        protocol: diagnosticProtocol,
+        pullMs: diagnosticPullMs,
+        pushMs: diagnosticPushMs,
+        queueWaitMs: diagnosticQueueWaitMs,
+        activeQueueWaitMs: diagnosticActiveQueueWaitMs,
+        failureCode: diagnosticFailureCode,
+        stage: diagnosticStage,
+        work: diagnosticWork,
+      });
       this.vaultSyncing = false;
     }
   }
@@ -1854,12 +3511,97 @@ export default class WeTongbuPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  async setVaultSyncMergeMode(mode: VaultSyncMergeMode) {
+    this.settings.vaultSyncMergeMode = mode === "manual" ? "manual" : "automatic";
+    await this.saveSettings();
+  }
+
+  async setVaultSyncDeleteMode(mode: VaultSyncDeleteMode) {
+    this.settings.vaultSyncDeleteMode = mode === "automatic" ? "automatic" : "review";
+    await this.saveSettings();
+  }
+
   private openVaultSafetyModal(result: SyncResult) {
     new VaultSafetyModal(this.app, this, result).open();
   }
 
   get pendingDeletionCount() {
-    return this.pendingDeletionReview?.pendingDeletions?.length ?? 0;
+    return (this.pendingDeletionReview?.pendingDeletions?.length ?? 0) + this.pendingV2DeletionReview.length;
+  }
+
+  private refreshPendingDeletionStatusBarItem() {
+    const item = this.pendingDeletionStatusBarItem;
+    if (!item) return;
+    const count = this.pendingDeletionCount;
+    item.style.display = count > 0 ? "" : "none";
+    item.textContent = `待确认删除 ${count}`;
+    item.setAttribute("aria-label", `有 ${count} 项待确认删除；点击查看并处理`);
+    item.title = "云端删除尚未提交。点击逐项确认或恢复。";
+  }
+
+  private notifyPendingDeletionReview(entries: readonly DeletionReviewNoticeEntry[], shouldNotify: boolean) {
+    this.refreshPendingDeletionStatusBarItem();
+    const localReminderSuppressionKey = localDeletionReminderSuppressionKey(
+      entries,
+      this.localDeletionReminderPaths,
+    );
+    if (localReminderSuppressionKey) {
+      this.pendingDeletionReviewNoticeSuppressedKey = localReminderSuppressionKey;
+    }
+    const keepLocalDeletionAction = !!localReminderSuppressionKey && this.pendingDeletionCount > 0
+      && (this.localDeletionReminderNotice?.noticeEl.isConnected ?? false);
+    if (keepLocalDeletionAction) this.localDeletionReminderPaths.clear();
+    else this.hideLocalDeletionReminderNotice();
+    const noticeVisible = this.pendingDeletionReviewNotice?.noticeEl.isConnected ?? false;
+    const transition = nextDeletionReviewNotice(
+      this.pendingDeletionReviewNoticeKey,
+      entries,
+      shouldNotify,
+      noticeVisible,
+      this.pendingDeletionReviewOpener.isOpening || keepLocalDeletionAction,
+      this.pendingDeletionReviewNoticeSuppressedKey,
+    );
+    this.pendingDeletionReviewNoticeKey = transition.key;
+    if (entries.length === 0 || transition.key !== this.pendingDeletionReviewNoticeSuppressedKey) {
+      this.pendingDeletionReviewNoticeSuppressedKey = "";
+    }
+    if (entries.length === 0) this.hidePendingDeletionReviewNotice();
+    if (transition.shouldNotify && !this.pendingV2DeletionReviewModalOpen) {
+      this.showPendingDeletionReviewNotice(transition.count, transition.key);
+    }
+  }
+
+  private showPendingDeletionReviewNotice(count: number, key: string) {
+    this.hidePendingDeletionReviewNotice();
+    const message = document.createDocumentFragment();
+    message.createEl("div", {
+      text: `本机已删除 ${count} 项笔记，但云端和其他设备仍保留这些文件。逐项确认后，才会同步删除。`,
+    });
+    message.createEl("div", {
+      text: "提醒关闭后，可在命令面板搜索“微同步：处理待确认删除”重新打开。",
+    });
+    const actions = message.createEl("div", { cls: "wetongbu-deletion-notice-actions" });
+    actions.style.display = "flex";
+    actions.style.flexWrap = "wrap";
+    actions.style.gap = "0.5em";
+    const action = actions.createEl("button", { text: "查看并处理删除" });
+    action.addClass("mod-cta");
+    const dismiss = actions.createEl("button", { text: "关闭提醒" });
+    const notice = new Notice(message, 0);
+    this.pendingDeletionReviewNotice = notice;
+    action.addEventListener("click", () => {
+      this.hidePendingDeletionReviewNotice();
+      void this.openPendingDeletionReview();
+    });
+    dismiss.addEventListener("click", () => {
+      this.pendingDeletionReviewNoticeSuppressedKey = key;
+      this.hidePendingDeletionReviewNotice();
+    });
+  }
+
+  private hidePendingDeletionReviewNotice() {
+    this.pendingDeletionReviewNotice?.hide();
+    this.pendingDeletionReviewNotice = null;
   }
 
   private openVaultDeletionReviewModal(result: SyncResult) {
@@ -1867,11 +3609,76 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async openPendingDeletionReview() {
+    // An explicit user action always re-enables the review, even if the last
+    // confirmation failed and its unchanged queue was temporarily suppressed.
+    this.pendingDeletionReviewNoticeSuppressedKey = "";
+    this.hidePendingDeletionReviewNotice();
+    if (this.pendingDeletionReviewOpener.isOpening) return;
+    if (this.pendingV2DeletionReview.length && this.pendingV2DeletionHandler) {
+      this.openVaultV2DeletionReviewModal(this.pendingV2DeletionReview, this.pendingV2DeletionHandler);
+      return;
+    }
     if (!this.pendingDeletionReview?.deletionPlanFingerprint) {
-      await this.runVaultSync(false);
+      let openedV2Review = false;
+      const previousRun = this.vaultSyncDiagnostics.snapshot().latest;
+      await this.pendingDeletionReviewOpener.open(
+        () => this.runVaultSync(false),
+        () => this.pendingV2DeletionHandler ? this.pendingV2DeletionReview : [],
+        (items) => {
+          const handler = this.pendingV2DeletionHandler;
+          if (handler) {
+            openedV2Review = true;
+            this.openVaultV2DeletionReviewModal([...items], handler);
+          }
+        },
+      );
+      const latestRun = this.vaultSyncDiagnostics.snapshot().latest;
+      if (!openedV2Review && shouldNotifyEmptyDeletionReview(
+        previousRun,
+        latestRun,
+        this.pendingDeletionCount,
+      )) {
+        new Notice("同步检查完成：没有待确认的云端删除。", 6000);
+      }
       return;
     }
     this.openVaultDeletionReviewModal(this.pendingDeletionReview);
+  }
+
+  private openVaultV2DeletionReviewModal(
+    items: VaultSyncV2PendingDeletion[],
+    confirm: (item: VaultSyncV2PendingDeletion) => Promise<VaultSyncV2PendingDeletion[]>,
+  ) {
+    if (this.pendingV2DeletionReviewModalOpen) return;
+    this.hidePendingDeletionReviewNotice();
+    this.pendingV2DeletionReviewModalOpen = true;
+    let modal: VaultSyncV2DeletionReviewModal;
+    modal = new VaultSyncV2DeletionReviewModal(this.app, items, confirm, () => {
+      if (this.pendingV2DeletionReviewModal === modal) this.pendingV2DeletionReviewModal = null;
+      this.pendingV2DeletionReviewModalOpen = false;
+      if (!this.vaultSyncLifecycleActive) return;
+      if (this.pendingV2DeletionReview.length > 0) {
+        this.pendingDeletionReviewNoticeSuppressedKey = nextDeletionReviewNotice(
+          "",
+          this.pendingV2DeletionReview.map((item) => ({
+            path: item.path,
+            fileId: item.fileId,
+            expectedVersionId: item.expectedVersionId,
+          })),
+          false,
+        ).key;
+      } else if (this.pendingV2DeletionReview.length === 0) {
+        this.pendingDeletionReviewNoticeSuppressedKey = "";
+      }
+      this.refreshPendingDeletionStatusBarItem();
+      // The user has just seen this exact queue in the review modal. Keep the
+      // status-bar entry available, but do not replace the dismissed local
+      // deletion reminder with a second notice that opens the same modal.
+      this.hidePendingDeletionReviewNotice();
+      void this.runVaultSync(true);
+    });
+    this.pendingV2DeletionReviewModal = modal;
+    modal.open();
   }
 
   async resolveVaultDeletions(
@@ -1883,8 +3690,14 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async openVaultConflictReview() {
-    const state = await createPrevSyncStore(this.app).load();
-    new VaultConflictReviewModal(this.app, this, state?.conflicts ?? {}).open();
+    try {
+      const state = await createPrevSyncStore(this.app).load();
+      new VaultConflictReviewModal(this.app, this, state?.conflicts ?? {}).open();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      new Notice(`无法读取本地 Vault 同步状态，冲突记录未打开：${message}`, 12000);
+      console.error("WeTongbu conflict review could not load the local sync state", error);
+    }
   }
 
   async resolveVaultConflict(path: string) {
@@ -1907,10 +3720,659 @@ export default class WeTongbuPlugin extends Plugin {
    * article-inbox "没有待同步文章" notice for an otherwise valid Vault run.
    */
   async manualSync() {
+    if (!this.vaultSyncWriteRecoveryReady) {
+      new Notice("Vault 正在检查本地写入恢复，请稍后再同步", 8000);
+      return;
+    }
     const articleSyncQuiet = this.settings.vaultSyncEnabled;
     await this.syncNow(articleSyncQuiet);
     if (this.settings.vaultSyncEnabled) {
       await this.runVaultSync(false);
+    }
+  }
+
+  async refreshVaultSyncDeviceProgress() {
+    const pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (!pluginToken || !this.settings.syncTargetId) throw new Error("请先连接当前 Vault");
+    const remote = createVaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+    });
+    this.vaultSyncDeviceProgress = await remote.getV2DeviceProgress();
+    this.vaultSyncDeviceProgressFetchedAt = new Date().toISOString();
+  }
+
+  async openDeletedVaultHistory() {
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
+      ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) : "");
+    if (!pluginToken || !deviceToken || !this.settings.syncTargetId || !this.settings.vaultDeviceId) {
+      new Notice("请先连接并同步此 Vault，再恢复已删除文件");
+      return;
+    }
+    try {
+      const remote = createVaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId: this.settings.syncTargetId,
+        pluginToken,
+        deviceToken,
+      });
+      const capabilities = await remote.getCapabilities();
+      if (!capabilities.canRead || !capabilities.baselineReady || !capabilities.historyPolicy?.enabled) {
+        throw new Error("当前账号或 Vault 尚未开放历史版本读取");
+      }
+      const identity: VaultSyncV2Identity = {
+        apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+        targetId: this.settings.syncTargetId,
+        deviceId: this.settings.vaultDeviceId,
+        protocolEpoch: capabilities.protocolEpoch,
+      };
+      const deleted = (await createVaultSyncV2BaselineStore(this.app, identity).load())
+        .filter((entry) => entry.isDeleted)
+        .sort((left, right) => left.path.localeCompare(right.path, "zh-Hans-CN"));
+      if (!deleted.length) {
+        new Notice("当前设备没有已验证的云端删除检查点");
+        return;
+      }
+      new VaultSyncV2DeletedHistoryModal(this.app, deleted.map((entry) => ({ fileId: entry.fileId, path: entry.path })), (entry) => {
+        void this.openVaultHistory(entry.path, true, entry.fileId);
+      }).open();
+    } catch (error) {
+      new Notice(`无法读取已删除文件历史：${error instanceof Error ? error.message : String(error)}`, 10000);
+    }
+  }
+
+  async openVaultHistory(pathOverride?: string, includeDeletedHead = false, fileIdOverride?: string) {
+    const file = pathOverride ? null : this.app.workspace.getActiveFile();
+    const filePath = pathOverride ?? file?.path;
+    if (!filePath) {
+      new Notice("请先打开要查看历史版本的文件");
+      return;
+    }
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
+      ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) : "");
+    if (!pluginToken || !deviceToken || !this.settings.syncTargetId || !this.settings.vaultDeviceId) {
+      new Notice("请先连接并同步此 Vault，再查看云端历史版本");
+      return;
+    }
+    try {
+      const remote = createVaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId: this.settings.syncTargetId,
+        pluginToken,
+        deviceToken,
+      });
+      const capabilities = await remote.getCapabilities();
+      if (!capabilities.canRead || !capabilities.baselineReady || !capabilities.historyPolicy?.enabled) {
+        throw new Error("当前账号或 Vault 尚未开放历史版本读取");
+      }
+      const identity: VaultSyncV2Identity = {
+        apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+        targetId: this.settings.syncTargetId,
+        deviceId: this.settings.vaultDeviceId,
+        protocolEpoch: capabilities.protocolEpoch,
+      };
+      const baseline = await createVaultSyncV2BaselineStore(this.app, identity).load();
+      const entry = baseline.find((item) => (fileIdOverride ? item.fileId === fileIdOverride : item.path === filePath)
+        && (includeDeletedHead || !item.isDeleted));
+      if (!entry) throw new Error("当前文件还没有已确认的云端版本；先完成一次同步后再查看历史");
+      const firstPage = await remote.getFileVersions({ fileId: entry.fileId, limit: 50 });
+      let vaultCrypto: VaultSyncCrypto | undefined;
+      let vaultCryptoKeyring: VaultSyncCryptoKeyring | undefined;
+      if (this.settings.vaultEncryptionEnabled) {
+        const context = await this.loadVaultSyncCryptoContext();
+        if (!context) throw new Error("此设备缺少 Vault 加密密码，无法预览历史内容");
+        vaultCrypto = context.active;
+        vaultCryptoKeyring = context.keyring;
+      }
+      const objectTransport = createV2HostedObjectTransport(remote, async (input) => {
+        const response = await requestUrl({ url: input.url, method: input.method, headers: input.headers, body: input.body, throw: false });
+        return { status: response.status, headers: response.headers, arrayBuffer: response.arrayBuffer };
+      }, vaultCryptoKeyring ?? vaultCrypto, { downloadStage: createVaultSyncV2DownloadStageStore(this.app, identity) });
+      const historyPush = capabilities.canWrite && capabilities.v2WriteAvailable
+        ? createVaultSyncV2PushEngine({
+          app: this.app,
+          identity,
+          remote,
+          journal: createVaultSyncOutboxStore(this.app, identity),
+          baseline: createVaultSyncV2BaselineStore(this.app, identity),
+          pathIntents: createVaultSyncPathIntentStore(this.app, {
+            apiBaseUrl: identity.apiBaseUrl, targetId: identity.targetId, installationId: this.settings.vaultInstallationId,
+          }),
+          baseContent: createVaultSyncV2BaseContentStore(this.app, identity, vaultCryptoKeyring ?? vaultCrypto),
+          transport: objectTransport,
+          allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+          onAutoMergePhase: (phase) => this.vaultSyncDiagnostics.recordPushCasAutoMergePhase(phase),
+          rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
+          maxConcurrent: 1,
+          maxInFlightBytes: 96 * 1024 * 1024,
+        })
+        : null;
+      const readPage = (beforeVersionNumber: string) => remote.getFileVersions({
+        fileId: entry.fileId, beforeVersionNumber, limit: 50,
+      });
+      const readVersionBytes = async (
+        version: VaultSyncV2FileVersion,
+        maxBytes = HISTORY_PREVIEW_MAX_BYTES,
+      ) => {
+        if (version.contentStatus !== "object_referenced" || !version.contentObjectId) {
+          throw new Error("该检查点没有经过验证的可读内容");
+        }
+        if (!Number.isSafeInteger(version.byteSize) || version.byteSize < 0 || version.byteSize > maxBytes) {
+          throw new Error(`该历史内容超过 ${Math.floor(maxBytes / 1024 / 1024)} MiB 读取上限`);
+        }
+        const downloaded = await objectTransport.downloadVersion({
+          fileId: entry.fileId,
+          versionId: version.versionId,
+          expectedObjectId: version.contentObjectId,
+        });
+        return downloaded.plaintext;
+      };
+      const modal = new VaultSyncV2HistoryModal(
+        this.app,
+        filePath,
+        firstPage,
+        readPage,
+        async (version) => new TextDecoder().decode(await readVersionBytes(version)),
+        historyPush ? async (version) => {
+          // Reconcile first while the normal sync gate is available. The
+          // bounded object read/write then owns the shared gate exclusively.
+          await this.runVaultSync(true);
+          const gated = await vaultSyncObjectWorkGate.run(async () => {
+            const freshCapabilities = await remote.getCapabilities();
+            if (!freshCapabilities.canWrite || !freshCapabilities.v2WriteAvailable
+              || freshCapabilities.protocolEpoch !== identity.protocolEpoch) {
+              throw new Error("当前账号或 Vault 暂未开放云端历史恢复写入");
+            }
+            const current = await createVaultSyncV2BaselineStore(this.app, identity).get(entry.fileId);
+            const latestPage = await remote.getFileVersions({ fileId: entry.fileId, limit: 1 });
+            const remoteHead = latestPage.items.find((item) => item.isCurrent);
+            if (!current || !remoteHead || current.fileVersionId !== remoteHead.versionId) {
+              throw new Error("云端文件刚刚发生变化；已暂停恢复，请重新打开历史并同步后重试");
+            }
+            const bytes = await readVersionBytes(version, HISTORY_RESTORE_MAX_BYTES);
+            const occupied = (candidate: string) => !!this.app.vault.getAbstractFileByPath(candidate)
+              || this.app.vault.getFiles().some((item) => normalizePath(item.path).toLocaleLowerCase() === candidate.toLocaleLowerCase());
+            const targetPath = historyRestoreTargetPath(version.path, version.versionNumber, entry.isDeleted, occupied);
+            await ensureFolder(this, targetPath.split("/").slice(0, -1).join("/"));
+            await writeBinaryAssetSafely(this.app, targetPath, bytes);
+            let outcome: Awaited<ReturnType<typeof historyPush.restoreVersion>>;
+            try {
+              outcome = await historyPush.restoreVersion({
+                fileId: entry.fileId,
+                sourceVersionId: version.versionId,
+                path: targetPath,
+                bytes,
+              });
+            } catch (error) {
+              new Notice(`云端恢复未提交；历史副本已保留在本地：${targetPath}（${error instanceof Error ? error.message : String(error)}）`, 12000);
+              return false;
+            }
+            if (outcome.status !== "committed") {
+              const reason = outcome.status === "conflict" ? "云端版本已变化，恢复副本已保留在本地待处理"
+                : outcome.status === "needs_rebase" ? "恢复副本已保留在本地，云端需要重新对齐"
+                  : `恢复副本已保留在本地（${outcome.failureCode ?? outcome.status}）`;
+              new Notice(`${reason}：${targetPath}`, 10000);
+              return false;
+            }
+            new Notice(`已提交云端恢复版本：${targetPath}。没有覆盖已有文件。`, 12000);
+            return true;
+          });
+          if (!gated.started) {
+            new Notice("另一个大型文件恢复、冲突处理或同步任务正在运行，请稍后重试", 8000);
+          }
+          await this.runVaultSync(true);
+        } : undefined,
+        entry.isDeleted,
+      );
+      modal.open();
+    } catch (error) {
+      new Notice(`无法打开云端历史：${formatVaultSyncHistoryError(error)}`, 10000);
+    }
+  }
+
+  async openVaultSyncConflictCenter() {
+    const targetId = this.settings.syncTargetId;
+    const deviceId = this.settings.vaultDeviceId;
+    if (!targetId || !deviceId) {
+      new Notice("当前 Vault 尚未连接同步设备，无法定位本机冲突记录");
+      return;
+    }
+    const showCachedConflicts = async () => {
+      let cached: VaultSyncOutboxSnapshot | null = null;
+      try {
+        cached = await loadLatestVaultSyncOutboxSnapshot(this.app, {
+          apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl), targetId, deviceId,
+        });
+      } catch { /* offline conflict browsing must never mutate or block on cache errors */ }
+      const pending = cached?.inbox.some((entry) => entry.state === "needs_resolution") ?? false;
+      const outbound = cached?.operations.some((operation) => operation.state === "conflict") ?? false;
+      if (cached && (pending || outbound)) {
+        new VaultSyncV2OfflineConflictSnapshotModal(this.app, cached).open();
+        return;
+      }
+      new Notice("无法连接云端冲突中心；本机没有已校验的待处理冲突快照。请恢复连接后重试。", 10000);
+    };
+    let pluginToken = "";
+    let deviceToken = "";
+    let cloudStateVerified = false;
+    try {
+      pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId()) ?? "";
+      deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
+        ? await this.app.secretStorage.getSecret(this.settings.vaultDeviceTokenSecretId) ?? "" : "");
+      if (!pluginToken || !deviceToken) {
+        await showCachedConflicts();
+        return;
+      }
+      const remote = createVaultSyncRemoteClient({
+        apiBaseUrl: this.settings.apiBaseUrl,
+        targetId,
+        pluginToken,
+        deviceToken,
+      });
+      const capabilities = await remote.getCapabilities();
+      if (!capabilities.canRead || !capabilities.baselineReady) {
+        throw new Error("当前设备尚未取得已验证的 Vault 读取基线");
+      }
+      cloudStateVerified = true;
+      const identity: VaultSyncV2Identity = {
+        apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl),
+        targetId,
+        deviceId,
+        protocolEpoch: capabilities.protocolEpoch,
+      };
+      const journal = createVaultSyncOutboxStore(this.app, identity);
+      const pathIntents = createVaultSyncPathIntentStore(this.app, {
+        apiBaseUrl: identity.apiBaseUrl, targetId: identity.targetId, installationId: this.settings.vaultInstallationId,
+      });
+      const baseline = createVaultSyncV2BaselineStore(this.app, identity);
+      const state = await journal.load();
+      const pending = state?.inbox.filter((entry) => entry.state === "needs_resolution") ?? [];
+      const outboundConflicts = state?.operations.filter((operation) => operation.state === "conflict") ?? [];
+      if (!pending.length && !outboundConflicts.length) {
+        new Notice("当前没有待处理的 v2 同步冲突");
+        return;
+      }
+
+      let vaultCrypto: VaultSyncCrypto | undefined;
+      let vaultCryptoKeyring: VaultSyncCryptoKeyring | undefined;
+      if (this.settings.vaultEncryptionEnabled) {
+        const context = await this.loadVaultSyncCryptoContext();
+        if (!context) throw new Error("此设备缺少 Vault 加密密码，无法读取冲突版本");
+        vaultCrypto = context.active;
+        vaultCryptoKeyring = context.keyring;
+      }
+      const objectTransport = createV2HostedObjectTransport(remote, async (input) => {
+        const response = await requestUrl({ url: input.url, method: input.method, headers: input.headers, body: input.body, throw: false });
+        return { status: response.status, headers: response.headers, arrayBuffer: response.arrayBuffer };
+      }, vaultCryptoKeyring ?? vaultCrypto, { downloadStage: createVaultSyncV2DownloadStageStore(this.app, identity) });
+      const baseContent = createVaultSyncV2BaseContentStore(this.app, identity, vaultCryptoKeyring ?? vaultCrypto);
+      const historyPush = capabilities.canWrite && capabilities.v2WriteAvailable
+        ? createVaultSyncV2PushEngine({
+          app: this.app,
+          identity,
+          remote,
+          journal,
+          baseline,
+          pathIntents,
+          baseContent,
+          transport: objectTransport,
+          allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+          onAutoMergePhase: (phase) => this.vaultSyncDiagnostics.recordPushCasAutoMergePhase(phase),
+          rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
+          maxConcurrent: 1,
+          maxInFlightBytes: 96 * 1024 * 1024,
+        })
+        : null;
+      const apply = createVaultSyncV2ApplyEngine({
+        app: this.app,
+        identity,
+        baseline,
+        journal,
+        pathIntents,
+        baseContent,
+        renameFileAndUpdateLinks: (file, path) => this.renameRemoteVaultFileAndUpdateLinks(file, path),
+        autoMergeEnabled: this.settings.vaultSyncMergeMode === "automatic",
+        allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+        objectWorkGate: vaultSyncObjectWorkGate,
+        rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
+        async download(item) {
+          const content = item.content;
+          if (!content || content.kind !== "object") {
+            throw Object.assign(new Error("此冲突版本不是可验证的 v2 对象；本地文件保持不变"), { code: "v2_conflict_remote_unavailable" });
+          }
+          return (await objectTransport.downloadVersion({
+            fileId: item.fileId,
+            versionId: item.fileVersionId,
+            expectedObjectId: content.objectId,
+          })).plaintext;
+        },
+      });
+      const canResolveSamePathUpdate = async (entry: VaultSyncInboxEntry) => {
+        const item = entry.item;
+        if (item.eventType !== "update" || item.isDeleted || !item.content || item.content.kind !== "object"
+          || !isVaultSyncContentWithinPlaintextLimit(item.byteSize, item.content, HISTORY_PREVIEW_MAX_BYTES,
+            this.settings.vaultEncryptionEnabled)) return false;
+        const previous = await baseline.get(item.fileId);
+        const localFile = this.app.vault.getAbstractFileByPath(item.path);
+        return !!previous && !previous.isDeleted && previous.path === item.path && !!localFile
+          && Number.isSafeInteger(Number((localFile as any).stat?.size))
+          && Number((localFile as any).stat.size) <= 2 * 1024 * 1024;
+      };
+      const previewGenerationByCursor = new Map<string, number>();
+      const preview = async (entry: VaultSyncInboxEntry) => {
+        const item = entry.item;
+        if (item.isDeleted || !item.content || item.content.kind !== "object"
+          || !item.path.toLowerCase().endsWith(".md")
+          || !isVaultSyncContentWithinPlaintextLimit(item.byteSize, item.content, HISTORY_PREVIEW_MAX_BYTES,
+            this.settings.vaultEncryptionEnabled)) {
+          throw new Error("此冲突不支持 Markdown 三方预览");
+        }
+        const localFile = this.app.vault.getAbstractFileByPath(item.path);
+        if (!localFile || !("extension" in localFile)) throw new Error("本地冲突文件已不存在");
+        const localGeneration = this.vaultSyncIndex.getGeneration(item.path);
+        previewGenerationByCursor.set(entry.cursor, localGeneration);
+        const declaredLocalSize = Number((localFile as any).stat?.size);
+        if (!Number.isSafeInteger(declaredLocalSize) || declaredLocalSize > 2 * 1024 * 1024) {
+          throw new Error("本机冲突正文超过 2 MiB 预览上限；本地文件保持不变");
+        }
+        const localBytes = new Uint8Array(await this.app.vault.readBinary(localFile as any));
+        assertVaultPathGeneration(item.path, localGeneration,
+          (path) => this.vaultSyncIndex.getGeneration(path), "v2_conflict_local_changed");
+        if (localBytes.byteLength > 2 * 1024 * 1024) {
+          throw new Error("本机冲突正文超过 2 MiB 预览上限；本地文件保持不变");
+        }
+        const remoteBytes = (await objectTransport.downloadVersion({
+          fileId: item.fileId,
+          versionId: item.fileVersionId,
+          expectedObjectId: item.content.objectId,
+        })).plaintext;
+        if (!isVaultSyncPlaintextSizeCompatible({
+          itemByteSize: item.byteSize, content: item.content, plaintextByteSize: remoteBytes.byteLength,
+          maxPlaintextBytes: HISTORY_PREVIEW_MAX_BYTES,
+          allowEncryptedSize: this.settings.vaultEncryptionEnabled,
+        })) throw new Error("云端正文尺寸与冲突变更记录不一致；本地文件保持不变");
+        const previous = await baseline.get(item.fileId);
+        const baseBytes = previous?.plaintextHash ? await baseContent.get(previous.plaintextHash) : null;
+        const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+        const remoteChoice = getConflictActionAvailability(
+          this.app, item.path, await canResolveSamePathUpdate(entry),
+        );
+        return {
+          path: item.path,
+          base: baseBytes ? decoder.decode(baseBytes) : "（共同基线缺失）",
+          local: decoder.decode(localBytes),
+          remote: decoder.decode(remoteBytes),
+          canChooseRemote: remoteChoice.canApplyRemote,
+          canSubmitLocal: remoteChoice.canSubmitLocal,
+          canEditMerge: remoteChoice.canEditMerge,
+          remoteChoiceBlockedByActiveEditor: remoteChoice.blockedByActiveEditor,
+          localHash: await sha256Hex(localBytes),
+        };
+      };
+      const previewOutboundRebase = async (operation: VaultSyncOutboxOperation) => {
+        const operationType = operation.request.operation.type;
+        if (operation.state !== "conflict" || (operationType !== "update" && operationType !== "delete" && operationType !== "rename")) {
+          throw new Error("该 outbox 操作类型暂不支持重新确认");
+        }
+        const previous = await baseline.get(operation.fileId);
+        if (!previous || previous.isDeleted) throw new Error("本机缺少有效的云端基线");
+        if (operationType === "rename") {
+          if (!previous.plaintextHash) throw new Error("改名冲突缺少已验证的共同正文基线");
+          const desiredPath = (operation.request.operation as any).path as string;
+          const localFile = this.app.vault.getAbstractFileByPath(desiredPath);
+          if (!localFile || !("extension" in localFile)) throw new Error("本机改名后的文件已不存在");
+          const declaredLocalSize = Number((localFile as any).stat?.size);
+          if (!Number.isSafeInteger(declaredLocalSize) || declaredLocalSize > 2 * 1024 * 1024) {
+            throw new Error("改名冲突当前只支持预览 2 MiB 内 Markdown；本机文件保持不变");
+          }
+          const localBytes = new Uint8Array(await this.app.vault.readBinary(localFile as any));
+          if (!desiredPath.toLowerCase().endsWith(".md") || localBytes.byteLength > 2 * 1024 * 1024) {
+            throw new Error("改名冲突当前只支持预览 2 MiB 内 Markdown；本机文件保持不变");
+          }
+          const latestPage = await remote.getFileVersions({ fileId: operation.fileId, limit: 1 });
+          const head = latestPage.items.find((item) => item.isCurrent);
+          if (!head || head.isDeleted || head.versionId === operation.request.expectedVersionId
+            || head.contentStatus !== "object_referenced" || !head.contentObjectId || head.byteSize > 2 * 1024 * 1024) {
+            throw new Error("云端当前改名版本不可预览；请先同步并重新检查冲突");
+          }
+          const remoteBytes = (await objectTransport.downloadVersion({
+            fileId: operation.fileId, versionId: head.versionId, expectedObjectId: head.contentObjectId,
+          })).plaintext;
+          if (remoteBytes.byteLength > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES
+            || await sha256Hex(remoteBytes) !== previous.plaintextHash) {
+            throw new Error("云端改名同时包含正文变化；请先处理正文冲突，本机文件保持不变");
+          }
+          const baseBytes = await baseContent.get(previous.plaintextHash);
+          const decoder = new TextDecoder("utf-8", { fatal: true });
+          return {
+            expectedVersionId: head.versionId,
+            preview: {
+              path: `${desiredPath}（云端当前：${head.path}）`,
+              base: baseBytes ? decoder.decode(baseBytes) : "（共同基线缺失）",
+              local: decoder.decode(localBytes),
+              remote: decoder.decode(remoteBytes),
+              canChooseRemote: false,
+            } satisfies VaultSyncV2ConflictPreview,
+          };
+        }
+        if (!previous.path.toLowerCase().endsWith(".md")) {
+          throw new Error("仅支持预览 Markdown 冲突；outbox 冲突仍保留");
+        }
+        let localText: string;
+        if (operationType === "delete") {
+          if (this.app.vault.getAbstractFileByPath(previous.path)) {
+            throw new Error("本机文件已重新出现；不会重新确认删除，请先重新同步");
+          }
+          localText = "（本机已删除；请检查云端当前版本后再决定是否确认删除）";
+        } else {
+          const localFile = this.app.vault.getAbstractFileByPath(previous.path);
+          if (!localFile || !("extension" in localFile)) throw new Error("本机冲突文件已不存在");
+          const declaredLocalSize = Number((localFile as any).stat?.size);
+          if (!Number.isSafeInteger(declaredLocalSize) || declaredLocalSize > 2 * 1024 * 1024) {
+            throw new Error("本机内容已变化或超过 2 MiB 预览上限；outbox 冲突仍保留");
+          }
+          const localBytes = new Uint8Array(await this.app.vault.readBinary(localFile as any));
+          if (localBytes.byteLength > 2 * 1024 * 1024 || localBytes.byteLength !== operation.localByteSize
+            || await sha256Hex(localBytes) !== operation.localContentHash) {
+            throw new Error("本机内容已变化或超过 2 MiB 预览上限；outbox 冲突仍保留");
+          }
+          localText = new TextDecoder("utf-8", { fatal: true }).decode(localBytes);
+        }
+        const latestPage = await remote.getFileVersions({ fileId: operation.fileId, limit: 1 });
+        const head = latestPage.items.find((item) => item.isCurrent);
+        if (!head || head.isDeleted || head.path !== previous.path || head.versionId === operation.request.expectedVersionId
+          || head.contentStatus !== "object_referenced" || !head.contentObjectId || head.byteSize > 2 * 1024 * 1024) {
+          throw new Error("云端当前 head 不可预览或与原路径不符；请先同步并检查冲突");
+        }
+        const remoteBytes = (await objectTransport.downloadVersion({
+          fileId: operation.fileId,
+          versionId: head.versionId,
+          expectedObjectId: head.contentObjectId,
+        })).plaintext;
+        if (remoteBytes.byteLength > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES) throw new Error("云端正文超过本机历史预览上限");
+        const baseBytes = previous.plaintextHash ? await baseContent.get(previous.plaintextHash) : null;
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        return {
+          expectedVersionId: head.versionId,
+          preview: {
+            path: previous.path,
+            base: baseBytes ? decoder.decode(baseBytes) : "（共同基线缺失）",
+            local: localText,
+            remote: decoder.decode(remoteBytes),
+            canChooseRemote: false,
+          } satisfies VaultSyncV2ConflictPreview,
+        };
+      };
+      const largeOrBinaryUpdateConflictCursors = new Set<string>();
+      const keepLocalRemoteUpdateCursors = new Set<string>();
+      const renameConflictCursors = new Set<string>();
+      const createConflictCursors = new Set<string>();
+      const deleteConflictCursors = new Set<string>();
+      const occupiedRemoteRenameEntries = pending.filter((entry) => entry.item.eventType === "rename"
+        && !!entry.item.previousPath && entry.item.previousPath !== entry.item.path
+        && !!this.app.vault.getAbstractFileByPath(entry.item.path));
+      const renameTargetIdentityByCursor = new Map<string, RemoteRenameTargetIdentity>();
+      if (occupiedRemoteRenameEntries.length) {
+        let baselineEntries: Awaited<ReturnType<typeof baseline.load>> = [];
+        try { baselineEntries = await baseline.load(); } catch { /* preserve an unknown identity when evidence cannot be read */ }
+        for (const entry of occupiedRemoteRenameEntries) {
+          renameTargetIdentityByCursor.set(entry.cursor,
+            classifyRemoteRenameTargetIdentity(entry.item, baselineEntries));
+        }
+      }
+      for (const entry of pending) {
+        const previewableMarkdown = entry.item.path.toLowerCase().endsWith(".md")
+          && !!entry.item.content && isVaultSyncContentWithinPlaintextLimit(
+            entry.item.byteSize, entry.item.content, HISTORY_PREVIEW_MAX_BYTES, this.settings.vaultEncryptionEnabled,
+          ) && await canResolveSamePathUpdate(entry);
+        if (entry.item.eventType === "update" && await apply.canResolveRemoteUpdate(entry) && !previewableMarkdown) {
+          largeOrBinaryUpdateConflictCursors.add(entry.cursor);
+        }
+        if (historyPush && await historyPush.canKeepLocalForRemoteUpdate(entry)) {
+          keepLocalRemoteUpdateCursors.add(entry.cursor);
+        }
+        if (await apply.canResolveRemoteRename(entry)) renameConflictCursors.add(entry.cursor);
+        if (await apply.canResolveRemoteCreate(entry)) createConflictCursors.add(entry.cursor);
+        if (await apply.canResolveRemoteDelete(entry)) deleteConflictCursors.add(entry.cursor);
+      }
+      const modal = new VaultSyncV2ConflictCenterModal(
+        this.app,
+        pending,
+        outboundConflicts,
+        largeOrBinaryUpdateConflictCursors,
+        keepLocalRemoteUpdateCursors,
+        renameConflictCursors,
+        createConflictCursors,
+        deleteConflictCursors,
+        preview,
+        previewOutboundRebase,
+        historyPush ? async (operation) => {
+          const outcome = await historyPush.repathCreateConflict({ operationId: operation.operationId });
+          if (outcome.status === "committed") new Notice("本机文件已保留到新路径并重新同步；原云端路径保持不变");
+          else if (outcome.status === "conflict") new Notice("换路径后的新建仍遇到云端竞争；本机副本和 outbox 操作均已保留，请刷新冲突中心", 10000);
+          else new Notice(`换路径重提尚未完成；本机副本和 outbox 操作仍保留（${outcome.failureCode ?? outcome.status}）`, 10000);
+          await this.runVaultSync(true);
+        } : undefined,
+        historyPush ? async (operation, expectedVersionId) => {
+          const outcome = operation.request.operation.type === "delete"
+            ? await historyPush.rebaseDeleteConflict({ operationId: operation.operationId, expectedVersionId })
+            : operation.request.operation.type === "rename"
+              ? await historyPush.rebaseRenameConflict({ operationId: operation.operationId, expectedVersionId })
+              : await historyPush.rebaseConflict({ operationId: operation.operationId, expectedVersionId });
+          if (outcome.status === "committed") new Notice(operation.request.operation.type === "delete"
+            ? "已删除刚才预览的云端版本"
+            : operation.request.operation.type === "rename"
+              ? "本机改名已基于预览中的云端版本重新提交"
+              : "本机内容已基于预览中的云端版本重新提交");
+          else if (outcome.status === "conflict") new Notice("预览期间云端又有新版本；本机操作仍保留，请刷新后重新比较", 10000);
+          else new Notice(`重基尚未提交；outbox 操作仍保留（${outcome.failureCode ?? outcome.status}）`, 10000);
+          await this.runVaultSync(true);
+        } : undefined,
+        historyPush ? async (operation) => {
+          await historyPush.cancelDeleteConflict({ operationId: operation.operationId });
+          new Notice("已保留本机文件并撤销待删除操作；下一轮同步会重新比较本机和云端版本");
+          await this.runVaultSync(true);
+        } : undefined,
+        historyPush ? async (entry, expectedLocalHash, mergeDraft) => {
+          const submitLocalVersion = async (localHash: string | undefined, isMerge: boolean) => {
+            const gated = await vaultSyncObjectWorkGate.run(() => historyPush.keepLocalForRemoteUpdate(entry.cursor, localHash));
+            if (!gated.started) throw new Error("另一个同步或大对象操作正在运行，请完成后再处理此冲突");
+            const outcome = gated.value;
+            if (outcome.status !== "committed") {
+              throw new Error(outcome.status === "conflict"
+                ? "云端版本刚刚又发生变化；本机文件和重提待办仍保留，请刷新后再处理"
+                : `本机版本尚未提交；冲突和重提待办仍保留（${outcome.failureCode ?? outcome.status}）`);
+            }
+            new Notice(isMerge
+              ? "合并正文已提交为云端新版本；冲突前的云端版本保留在历史记录"
+              : "已将本机预览原样提交为云端新版本；这不是合并，冲突前的云端版本保留在历史记录", 12000);
+            await this.runVaultSync(true).catch((error) => {
+              new Notice(`版本已提交；后续同步尚未完成（${error instanceof Error ? error.message : String(error)}）`, 10000);
+            });
+          };
+          if (mergeDraft) {
+            await submitManualConflictMerge({
+              expectedPreviewText: mergeDraft.expectedPreviewText,
+              mergedText: mergeDraft.text,
+              maxBytes: HISTORY_PREVIEW_MAX_BYTES,
+              writeText: async (mergedText, expectedPreviewText) => {
+                await writeTextAtomically(this.app, entry.item.path, mergedText, expectedPreviewText, {
+                  expectedGeneration: previewGenerationByCursor.get(entry.cursor),
+                  getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+                });
+                this.vaultSyncIndex.invalidate(entry.item.path);
+              },
+              submit: (mergedHash) => submitLocalVersion(mergedHash, true),
+            });
+            return;
+          }
+          await submitLocalVersion(expectedLocalHash, false);
+        } : undefined,
+        async (entry) => {
+          const result = await resolveConflictAndScheduleFollowUp(
+            () => apply.resolveInboxWithRemote(entry.cursor),
+            () => this.runVaultSync(false),
+            (error) => new Notice(
+              `冲突已处理；后续同步未完成（${error instanceof Error ? error.message : String(error)}）`,
+              10000,
+            ),
+          );
+          if (entry.item.eventType === "rename" && result.preservedLocalPath) {
+            new Notice(`已在 ${entry.item.path} 应用云端改名；本机内容保留在 ${result.preservedLocalPath}，将作为独立文件继续同步`, 12000);
+          } else if (entry.item.eventType === "delete" && result.preservedLocalPath) {
+            new Notice(`已确认云端删除；已改名的本机文件保留在 ${result.preservedLocalPath}，将作为独立文件继续同步`, 12000);
+          } else if (entry.item.eventType === "delete" && result.conflictCopyPath) {
+            new Notice(`已确认云端删除；本机文件保存在 ${result.conflictCopyPath}，将作为独立文件继续同步`, 12000);
+          } else if (result.conflictCopyPath) {
+            new Notice(`已采用云端内容；本机冲突副本保存在 ${result.conflictCopyPath}`, 12000);
+          } else {
+            new Notice("本地和远端内容已相同，冲突回执已推进");
+          }
+        },
+        async () => {
+          await this.runVaultSync(true);
+          await this.openVaultSyncConflictCenter();
+        },
+        this.settings.vaultEncryptionEnabled,
+        identity.deviceId,
+        renameTargetIdentityByCursor,
+      );
+      modal.open();
+    } catch (error) {
+      if (!cloudStateVerified) await showCachedConflicts();
+      else new Notice(`无法打开同步冲突中心：${error instanceof Error ? error.message : String(error)}`, 10000);
+    }
+  }
+
+  async openVaultSyncNeedsRebaseReview() {
+    const targetId = this.settings.syncTargetId;
+    const deviceId = this.settings.vaultDeviceId;
+    if (!targetId || !deviceId) {
+      new Notice("当前 Vault 尚未连接同步设备，无法读取本机需重基记录");
+      return;
+    }
+    try {
+      const snapshot = await loadLatestVaultSyncOutboxSnapshot(this.app, {
+        apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl), targetId, deviceId,
+      });
+      if (!snapshot) {
+        new Notice("本机没有可校验的同步 outbox 快照");
+        return;
+      }
+      const baselineEntries = await createVaultSyncV2BaselineStore(this.app, snapshot.identity).load().catch(() => []);
+      const items = summarizeVaultSyncNeedsRebase(snapshot, baselineEntries);
+      if (!items.length) {
+        new Notice("本机 outbox 没有需重基的操作");
+        return;
+      }
+      new VaultSyncNeedsRebaseModal(this.app, items).open();
+    } catch (error) {
+      new Notice(`无法读取本机需重基记录：${error instanceof Error ? error.message : String(error)}`, 10000);
     }
   }
 
@@ -2060,12 +4522,20 @@ export default class WeTongbuPlugin extends Plugin {
           requiresVaultSync: this.settings.vaultSyncEnabled,
           createdAt: new Date().toISOString(),
         });
+        this.settingTab?.refreshCaptureHandoffStatus();
+        const syncRoot = this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined;
+        if (written.files.some((file: { path: string }) => shouldSyncPath(file.path, syncRoot))) {
+          this.requestAutomaticVaultSync();
+        }
         this.settings.processedTaskIds.push(item.task_id);
         this.settings.processedTaskIds = this.settings.processedTaskIds.slice(-1000);
         await this.saveSettings();
         await this.completeHostedTask(base, token, item.task_id);
         completedOnServer = true;
-        if (!this.settings.vaultSyncEnabled) await this.captureHandoffs.remove(item.task_id);
+        if (!this.settings.vaultSyncEnabled) {
+          await this.captureHandoffs.remove(item.task_id);
+          this.settingTab?.refreshCaptureHandoffStatus();
+        }
         synced += 1;
       } catch (error) {
         if (!completedOnServer) await this.failHostedTask(base, token, item.task_id, error);
@@ -2077,12 +4547,13 @@ export default class WeTongbuPlugin extends Plugin {
 
   private async findClipContinuationNote(taskId: string) {
     const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
-    const matches: Array<ArticleCandidate & { file: TFile }> = [];
+    const matches: Array<ArticleCandidate & { file: TFile; generation: number }> = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
       if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+      const generation = this.vaultSyncIndex.getGeneration(file.path);
       const content = await this.app.vault.cachedRead(file);
       const candidate = articleCandidate(file.path, content);
-      if (candidate.taskId === taskId) matches.push({ ...candidate, file });
+      if (candidate.taskId === taskId) matches.push({ ...candidate, file, generation });
     }
     if (matches.length > 1) throw new Error("图片续传任务对应多个剪藏文章；为避免改错文章，已停止回填");
     return matches[0] ?? null;
@@ -2091,7 +4562,7 @@ export default class WeTongbuPlugin extends Plugin {
   private async applyHostedMediaContinuation(
     task: any,
     imageLinks: Record<string, string>,
-    candidate: ArticleCandidate & { file: TFile },
+    candidate: ArticleCandidate & { file: TFile; generation: number },
   ) {
     const clipTaskId = String(task.manifest.mediaContinuationClipTaskId);
     const capturedAt = String(candidate.frontmatter.captured_at ?? task.manifest.capturedAt ?? new Date().toISOString());
@@ -2105,49 +4576,64 @@ export default class WeTongbuPlugin extends Plugin {
     const notePath = candidate.path;
     const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
     const attachmentFolder = normalizePath(layout.attachmentFolder);
-    const createdPaths: string[] = [];
+    const createdPaths: Array<{ path: string; body: Uint8Array; mtime: number | null }> = [];
     const localFiles: Array<{ path: string; body: Uint8Array }> = [];
-    const replacements: Array<{ from: string; to: string; imageOnly: boolean }> = [];
     try {
+      const original = await this.app.vault.cachedRead(candidate.file);
+      let updated = original;
       for (const [index, asset] of task.assets.entries()) {
         const reference = typeof asset.clipReference === "string" ? asset.clipReference : "";
         if (!reference) throw new Error(`图片续传清单缺少原引用：${asset.relativePath}`);
         const hostedLink = asset.kind === "image" ? imageLinks[asset.relativePath] : undefined;
+        const imageOnly = Boolean(hostedLink);
         if (hostedLink) {
-          replacements.push({ from: reference, to: hostedLink, imageOnly: true });
+          const result = await applyMediaContinuationAsset({
+            markdown: updated,
+            from: reference,
+            to: hostedLink,
+            imageOnly,
+          });
+          if (!result.included) continue;
+          updated = result.markdown;
           continue;
         }
         const desiredPath = normalizePath(`${attachmentFolder}/${layout.assetNames[index]}`);
         const resolved = await resolveAssetTarget(this.app.vault.adapter, desiredPath, new Uint8Array(asset.body));
-        if (resolved.writeLocal) {
-          await ensureFolder(this, attachmentFolder);
-          createdPaths.push(resolved.targetPath);
-          await this.app.vault.adapter.writeBinary(resolved.targetPath, toArrayBuffer(new Uint8Array(asset.body)));
-          const persisted = await this.app.vault.adapter.stat(resolved.targetPath);
-          if (!persisted || persisted.type !== "file" || persisted.size !== asset.body.length) {
-            throw new Error(`附件写入校验失败：${resolved.targetPath}`);
-          }
-        }
-        localFiles.push({ path: resolved.targetPath, body: new Uint8Array(asset.body) });
-        replacements.push({ from: reference, to: relativeVaultPath(noteFolder, resolved.targetPath), imageOnly: false });
+        const replacement = relativeVaultPath(noteFolder, resolved.targetPath);
+        const result = await applyMediaContinuationAsset({
+          markdown: updated,
+          from: reference,
+          to: replacement,
+          ensureDependency: async () => {
+            if (resolved.writeLocal) {
+              await ensureFolder(this, attachmentFolder);
+              const body = new Uint8Array(asset.body);
+              const write = await writeBinaryAssetSafely(this.app, resolved.targetPath, body);
+              if (write.created) createdPaths.push({ path: resolved.targetPath, body, mtime: write.mtime });
+              const persisted = await this.app.vault.adapter.stat(resolved.targetPath);
+              if (!persisted || persisted.type !== "file" || persisted.size !== asset.body.length) {
+                throw new Error(`附件写入校验失败：${resolved.targetPath}`);
+              }
+            }
+            localFiles.push({ path: resolved.targetPath, body: new Uint8Array(asset.body) });
+          },
+        });
+        if (!result.included) continue;
+        updated = result.markdown;
       }
-
-      const original = await this.app.vault.cachedRead(candidate.file);
-      let updated = original;
-      for (const replacement of replacements) {
-        updated = replaceMarkdownDestination(updated, replacement.from, replacement.to, replacement.imageOnly);
-      }
-      if (updated !== original) await writeTextAtomically(this.app, notePath, updated);
-      const persisted = await this.app.vault.adapter.read(notePath);
-      const encoded = new TextEncoder().encode(persisted);
-      const files = [{ path: notePath, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }];
-      for (const file of localFiles) {
-        files.push({ path: file.path, contentHash: await sha256Hex(file.body), byteSize: file.body.byteLength });
-      }
-      return { notePath, files };
+      return await commitMediaContinuationNoteAndEvidence({
+        notePath,
+        original,
+        updated,
+        assets: localFiles,
+        writeNote: (content, expectedOriginal) => writeTextAtomically(this.app, notePath, content, expectedOriginal, {
+          expectedGeneration: candidate.generation,
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+        }),
+      });
     } catch (error) {
-      for (const path of createdPaths) {
-        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path).catch(() => {});
+      for (const file of createdPaths) {
+        await removeBinaryAssetIfUnchanged(this.app, file.path, file.body, file.mtime).catch(() => false);
       }
       throw error;
     }
@@ -2164,23 +4650,54 @@ export default class WeTongbuPlugin extends Plugin {
     return true;
   }
 
+  async getCaptureHandoffStatusSummary(): Promise<string> {
+    const handoffs = await this.captureHandoffs.list();
+    return captureHandoffStatusSummary(
+      handoffs,
+      this.settings.vaultSyncEnabled,
+      this.settings.vaultSyncIntervalMinutes,
+    );
+  }
+
   private async reconcileCaptureHandoffs() {
     const handoffs = await this.captureHandoffs.list();
     if (!handoffs.length) return;
     const store = createPrevSyncStore(this.app);
     const prev = await store.load();
+    if (prev) await this.reconcileCaptureHandoffsWithRemoteFiles(prev.files);
+  }
+
+  private async reconcileCaptureHandoffsWithRemoteFiles(
+    remoteFiles: Record<string, { contentHash: string | null; byteSize: number; revision?: number; isDeleted?: boolean }>,
+  ) {
+    const handoffs = await this.captureHandoffs.list();
+    if (!handoffs.length) return;
+    let changed = false;
     for (const handoff of handoffs) {
       if (!handoff.requiresVaultSync) {
         await this.captureHandoffs.remove(handoff.taskId);
+        changed = true;
         continue;
       }
-      if (!prev) continue;
-      const committed = handoff.files.every((record) => {
-        const remote = prev.files[record.path];
-        return remote && remote.contentHash === record.contentHash && remote.isDeleted !== true && Number(remote.revision) > 0;
+      const committed = await captureHandoffFilesHaveCommittedSuccessors(handoff, remoteFiles, async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) return null;
+        const body = new Uint8Array(await this.app.vault.readBinary(file));
+        return { contentHash: await sha256Hex(body), byteSize: body.byteLength };
+      }, async (record, currentHandoff) => {
+        const existing = this.app.vault.getAbstractFileByPath(record.path);
+        if (existing instanceof TFile) return record.path;
+        if (record.path !== currentHandoff.notePath) return null;
+        const movedNotes = this.app.vault.getMarkdownFiles().filter((file) =>
+          this.app.metadataCache.getFileCache(file)?.frontmatter?.wetongbu_task_id === currentHandoff.taskId);
+        return movedNotes.length === 1 ? movedNotes[0].path : null;
       });
-      if (committed) await this.captureHandoffs.remove(handoff.taskId);
+      if (committed) {
+        await this.captureHandoffs.remove(handoff.taskId);
+        changed = true;
+      }
     }
+    if (changed) this.settingTab?.refreshCaptureHandoffStatus();
   }
 
   private async recoverCaptureHandoffs() {
@@ -2291,7 +4808,10 @@ export default class WeTongbuPlugin extends Plugin {
     for (const [filename, content] of guides) {
       const target = normalizePath(`${root}/${filename}`);
       if (!this.app.vault.getAbstractFileByPath(target)) {
-        await this.app.vault.create(target, content);
+        await withVaultPathWriteLock(target, async () => {
+          if (this.app.vault.getAbstractFileByPath(target)) return;
+          await this.app.vault.create(target, content);
+        });
       }
     }
   }
@@ -2324,8 +4844,11 @@ export default class WeTongbuPlugin extends Plugin {
           ? inboxFiles
           : allMarkdownFiles;
     const readCandidates = async (files: TFile[]) => {
-      const result: Array<{ file: TFile; content: string }> = [];
-      for (const file of files) result.push({ file, content: await this.app.vault.cachedRead(file) });
+      const result: Array<{ file: TFile; content: string; generation: number }> = [];
+      for (const file of files) {
+        const generation = this.vaultSyncIndex.getGeneration(file.path);
+        result.push({ file, content: await this.app.vault.cachedRead(file), generation });
+      }
       return result;
     };
     let candidates = await readCandidates(prioritizedFiles);
@@ -2342,8 +4865,9 @@ export default class WeTongbuPlugin extends Plugin {
         task.manifest.sourceUrl,
       );
     }
-    const note = selected ? candidates.find(({ file }) => file.path === selected.path)?.file : undefined;
-    if (!selected || !note) {
+    const selectedCandidate = selected ? candidates.find(({ file }) => file.path === selected.path) : undefined;
+    const note = selectedCandidate?.file;
+    if (!selected || !selectedCandidate || !note) {
       const fallback = await this.writeTask(task, {});
       new Notice(candidates.filter(({ content }) => capturePattern.test(content)).length === 0
         ? "原笔记已找不到，已新建完整笔记"
@@ -2381,12 +4905,13 @@ export default class WeTongbuPlugin extends Plugin {
       localAssets.push({ asset, targetPath, writeLocal: resolved.writeLocal });
     }
     if (localAssets.some(({ writeLocal }) => writeLocal)) await ensureFolder(this, attachmentFolder);
-    const createdAssets: string[] = [];
+    const createdAssets: Array<{ path: string; body: Uint8Array; mtime: number | null }> = [];
     try {
       for (const { asset, targetPath, writeLocal } of localAssets) {
         if (!writeLocal) continue;
-        createdAssets.push(targetPath);
-        await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
+        const bodyBytes = new Uint8Array(asset.body);
+        const write = await writeBinaryAssetSafely(this.app, targetPath, bodyBytes);
+        if (write.created) createdAssets.push({ path: targetPath, body: bodyBytes, mtime: write.mtime });
         const stat = await this.app.vault.adapter.stat(targetPath);
         if (!stat || stat.type !== "file" || stat.size !== asset.body.length) throw new Error(`附件写入校验失败：${targetPath}`);
       }
@@ -2407,22 +4932,48 @@ export default class WeTongbuPlugin extends Plugin {
       const backup = `${note.path}.wetongbu-complete-${transactionId}.bak`;
       await this.app.vault.adapter.write(backup, original);
       if ((await this.app.vault.adapter.read(backup)) !== original) throw new Error("原笔记备份校验失败");
-      try {
-        await this.app.vault.adapter.write(note.path, updated);
-        const persisted = await this.app.vault.adapter.read(note.path);
-        if (persisted !== updated) throw new Error("原笔记更新校验失败");
-      } catch (error) {
-        await this.app.vault.adapter.write(note.path, original).catch(() => {});
-        throw error;
-      } finally {
-        if (await this.app.vault.adapter.exists(temporary)) await this.app.vault.adapter.remove(temporary).catch(() => {});
-        if (await this.app.vault.adapter.exists(backup)) await this.app.vault.adapter.remove(backup).catch(() => {});
-      }
+      await withVaultPathWriteLock(note.path, async () => {
+        let replacementStarted = false;
+        let replacementCommitted = false;
+        let rollbackVerified = false;
+        try {
+          await assertSafeTextReplacement(this.app, note.path, original, {
+            expectedGeneration: selectedCandidate.generation,
+            getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+          });
+          replacementStarted = true;
+          await this.app.vault.adapter.write(note.path, updated);
+          const persisted = await this.app.vault.adapter.read(note.path);
+          if (persisted !== updated) throw new Error("原笔记更新校验失败");
+          replacementCommitted = true;
+        } catch (error) {
+          if (!replacementStarted) {
+            rollbackVerified = true;
+          } else {
+            try {
+              await this.app.vault.adapter.write(note.path, original);
+              rollbackVerified = (await this.app.vault.adapter.read(note.path)) === original;
+            } catch {
+              rollbackVerified = false;
+            }
+          }
+          throw error;
+        } finally {
+          if (replacementCommitted || rollbackVerified) {
+            await cleanupTextReplacementArtifacts(this.app.vault.adapter as any, [backup, temporary]);
+          }
+        }
+      });
       let finalPath = note.path;
       const desiredPath = normalizePath(`${noteFolder}/${layout.noteFilename}`);
-      if (desiredPath !== note.path && !(await this.app.vault.adapter.exists(desiredPath))) {
-        await this.app.fileManager.renameFile(note, desiredPath);
-        finalPath = desiredPath;
+      if (desiredPath !== note.path) {
+        await withVaultPathWriteLocks([note.path, desiredPath], async () => {
+          if (await this.app.vault.adapter.exists(desiredPath)) return;
+          const current = this.app.vault.getAbstractFileByPath(note.path);
+          if (!(current instanceof TFile)) throw new Error("原笔记在改名期间已移动或删除");
+          await this.app.fileManager.renameFile(current, desiredPath);
+          finalPath = desiredPath;
+        });
       }
       const persisted = await this.app.vault.adapter.read(finalPath);
       const encoded = new TextEncoder().encode(persisted);
@@ -2432,8 +4983,8 @@ export default class WeTongbuPlugin extends Plugin {
       }
       return { notePath: finalPath, files };
     } catch (error) {
-      for (const targetPath of createdAssets) {
-        if (await this.app.vault.adapter.exists(targetPath)) await this.app.vault.adapter.remove(targetPath).catch(() => {});
+      for (const file of createdAssets) {
+        await removeBinaryAssetIfUnchanged(this.app, file.path, file.body, file.mtime).catch(() => false);
       }
       throw error;
     }
@@ -2482,36 +5033,46 @@ export default class WeTongbuPlugin extends Plugin {
 
     const taskId = typeof task.manifest.taskId === "string" ? task.manifest.taskId : "";
     const isCreateNewZip = task.manifest.operation === "create_new" && options.allowLegacyPathMatch !== true;
-    const taskIdentityCandidates: Array<ArticleCandidate & { file: TFile }> = [];
+    const taskIdentityCandidates: Array<ArticleCandidate & { file: TFile; generation: number }> = [];
     if (taskId) {
       for (const file of this.app.vault.getMarkdownFiles()) {
         const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
         if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        const generation = this.vaultSyncIndex.getGeneration(file.path);
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
-        if (candidate.taskId === taskId) taskIdentityCandidates.push({ ...candidate, file });
+        if (candidate.taskId === taskId) taskIdentityCandidates.push({ ...candidate, file, generation });
       }
     }
     if (taskIdentityCandidates.length > 1) throw new Error("同一任务已有多个本地版本，请先在 Vault 中处理重复文章");
     if (taskIdentityCandidates.length === 1) {
       const existing = taskIdentityCandidates[0];
-      const encoded = new TextEncoder().encode(existing.content);
+      const files = await captureHandoffFilesForExistingTask(
+        existing.path,
+        assetPlans.flatMap((plan) => plan.targetPath ? [plan.targetPath] : []),
+        async (path) => {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!(file instanceof TFile)) return null;
+          return new Uint8Array(await this.app.vault.readBinary(file));
+        },
+      );
       try { await this.app.workspace.getLeaf(false).openFile(existing.file); } catch { /* best effort */ }
       return {
         notePath: existing.path,
-        files: [{ path: existing.path, contentHash: await sha256Hex(encoded), byteSize: encoded.byteLength }],
+        files,
       };
     }
 
     const sourceKey = normalizeArticleSourceUrl(task.manifest.sourceUrl);
-    const candidates: Array<ArticleCandidate & { file: TFile }> = [];
+    const candidates: Array<ArticleCandidate & { file: TFile; generation: number }> = [];
     if (!isCreateNewZip && sourceKey) {
       const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
       for (const file of this.app.vault.getMarkdownFiles()) {
         if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        const generation = this.vaultSyncIndex.getGeneration(file.path);
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
-        if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file });
+        if (candidate.sourceKey === sourceKey) candidates.push({ ...candidate, file, generation });
       }
     }
     // Older lightweight clips have generated markers but no source_url. When
@@ -2522,9 +5083,10 @@ export default class WeTongbuPlugin extends Plugin {
       const expectedPath = normalizePath(`${layout.noteFolder}/${layout.noteFilename}`);
       const legacyFile = this.app.vault.getAbstractFileByPath(expectedPath);
       if (legacyFile instanceof TFile) {
+        const generation = this.vaultSyncIndex.getGeneration(legacyFile.path);
         const content = await this.app.vault.cachedRead(legacyFile);
         const candidate = articleCandidate(legacyFile.path, content);
-        if (isLegacyArticleCandidate(candidate, expectedPath)) candidates.push({ ...candidate, file: legacyFile });
+        if (isLegacyArticleCandidate(candidate, expectedPath)) candidates.push({ ...candidate, file: legacyFile, generation });
       }
     }
     const incomingBody = normalizeArticleBodyForCompare(splitMarkdownFrontmatter(markdown).body);
@@ -2537,7 +5099,7 @@ export default class WeTongbuPlugin extends Plugin {
     if (candidates.length > 1) {
       throw new Error("同一来源已有多个本地版本，请先在 Vault 中处理重复文章；本次未新建副本");
     }
-    let exactCandidate: (ArticleCandidate & { file: TFile }) | undefined;
+    let exactCandidate: (ArticleCandidate & { file: TFile; generation: number }) | undefined;
     if (candidates.length === 1 && normalizeArticleBodyForCompare(candidates[0].body) === incomingBody) {
       const candidateAssetFingerprint = await articleAssetFingerprintFromVault(
         this.app.vault.adapter,
@@ -2566,13 +5128,14 @@ export default class WeTongbuPlugin extends Plugin {
     const localAssetPlans = assetPlans.filter((plan: { writeLocal: boolean }) => plan.writeLocal);
     let createdNote: TFile | null = null;
     let noteCreatedByThisAttempt = false;
-    const assetsCreatedByThisAttempt: string[] = [];
+    const assetsCreatedByThisAttempt: Array<{ path: string; body: Uint8Array; mtime: number | null }> = [];
     let persistedMarkdown = "";
     try {
       if (localAssetPlans.length) await ensureFolder(this, taskAttachmentFolder);
       for (const { asset, filename, targetPath } of localAssetPlans) {
-        assetsCreatedByThisAttempt.push(targetPath);
-        await this.app.vault.adapter.writeBinary(targetPath, toArrayBuffer(asset.body));
+        const body = new Uint8Array(asset.body);
+        const write = await writeBinaryAssetSafely(this.app, targetPath, body);
+        if (write.created) assetsCreatedByThisAttempt.push({ path: targetPath, body, mtime: write.mtime });
         const writtenAsset = await this.app.vault.adapter.stat(targetPath);
         if (!writtenAsset || writtenAsset.type !== "file" || writtenAsset.size !== asset.body.length) {
           throw new Error(`附件写入校验失败：${filename}`);
@@ -2589,12 +5152,20 @@ export default class WeTongbuPlugin extends Plugin {
           markdown = markdown.split(`<${from}>`).join(`<${to}>`).split(from).join(to);
         }
         const merged = mergeArticleMarkdown(existing, markdown, { preserveGeneratedMarkers });
-        await writeTextAtomically(this.app, existing.path, merged);
+        await writeTextAtomically(this.app, existing.path, merged, existing.content, {
+          expectedGeneration: existing.generation,
+          getPathGeneration: (path) => this.vaultSyncIndex.getGeneration(path),
+        });
         createdNote = existing.file;
         persistedMarkdown = merged;
       } else {
         const notePath = await uniqueNotePath(this, noteFolder, layout.noteFilename);
-        createdNote = await this.app.vault.create(notePath, markdown);
+        createdNote = await withVaultPathWriteLock(notePath, async () => {
+          if (this.app.vault.getAbstractFileByPath(notePath)) {
+            throw Object.assign(new Error("目标笔记在创建期间已被占用，已保留现有文件"), { code: "vault_write_path_collision" });
+          }
+          return await this.app.vault.create(notePath, markdown);
+        });
         noteCreatedByThisAttempt = true;
         persistedMarkdown = await this.app.vault.adapter.read(createdNote.path);
       }
@@ -2602,10 +5173,16 @@ export default class WeTongbuPlugin extends Plugin {
         if (!existing) throw new Error("本地 Markdown 写入校验失败");
       }
     } catch (error) {
-      if (createdNote && noteCreatedByThisAttempt) await this.app.fileManager.trashFile(createdNote);
-      for (const targetPath of assetsCreatedByThisAttempt) {
-        const asset = this.app.vault.getAbstractFileByPath(targetPath);
-        if (asset instanceof TFile) await this.app.fileManager.trashFile(asset);
+      if (createdNote && noteCreatedByThisAttempt) {
+        await withVaultPathWriteLock(createdNote.path, async () => {
+          const current = this.app.vault.getAbstractFileByPath(createdNote!.path);
+          if (!(current instanceof TFile)) return;
+          const currentBody = await this.app.vault.adapter.read(createdNote!.path).catch(() => null);
+          if (currentBody === markdown) await this.app.fileManager.trashFile(current);
+        });
+      }
+      for (const file of assetsCreatedByThisAttempt) {
+        await removeBinaryAssetIfUnchanged(this.app, file.path, file.body, file.mtime).catch(() => false);
       }
       throw error;
     }
@@ -2613,10 +5190,15 @@ export default class WeTongbuPlugin extends Plugin {
     let finalPath = createdNote.path;
     if (existing) {
       const desiredPath = normalizePath(`${noteFolder}/${layout.noteFilename}`);
-      if (desiredPath !== existing.path && !(await this.app.vault.adapter.exists(desiredPath))) {
-        await this.app.fileManager.renameFile(createdNote, desiredPath);
-        finalPath = desiredPath;
-        createdNote = this.app.vault.getAbstractFileByPath(desiredPath) as TFile;
+      if (desiredPath !== existing.path) {
+        await withVaultPathWriteLocks([existing.path, desiredPath], async () => {
+          if (await this.app.vault.adapter.exists(desiredPath)) return;
+          const current = this.app.vault.getAbstractFileByPath(existing.path);
+          if (!(current instanceof TFile)) throw new Error("原笔记在改名期间已移动或删除");
+          await this.app.fileManager.renameFile(current, desiredPath);
+          finalPath = desiredPath;
+          createdNote = this.app.vault.getAbstractFileByPath(desiredPath) as TFile;
+        });
       }
     }
     try {
@@ -2637,42 +5219,6 @@ export default class WeTongbuPlugin extends Plugin {
       });
     }
     return { notePath: finalPath, files: writtenFiles };
-  }
-}
-
-async function writeTextAtomically(app: App, path: string, content: string) {
-  const temporary = `${path}.wetongbu-update-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
-  const backup = `${path}.wetongbu-update-${Date.now()}-${Math.random().toString(16).slice(2)}.bak`;
-  const adapter = app.vault.adapter as any;
-  await adapter.write(temporary, content);
-  if ((await adapter.read(temporary)) !== content) {
-    await adapter.remove(temporary).catch(() => {});
-    throw new Error("文章临时文件写入校验失败");
-  }
-  const original = await adapter.read(path);
-  await adapter.write(backup, original);
-  try {
-    // DataAdapter.rename intentionally rejects an existing destination on
-    // Obsidian's local adapter. Use the verified overwrite path whenever the
-    // note is still present; only use rename if a concurrent operation removed
-    // the destination between the backup and replacement steps.
-    if (typeof adapter.rename === "function" && !(await adapter.exists(path))) {
-      await adapter.rename(temporary, path);
-    } else {
-      // Verify the overwrite and restore the original on a torn/corrupted
-      // write. The backup above still gives us a recovery copy during this
-      // non-atomic replacement window.
-      await adapter.write(path, content);
-      if ((await adapter.read(path)) !== content) throw new Error("文章更新替换校验失败");
-      await adapter.remove(temporary).catch(() => {});
-    }
-    if ((await adapter.read(path)) !== content) throw new Error("文章更新校验失败");
-  } catch (error) {
-    await adapter.write(path, original).catch(() => {});
-    throw error;
-  } finally {
-    if (await adapter.exists(temporary)) await adapter.remove(temporary).catch(() => {});
-    if (await adapter.exists(backup)) await adapter.remove(backup).catch(() => {});
   }
 }
 
@@ -2707,7 +5253,13 @@ class VaultConflictReviewModal extends Modal {
         setting.addButton((button) => button
           .setButtonText("标记已处理")
           .onClick(async () => {
-            await this.plugin.resolveVaultConflict(path);
+            try {
+              await this.plugin.resolveVaultConflict(path);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              new Notice(`无法保存冲突处理状态：${message}`, 12000);
+              return;
+            }
             record.status = "resolved";
             button.setDisabled(true).setButtonText("已处理");
           }));
@@ -2715,6 +5267,623 @@ class VaultConflictReviewModal extends Modal {
         setting.addButton((button) => button.setButtonText("已处理").setDisabled(true));
       }
     }
+  }
+}
+
+interface VaultSyncV2ConflictPreview {
+  path: string;
+  base: string;
+  local: string;
+  remote: string;
+  canChooseRemote: boolean;
+  canSubmitLocal?: boolean;
+  canEditMerge?: boolean;
+  remoteChoiceBlockedByActiveEditor?: boolean;
+  localHash?: string;
+}
+
+class VaultSyncNeedsRebaseModal extends Modal {
+  constructor(app: App, private items: ReturnType<typeof summarizeVaultSyncNeedsRebase>) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText(`本机需重基记录（${this.items.length}）`);
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "这些是本机保留的旧 outbox 请求，已停止自动重试，只供核对；不会阻塞其他独立笔记同步，也不是远端 inbox 冲突。此窗口只读，不会重放或清理记录。路径来自旧请求或最近的本机基线，可能不是当前路径。",
+    });
+    for (const item of this.items) {
+      new Setting(this.contentEl)
+        .setName(item.location)
+        .setDesc(`${item.action} · 原因：${item.reason} · 操作 ${item.operationId.slice(0, 8)}… · 文件 ${item.fileId.slice(0, 8)}…`);
+    }
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
+
+class VaultSyncV2OfflineConflictSnapshotModal extends Modal {
+  constructor(app: App, private snapshot: VaultSyncOutboxSnapshot) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText("Vault 同步冲突中心（本机快照）");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "当前无法确认云端最新状态。以下内容来自本机已校验快照，仅供查看，可能不是云端最新状态；连接恢复后请重新同步并刷新冲突中心，再处理任何项目。",
+      cls: "wetongbu-sync-offline-warning",
+    });
+    this.contentEl.createEl("p", {
+      text: `本机快照 · 协议 epoch ${this.snapshot.identity.protocolEpoch} · 已接收游标 ${this.snapshot.receivedCursor} · 已应用游标 ${this.snapshot.appliedCursor}`,
+    });
+
+    const pending = this.snapshot.inbox.filter((entry) => entry.state === "needs_resolution");
+    const outbound = this.snapshot.operations.filter((operation) => operation.state === "conflict");
+    if (!pending.length && !outbound.length) {
+      this.contentEl.createEl("p", { text: "最近一次有效本机快照中没有待处理冲突；这不能代表云端当前也没有冲突。" });
+      return;
+    }
+    if (outbound.length) {
+      this.contentEl.createEl("h3", { text: `本机提交冲突（${outbound.length}）` });
+      for (const operation of outbound) {
+        const operationType = String(operation.request.operation.type ?? "unknown");
+        new Setting(this.contentEl)
+          .setName(`本机提交 ${operation.operationId.slice(0, 8)}…`)
+          .setDesc(`${operationType} · file ${operation.fileId.slice(0, 8)}… · 本机内容 ${operation.localContentHash.slice(0, 12)}…`);
+      }
+    }
+    if (pending.length) {
+      this.contentEl.createEl("h3", { text: `待处理的远端变更（${pending.length}）` });
+      const eventLabel: Record<string, string> = {
+        create: "远端新增", update: "远端修改", delete: "远端删除", restore: "远端恢复", rename: "远端改名",
+      };
+      for (const entry of pending) {
+        new Setting(this.contentEl)
+          .setName(entry.item.path)
+          .setDesc(`${eventLabel[entry.item.eventType] ?? entry.item.eventType} · 变更 ${entry.cursor} · 来源设备 ${entry.item.createdByDeviceId.slice(0, 8)}…`);
+      }
+    }
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
+
+class VaultSyncV2ConflictCenterModal extends Modal {
+  private resolvedRemoteDeleteCursors = new Set<string>();
+  private remoteDeleteProgressEl: HTMLParagraphElement | null = null;
+
+  constructor(
+    app: App,
+    private entries: VaultSyncInboxEntry[],
+    private outboundConflicts: VaultSyncOutboxOperation[],
+    private largeOrBinaryUpdateConflictCursors: Set<string>,
+    private keepLocalRemoteUpdateCursors: Set<string>,
+    private renameConflictCursors: Set<string>,
+    private createConflictCursors: Set<string>,
+    private deleteConflictCursors: Set<string>,
+    private preview: (entry: VaultSyncInboxEntry) => Promise<VaultSyncV2ConflictPreview>,
+    private previewOutboundRebase: (operation: VaultSyncOutboxOperation) => Promise<{
+      preview: VaultSyncV2ConflictPreview;
+      expectedVersionId: string;
+    }>,
+    private repathOutboundCreate: ((operation: VaultSyncOutboxOperation) => Promise<void>) | undefined,
+    private rebaseOutbound: ((operation: VaultSyncOutboxOperation, expectedVersionId: string) => Promise<void>) | undefined,
+    private cancelOutboundDelete: ((operation: VaultSyncOutboxOperation) => Promise<void>) | undefined,
+    private keepLocalAndPush: ((entry: VaultSyncInboxEntry, expectedLocalHash?: string,
+      mergeDraft?: { expectedPreviewText: string; text: string }) => Promise<void>) | undefined,
+    private resolve: (entry: VaultSyncInboxEntry) => Promise<void>,
+    private refresh: () => Promise<void>,
+    private allowEncryptedSize: boolean,
+    private currentDeviceId: string,
+    private renameTargetIdentityByCursor: ReadonlyMap<string, RemoteRenameTargetIdentity>,
+  ) { super(app); }
+
+  private dismissForActiveEditorBusy(error: unknown): boolean {
+    return dismissConflictActionForActiveEditorBusy(error, {
+      notify: (message, durationMs) => { new Notice(message, durationMs); },
+      close: () => this.close(),
+    });
+  }
+
+  onOpen() {
+    this.titleEl.setText("Vault 同步冲突中心");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", { text: "远端冲突会保留在本地 inbox，直到明确查看或处理。普通更新在采用远端前会另存本机副本；改名冲突可以在检查云端最新版本后重新确认本机路径。" });
+    if (this.deleteConflictCursors.size) {
+      this.remoteDeleteProgressEl = this.contentEl.createEl("p", {
+        text: `有 ${this.deleteConflictCursors.size} 项发送端已确认的远端删除因本机内容需要保护而待处理。这里无需再次授权删除；逐项处理会先把本机文件保存为冲突副本，再应用已确认的删除。成功项留在本窗口标记为已处理，方便继续核对其他条目。`,
+      });
+    }
+    if (this.outboundConflicts.length) {
+      this.contentEl.createEl("p", { text: `本机有 ${this.outboundConflicts.length} 项提交遇到云端 CAS 冲突，原操作仍保存在 outbox。update 冲突可对比三方内容并重基；delete 冲突可检查后重新确认；rename 冲突会先验证云端正文未变，再保留本机改名。` });
+      for (const operation of this.outboundConflicts) {
+        const operationType = String(operation.request.operation.type ?? "unknown");
+        const setting = new Setting(this.contentEl)
+          .setName(`本机提交 ${operation.operationId.slice(0, 8)}…`)
+          .setDesc(`${operationType} · file ${operation.fileId.slice(0, 8)}… · 本机正文 ${operation.localContentHash.slice(0, 12)}…`);
+        const hasRelatedRemoteChange = this.entries.some((entry) => entry.item.fileId === operation.fileId
+          || (operation.request.operation.type === "create" && operation.request.operation.path === entry.item.path));
+        if (!hasRelatedRemoteChange) {
+          setting.setDesc(`${operationType} · file ${operation.fileId.slice(0, 8)}… · 本机正文 ${operation.localContentHash.slice(0, 12)}… · 等待对应云端变更`);
+        }
+        if (this.rebaseOutbound && (operationType === "update" || operationType === "delete" || operationType === "rename")) {
+          const buttonLabel = operationType === "delete" ? "查看云端版本并重新确认删除"
+            : operationType === "rename" ? "检查云端版本并重新确认改名" : "对比并重基";
+          setting.addButton((button) => button.setButtonText(buttonLabel).onClick(async () => {
+            button.setDisabled(true).setButtonText("读取冲突内容…");
+            try {
+              const result = await this.previewOutboundRebase(operation);
+              new VaultSyncV2ConflictDetailModal(this.app, result.preview, undefined, {
+                label: operationType === "delete" ? "确认删除当前云端版本"
+                  : operationType === "rename" ? "保留本机路径并重提改名" : "以云端版本为基准重新提交本机内容",
+                description: operationType === "delete"
+                  ? "这会删除刚才预览的云端当前版本。提交前会再次核对 head，并确认本机路径仍为空；任何变化都会保留待办。"
+                  : operationType === "rename"
+                    ? "仅在云端正文与已验证基线一致时，按最新云端路径和版本重新提交改名；若正文也变化则保留冲突待办。"
+                    : "将保留本机正文，并以刚才预览的云端版本作为 CAS 基线。提交前会再次核对云端 head 和本机内容；期间有新修改时会保留待办。",
+                run: async () => {
+                  await this.rebaseOutbound!(operation, result.expectedVersionId);
+                  this.close();
+                },
+              }, undefined, undefined, () => this.close()).open();
+            } catch (error) {
+              if (this.dismissForActiveEditorBusy(error)) return;
+              new Notice(`读取本机冲突预览失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            } finally {
+              button.setDisabled(false).setButtonText(buttonLabel);
+            }
+          }));
+        }
+        if (this.cancelOutboundDelete && operationType === "delete") {
+          setting.addButton((button) => button.setButtonText("本机文件已恢复，撤销删除意图").onClick(async () => {
+            button.setDisabled(true).setButtonText("处理中…");
+            try {
+              await this.cancelOutboundDelete!(operation);
+              this.close();
+            } catch (error) {
+              if (this.dismissForActiveEditorBusy(error)) return;
+              new Notice(`撤销删除失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              button.setDisabled(false).setButtonText("本机文件已恢复，撤销删除意图");
+            }
+          }));
+        }
+        if (this.repathOutboundCreate && operationType === "create" && !hasRelatedRemoteChange) {
+          setting.addButton((button) => button.setButtonText("保留本机文件并换路径重提").onClick(async () => {
+            button.setDisabled(true).setButtonText("正在保留并重提…");
+            try {
+              await this.repathOutboundCreate!(operation);
+              this.close();
+            } catch (error) {
+              if (this.dismissForActiveEditorBusy(error)) return;
+              new Notice(`本机 create 冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              button.setDisabled(false).setButtonText("保留本机文件并换路径重提");
+            }
+          }));
+        }
+      }
+      const refresh = this.contentEl.createEl("button", { text: "同步并查找对应云端变更" });
+      refresh.addEventListener("click", () => {
+        if (refresh.disabled) return;
+        refresh.disabled = true;
+        refresh.setText("同步中…");
+        this.close();
+        void this.refresh().catch((error) => {
+          new Notice(`同步最新冲突状态失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+        });
+      });
+    }
+    if (!this.entries.length) {
+      this.contentEl.createEl("p", { text: "当前没有待处理的远端变更；上方显示的本机提交冲突仍保留在 outbox。" });
+      return;
+    }
+    for (const entry of this.entries) {
+      const item = entry.item;
+      const eventLabel: Record<string, string> = {
+        create: "远端新增", update: "远端修改", delete: "远端删除", restore: "远端恢复", rename: "远端改名",
+      };
+      const setting = new Setting(this.contentEl)
+        .setName(item.path)
+        .setDesc(`${eventLabel[item.eventType] ?? item.eventType} · 变更 ${entry.cursor} · 来源设备 ${item.createdByDeviceId.slice(0, 8)}…${this.outboundConflicts.some((operation) => operation.fileId === item.fileId
+          || (operation.request.operation.type === "create" && operation.request.operation.path === item.path)) ? " · 对应本机 CAS 提交冲突" : ""}`);
+      if (item.eventType !== "rename" && !item.isDeleted && item.content?.kind === "object" && item.path.toLowerCase().endsWith(".md")
+        && isVaultSyncContentWithinPlaintextLimit(item.byteSize, item.content, HISTORY_PREVIEW_MAX_BYTES,
+          this.allowEncryptedSize)) {
+        setting.addButton((button) => button.setButtonText("查看三方内容").onClick(async () => {
+          button.setDisabled(true).setButtonText("读取中…");
+          try {
+            const preview = await this.preview(entry);
+            const keepLocal = this.keepLocalAndPush && this.keepLocalRemoteUpdateCursors.has(entry.cursor)
+              && preview.canSubmitLocal !== false && !preview.remoteChoiceBlockedByActiveEditor
+              ? {
+                description: "只将下方本机预览原样提交为云端新版本，不会把云端正文合进来；冲突云端版本会留在历史中。要合并两边内容，请使用下方“编辑合并正文”。",
+                run: () => this.keepLocalAndPush!(entry, preview.localHash),
+              }
+              : undefined;
+            const mergeAndPush = this.keepLocalAndPush && this.keepLocalRemoteUpdateCursors.has(entry.cursor)
+              && preview.canEditMerge !== false && !preview.remoteChoiceBlockedByActiveEditor
+              ? {
+                description: "编辑完整正文并确认同时保留双方需要的内容。提交会先按本机预览原文安全写入，再基于本次冲突版本提交；若云端提交未确认，合并稿仍保留在本机。",
+                initialContent: preview.local,
+                run: (text: string) => this.keepLocalAndPush!(entry, undefined, {
+                  expectedPreviewText: preview.local,
+                  text,
+                }),
+              }
+              : undefined;
+            new VaultSyncV2ConflictDetailModal(this.app, preview, async () => {
+              await this.resolve(entry);
+              this.close();
+            }, undefined, keepLocal, mergeAndPush, () => this.close()).open();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`读取冲突版本失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+          } finally {
+            button.setDisabled(false).setButtonText("查看三方内容");
+          }
+        }));
+      } else if (this.keepLocalRemoteUpdateCursors.has(entry.cursor)
+        || this.largeOrBinaryUpdateConflictCursors.has(entry.cursor)) {
+        const remoteTooLarge = !item.content || !isVaultSyncContentWithinPlaintextLimit(
+          item.byteSize, item.content, VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES, this.allowEncryptedSize,
+        );
+        setting.setDesc(`${eventLabel[item.eventType] ?? item.eventType} · 变更 ${entry.cursor} · 来源设备 ${item.createdByDeviceId.slice(0, 8)}… · ${remoteTooLarge
+          ? "云端对象超过 24 MiB，本机不会下载覆盖"
+          : "该对象为二进制内容或超过 2 MiB 预览范围"}；按本机当前内容重提，或在支持范围内保留本机副本后采用云端版本。`);
+        if (this.keepLocalRemoteUpdateCursors.has(entry.cursor)) {
+          setting.addButton((button) => button.setButtonText("保留本机内容并提交为新版本").onClick(async () => {
+            button.setDisabled(true).setButtonText("处理中…");
+            try {
+              if (!this.keepLocalAndPush) throw new Error("当前设备没有可用的云端写入权限");
+              await this.keepLocalAndPush(entry);
+              this.close();
+            } catch (error) {
+              if (this.dismissForActiveEditorBusy(error)) return;
+              new Notice(`本机版本重提未完成：${error instanceof Error ? error.message : String(error)}`, 10000);
+              button.setDisabled(false).setButtonText("保留本机内容并提交为新版本");
+            }
+          }));
+        }
+        if (this.largeOrBinaryUpdateConflictCursors.has(entry.cursor)) {
+          setting.addButton((button) => button.setButtonText("保留本机副本并采用云端").onClick(async () => {
+            button.setDisabled(true).setButtonText("处理中…");
+            try {
+              await this.resolve(entry);
+              this.close();
+            } catch (error) {
+              if (this.dismissForActiveEditorBusy(error)) return;
+              new Notice(`冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              button.setDisabled(false).setButtonText("保留本机副本并采用云端");
+            }
+          }));
+        }
+      } else {
+        const renameDescription = item.eventType === "rename" && item.previousPath ? ` · ${item.previousPath} → ${item.path}` : "";
+        const renameTarget = item.eventType === "rename" && item.previousPath
+          ? this.app.vault.getAbstractFileByPath(item.path)
+          : null;
+        const renameHint = describeRemoteRenameConflictHint(item,
+          !!renameTarget && renameTarget.path !== item.previousPath,
+          item.createdByDeviceId.toLowerCase() === this.currentDeviceId.toLowerCase(),
+          this.renameTargetIdentityByCursor.get(entry.cursor) ?? "unknown");
+        setting.setDesc(`${eventLabel[item.eventType] ?? item.eventType} · 变更 ${entry.cursor} · 来源设备 ${item.createdByDeviceId.slice(0, 8)}… · ${renameHint ?? "该类型暂不支持三方预览或自动处理"}${renameDescription}`);
+      }
+      if (this.renameConflictCursors.has(entry.cursor)) {
+        setting.addButton((button) => button.setButtonText("保留本机文件并采用云端改名").onClick(async () => {
+          button.setDisabled(true).setButtonText("处理中…");
+          try {
+            await this.resolve(entry);
+            this.close();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`改名冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText("保留本机文件并采用云端改名");
+          }
+        }));
+      }
+      if (this.createConflictCursors.has(entry.cursor)) {
+        setting.addButton((button) => button.setButtonText("保留本机副本并采用云端新增").onClick(async () => {
+          button.setDisabled(true).setButtonText("处理中…");
+          try {
+            await this.resolve(entry);
+            this.close();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`新增文件冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText("保留本机副本并采用云端新增");
+          }
+        }));
+      }
+      if (this.deleteConflictCursors.has(entry.cursor)) {
+        setting.addButton((button) => button.setButtonText("保留本机副本并应用已确认删除").onClick(async () => {
+          button.setDisabled(true).setButtonText("处理中…");
+          try {
+            await this.resolve(entry);
+            this.resolvedRemoteDeleteCursors.add(entry.cursor);
+            button.setButtonText("已处理");
+            setting.setDesc(`远端删除 · 变更 ${entry.cursor} · 已处理；本机副本已保留，发送端已确认的删除已应用。`);
+            this.remoteDeleteProgressEl?.setText(
+              `已处理 ${this.resolvedRemoteDeleteCursors.size}/${this.deleteConflictCursors.size} 项可安全处理的远端删除；其他条目仍保留在本窗口。`,
+            );
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`删除冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText("保留本机副本并应用已确认删除");
+          }
+        }));
+      }
+    }
+    if (this.entries.length && !this.outboundConflicts.length) {
+      const refresh = this.contentEl.createEl("button", { text: "同步并刷新冲突状态" });
+      refresh.addEventListener("click", () => {
+        if (refresh.disabled) return;
+        refresh.disabled = true;
+        refresh.setText("同步中…");
+        this.close();
+        void this.refresh().catch((error) => {
+          new Notice(`同步最新冲突状态失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+        });
+      });
+    }
+  }
+}
+
+class VaultSyncV2ConflictDetailModal extends Modal {
+  constructor(
+    app: App,
+    private preview: VaultSyncV2ConflictPreview,
+    private resolve?: () => Promise<void>,
+    private rebase?: { label: string; description: string; run: () => Promise<void> },
+    private keepLocal?: { description: string; run: () => Promise<void> },
+    private mergeAndPush?: { description: string; initialContent: string; run: (text: string) => Promise<void> },
+    private onEditorBusy?: () => void,
+  ) { super(app); }
+
+  private dismissForActiveEditorBusy(error: unknown): boolean {
+    return dismissConflictActionForActiveEditorBusy(error, {
+      notify: (message, durationMs) => { new Notice(message, durationMs); },
+      close: () => this.close(),
+      afterClose: () => this.onEditorBusy?.(),
+    });
+  }
+
+  onOpen() {
+    this.titleEl.setText("同步冲突 · 三方内容");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", { text: `${this.preview.path} · 内容均在本机解密` });
+    for (const [label, text] of [["共同基线", this.preview.base], ["本机内容", this.preview.local], ["云端内容", this.preview.remote]]) {
+      const section = this.contentEl.createEl("details", { attr: { open: true } });
+      section.createEl("summary", { text: label });
+      section.createEl("pre", { text }).setCssStyles({
+        maxHeight: "24vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+      });
+    }
+    if (this.preview.remoteChoiceBlockedByActiveEditor) {
+      this.contentEl.createEl("p", { text: "目标笔记仍在编辑器中打开，当前暂停改写原路径和提交本机版本。请关闭这篇笔记，重新打开冲突中心并核对最新三方内容后再处理。" });
+    }
+    if (this.preview.canChooseRemote && this.resolve) {
+      new Setting(this.contentEl)
+        .setName("保留双方")
+        .setDesc("原路径将采用云端正文；本机正文和其中的本机链接会另存为同目录冲突副本，处理成功后会显示副本路径。云端 ACK 仅在本地写入和基线保存成功后推进。")
+        .addButton((button) => button.setButtonText("保留本地副本并采用云端").setCta().onClick(async () => {
+          button.setDisabled(true).setButtonText("处理中…");
+          try {
+            await this.resolve!();
+            this.close();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`冲突处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText("保留本地副本并采用云端");
+          }
+        }));
+    }
+    if (this.rebase) {
+      new Setting(this.contentEl)
+        .setName("保留本机并重新提交")
+        .setDesc(this.rebase.description)
+        .addButton((button) => button.setButtonText(this.rebase!.label).setCta().onClick(async () => {
+          button.setDisabled(true).setButtonText("正在重新提交…");
+          try {
+            await this.rebase!.run();
+            this.close();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`冲突重基失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText(this.rebase!.label);
+          }
+        }));
+    }
+    if (this.keepLocal) {
+      new Setting(this.contentEl)
+        .setName("只提交本机预览")
+        .setDesc(this.keepLocal.description)
+        .addButton((button) => button.setButtonText("仅提交本机预览到云端").setCta().onClick(async () => {
+          button.setDisabled(true).setButtonText("正在提交…");
+          try {
+            await this.keepLocal!.run();
+            this.close();
+          } catch (error) {
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`本机版本重提未完成：${error instanceof Error ? error.message : String(error)}`, 10000);
+            button.setDisabled(false).setButtonText("仅提交本机预览到云端");
+          }
+        }));
+    }
+    if (this.mergeAndPush) {
+      new Setting(this.contentEl)
+        .setName("编辑合并正文")
+        .setDesc(this.mergeAndPush.description);
+      const editor = this.contentEl.createEl("textarea");
+      editor.value = this.mergeAndPush.initialContent.startsWith("\uFEFF")
+        ? this.mergeAndPush.initialContent.slice(1)
+        : this.mergeAndPush.initialContent;
+      editor.rows = 12;
+      editor.spellcheck = false;
+      editor.setCssStyles({
+        display: "block", width: "100%", minHeight: "12em", resize: "vertical",
+        fontFamily: "var(--font-monospace)", whiteSpace: "pre", overflow: "auto",
+      });
+      new Setting(this.contentEl)
+        .addButton((button) => button.setButtonText("提交这份合并正文").setCta().onClick(async () => {
+          button.setDisabled(true).setButtonText("正在保存并提交…");
+          editor.disabled = true;
+          try {
+            await this.mergeAndPush!.run(restoreConflictEditorTextFormat(editor.value, this.mergeAndPush!.initialContent));
+            this.close();
+          } catch (error) {
+            const draftSaved = Boolean((error as any)?.localDraftSaved);
+            if (this.dismissForActiveEditorBusy(error)) return;
+            new Notice(`合并正文提交未完成：${error instanceof Error ? error.message : String(error)}`, 12000);
+            if (draftSaved) {
+              button.setButtonText("本机合并稿已保存，请刷新预览");
+            } else {
+              button.setDisabled(false).setButtonText("提交这份合并正文");
+              editor.disabled = false;
+            }
+          }
+        }));
+    }
+  }
+}
+
+class VaultSyncV2DeletedHistoryModal extends Modal {
+  constructor(
+    app: App,
+    private entries: Array<{ fileId: string; path: string }>,
+    private select: (entry: { fileId: string; path: string }) => void,
+  ) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText("已删除文件历史");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "选择一个有已验证云端删除检查点的文件。恢复会从历史正文创建新路径，原路径不会被覆盖。",
+    });
+    for (const entry of this.entries) {
+      new Setting(this.contentEl)
+        .setName(entry.path)
+        .setDesc(`云端当前 head 为删除检查点 · file ${entry.fileId.slice(0, 8)}…`)
+        .addButton((button) => button.setButtonText("查看历史").onClick(() => {
+          this.close();
+          this.select(entry);
+        }));
+    }
+  }
+}
+
+class VaultSyncV2HistoryModal extends Modal {
+  private items: VaultSyncV2FileVersion[];
+  private hasMore: boolean;
+  private nextCursor: string | null;
+  private loading = false;
+
+  constructor(
+    app: App,
+    private filePath: string,
+    page: VaultSyncV2FileVersionsPage,
+    private readPage: (beforeVersionNumber: string) => Promise<VaultSyncV2FileVersionsPage>,
+    private preview: (version: VaultSyncV2FileVersion) => Promise<string>,
+    private restore?: (version: VaultSyncV2FileVersion) => Promise<void>,
+    private deletedHead = false,
+  ) {
+    super(app);
+    this.items = [...page.items];
+    this.hasMore = page.hasMore;
+    this.nextCursor = page.nextBeforeVersionNumber;
+  }
+
+  onOpen() { this.render(); }
+
+  private render() {
+    this.titleEl.setText("云端历史版本");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", { text: this.restore
+      ? this.deletedHead
+        ? `${this.filePath} · 已删除文件恢复优先使用原路径；路径被占用时生成新路径，不覆盖本地文件`
+        : `${this.filePath} · 恢复会生成新路径和新版本，并保留当前本地文件`
+      : `${this.filePath} · 历史记录只读预览；当前账号或服务端尚未开放恢复写入` });
+    if (!this.items.length) {
+      this.contentEl.createEl("p", { text: "当前文件没有可显示的历史检查点。" });
+      return;
+    }
+    for (const version of this.items) {
+      const date = new Date(version.createdAt).toLocaleString();
+      const state = version.isDeleted ? "删除检查点"
+        : version.contentStatus === "object_referenced" && version.byteSize > HISTORY_RESTORE_MAX_BYTES ? "超过 24 MiB 恢复上限"
+          : version.contentStatus === "object_referenced" && !version.path.toLowerCase().endsWith(".md") ? "附件可恢复"
+            : version.contentStatus === "object_referenced" && version.byteSize > HISTORY_PREVIEW_MAX_BYTES ? "可恢复，不提供预览"
+              : version.contentStatus === "object_referenced" ? "可预览并恢复"
+          : version.contentStatus === "pruned" ? "正文已按留存策略清理"
+          : version.contentStatus === "legacy_unverified" ? "旧版正文未验证"
+            : "正文暂不可用";
+      const setting = new Setting(this.contentEl)
+        .setName(`版本 ${version.versionNumber}${version.isCurrent ? " · 当前版本" : ""}`)
+        .setDesc(`${date} · ${version.path} · ${state} · ${version.byteSize} bytes`);
+      if (!version.isDeleted && version.contentStatus === "object_referenced" && version.contentObjectId) {
+        if (canPreviewHistoryVersion(version)) {
+          setting.addButton((button) => button.setButtonText("预览").onClick(async () => {
+            button.setDisabled(true).setButtonText("读取中…");
+            try {
+              const content = await this.preview(version);
+              new VaultSyncV2HistoryPreviewModal(this.app, version, content).open();
+            } catch (error) {
+              new Notice(`历史预览失败：${formatVaultSyncHistoryError(error)}`, 8000);
+            } finally {
+              button.setDisabled(false).setButtonText("预览");
+            }
+          }));
+        }
+        if (this.restore && canRestoreHistoryVersion(version)) {
+          const restoreLabel = this.deletedHead ? "恢复版本" : "恢复为新路径";
+          setting.addButton((button) => button.setButtonText(restoreLabel).onClick(async () => {
+            button.setDisabled(true).setButtonText("恢复中…");
+            try {
+              await this.restore!(version);
+            } catch (error) {
+              new Notice(`历史恢复失败：${formatVaultSyncHistoryError(error)}`, 10000);
+            } finally {
+              button.setDisabled(false).setButtonText(restoreLabel);
+            }
+          }));
+        }
+      }
+    }
+    if (this.hasMore && this.nextCursor) {
+      const button = this.contentEl.createEl("button", { text: this.loading ? "读取中…" : "更早版本" });
+      button.disabled = this.loading;
+      button.addEventListener("click", () => { void this.loadMore(button); });
+    }
+  }
+
+  private async loadMore(button: HTMLButtonElement) {
+    if (this.loading || !this.nextCursor) return;
+    this.loading = true;
+    button.disabled = true;
+    button.setText("读取中…");
+    try {
+      const page = await this.readPage(this.nextCursor);
+      const known = new Set(this.items.map((item) => item.versionId));
+      this.items.push(...page.items.filter((item) => !known.has(item.versionId)));
+      this.hasMore = page.hasMore;
+      this.nextCursor = page.nextBeforeVersionNumber;
+    } catch (error) {
+      new Notice(`读取更早版本失败：${formatVaultSyncHistoryError(error)}`, 8000);
+    } finally {
+      this.loading = false;
+      this.render();
+    }
+  }
+}
+
+class VaultSyncV2HistoryPreviewModal extends Modal {
+  constructor(app: App, private version: VaultSyncV2FileVersion, private content: string) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText(`历史预览 · 版本 ${this.version.versionNumber}`);
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: `${this.version.path} · ${new Date(this.version.createdAt).toLocaleString()} · 只读预览`,
+    });
+    this.contentEl.createEl("pre", { text: this.content }).setCssStyles({
+      maxHeight: "65vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+    });
   }
 }
 
@@ -2762,6 +5931,82 @@ class AccountLogoutConfirmModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
+  }
+}
+
+class VaultSyncV2DeletionReviewModal extends Modal {
+  private confirming = false;
+  private handledCount = 0;
+  private readonly lifetime = new DeletionReviewModalLifetime();
+
+  constructor(
+    app: App,
+    private items: VaultSyncV2PendingDeletion[],
+    private confirm: (item: VaultSyncV2PendingDeletion) => Promise<VaultSyncV2PendingDeletion[]>,
+    private onDismiss: () => void,
+  ) { super(app); }
+
+  onOpen() {
+    this.titleEl.setText("确认同步删除");
+    this.renderPendingItems();
+  }
+
+  private renderPendingItems() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: "这些文件在本机已不存在，但云端仍有当前版本。微同步不会自动删除云端文件；逐项确认后才会提交 tombstone。若云端版本在确认前变化，操作会进入冲突中心，不会覆盖新版本。",
+    });
+    contentEl.createEl("p", {
+      text: this.handledCount > 0
+        ? `已处理 ${this.handledCount} 项，剩余 ${this.items.length} 项。完成前，此窗口会保持打开。`
+        : `共 ${this.items.length} 项待确认；逐项处理时会留在此窗口。`,
+      cls: "setting-item-description",
+      attr: { role: "status" },
+    });
+    const confirmButtons: HTMLButtonElement[] = [];
+    for (const item of this.items) {
+      new Setting(contentEl)
+        .setName(item.path)
+        .setDesc(`云端版本 ${item.expectedVersionId.slice(0, 8)}… · ${item.byteSize} bytes${item.pendingOperationCount
+          ? ` · 另有 ${item.pendingOperationCount} 条未完成的本机提交；确认后若云端删除成功，这些提交会一并取消。若云端版本已变化，提交会进入冲突处理。`
+          : ""}`)
+        .addButton((button) => {
+          confirmButtons.push(button.buttonEl);
+          button.setButtonText("确认删除云端版本").setWarning().onClick(async () => {
+            if (this.confirming) return;
+            this.confirming = true;
+            for (const confirmButton of confirmButtons) confirmButton.disabled = true;
+            button.setButtonText("提交中…");
+            await this.lifetime.settle(async () => {
+              const previousCount = this.items.length;
+              const nextItems = await this.confirm(item);
+              return { previousCount, nextItems };
+            }, ({ previousCount, nextItems }) => {
+              this.items = nextItems;
+              this.handledCount += Math.max(0, previousCount - this.items.length);
+              this.confirming = false;
+              if (shouldCloseDeletionReviewModal(this.items)) this.close();
+              else this.renderPendingItems();
+            }, (error) => {
+              this.confirming = false;
+              for (const confirmButton of confirmButtons) confirmButton.disabled = false;
+              button.setButtonText("确认删除云端版本");
+              new Notice(`删除确认失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              if (shouldDismissDeletionReviewOnError(error)) this.close();
+            });
+          });
+        });
+    }
+    new Setting(contentEl).addButton((button) => button
+      .setButtonText("暂不处理")
+      .onClick(() => this.close()));
+  }
+
+  onClose() {
+    this.lifetime.close();
+    this.contentEl.empty();
+    this.onDismiss();
   }
 }
 
@@ -2950,6 +6195,8 @@ class WeTongbuSettingTab extends PluginSettingTab {
   private secretKeyInput: string | null = null;
   private recoveryTokenInput = "";
   private vaultPairingCodeInput = "";
+  private captureHandoffSetting: Setting | null = null;
+  private captureHandoffRenderGeneration = 0;
 
   constructor(app: App, private plugin: WeTongbuPlugin) {
     super(app, plugin);
@@ -2972,8 +6219,24 @@ class WeTongbuSettingTab extends PluginSettingTab {
     this.displayPreservingScroll();
   }
 
+  refreshCaptureHandoffStatus() {
+    const setting = this.captureHandoffSetting;
+    if (!setting) return;
+    const generation = ++this.captureHandoffRenderGeneration;
+    void this.plugin.getCaptureHandoffStatusSummary().then((summary) => {
+      if (generation === this.captureHandoffRenderGeneration && setting === this.captureHandoffSetting) setting.setDesc(summary);
+    }).catch(() => {
+      if (generation === this.captureHandoffRenderGeneration && setting === this.captureHandoffSetting) {
+        setting.setDesc("暂时无法读取本机剪藏同步状态；已保存的内容仍留在 Vault 中。");
+      }
+    });
+  }
+
   display(): void {
     const { containerEl } = this;
+    if (this.plugin.accountLoggedIn && this.plugin.settings.vaultSyncEnabled && this.plugin.settings.vaultEncryptionEnabled) {
+      void this.plugin.refreshVaultEncryptionRotationAvailability();
+    }
     containerEl.classList.add("wetongbu-setting-tab");
     containerEl.classList.toggle("wetongbu-mobile-settings", Platform.isMobile);
     const scrollEl = containerEl.closest(".vertical-tab-content") as HTMLElement | null;
@@ -2991,13 +6254,19 @@ class WeTongbuSettingTab extends PluginSettingTab {
     // upgrades and are never used to construct a sync client.
     const canUseSelfHostedStorage = false;
 
+    const renderedAccountLoggedIn = this.plugin.accountLoggedIn;
     new Setting(containerEl)
       .setName("账号与登录")
       .setDesc(this.plugin.accountStatus)
       .addButton((button) =>
-        button.setButtonText(this.plugin.accountLoggedIn ? "退出账号" : "登录账号")
+        button.setButtonText(renderedAccountLoggedIn ? "退出账号" : "登录账号")
           .onClick(async () => {
             const wasLoggedIn = this.plugin.accountLoggedIn;
+            if (wasLoggedIn !== renderedAccountLoggedIn) {
+              this.displayPreservingScroll();
+              new Notice("账号状态刚刚更新，页面已刷新；请按最新状态重新操作", 8000);
+              return;
+            }
             if (wasLoggedIn) {
               new AccountLogoutConfirmModal(this.app, async () => {
                 await this.plugin.logoutAccount();
@@ -3211,16 +6480,21 @@ class WeTongbuSettingTab extends PluginSettingTab {
               button.setDisabled(false);
             }
           }));
+
     }
 
-    this.textSetting("微同步目录", "文章、附件和 AI 说明文件的根目录", "rootFolder");
+    this.textSetting(
+      "微同步目录",
+      `文章、附件和 AI 说明文件的剪藏根目录；Vault Sync 选择“仅 ${this.plugin.settings.rootFolder} 目录”时也以此路径筛选文件。手动新建文件夹不会自动更新此字段。`,
+      "rootFolder",
+    );
 
     if (this.plugin.pendingDeletionCount > 0) {
       new Setting(containerEl)
-        .setName("待确认的删除")
-        .setDesc(`有 ${this.plugin.pendingDeletionCount} 个文件等待你确认删除或恢复；微同步不会自动执行。`)
+        .setName(`需要处理的删除：${this.plugin.pendingDeletionCount} 项`)
+        .setDesc("本机删除不会立即删除云端或其他设备上的文件；请逐项确认同步删除或恢复。提醒关闭后，可在命令面板搜索“微同步：处理待确认删除”重新打开。")
         .addButton((button) => button
-          .setButtonText("查看并处理")
+          .setButtonText(`现在处理 ${this.plugin.pendingDeletionCount} 项`)
           .onClick(() => { void this.plugin.openPendingDeletionReview(); }));
     }
 
@@ -3249,17 +6523,24 @@ class WeTongbuSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("立即同步")
       .setDesc(this.plugin.settings.vaultSyncEnabled
-        ? "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除"
+        ? (this.plugin.settings.vaultSyncDeleteMode === "review"
+          ? "获取新的剪藏笔记，并同步当前 Vault 的新增和修改。本机删除默认先保留云端副本；同步后提醒你确认。其他设备收到已提交的云端删除会自动应用，未同步修改仍会保留并进入冲突处理。"
+          : "获取新的剪藏笔记，并同步当前 Vault 的新增、修改和删除。其他设备收到已提交的云端删除会自动应用，未同步修改仍会保留并进入冲突处理。")
         : "检查飞书、网页和微信剪藏任务；开启多端同步后也会同步 Vault 文件")
       .addButton((button) =>
         button.setButtonText("立即同步").onClick(() => this.plugin.manualSync()),
       );
 
+    this.captureHandoffSetting = new Setting(containerEl)
+      .setName("剪藏同步状态")
+      .setDesc("正在读取本机剪藏交接状态…");
+    this.refreshCaptureHandoffStatus();
+
     const canVaultSync = this.plugin.accountCanVaultSync;
     const vaultSyncSetting = new Setting(containerEl)
       .setName("多端同步")
       .setDesc(canVaultSync
-        ? "在多台设备间双向同步整个 Vault，无需其他设置。开启后仍需点击“立即同步”，或配置自动同步间隔；同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"
+        ? "在多台设备间双向同步整个 Vault。新安装默认自动同步；开启后本机文件变更会自动触发，首次同步仍按安全提示处理。同文件在两台设备都修改时会生成冲突副本，不会静默覆盖。"
         : (this.plugin.accountLoggedIn
           ? "当前账号暂未开放 Vault 多端同步；同步权益由账号套餐配置。"
           : "登录账号后可连接云端 Vault，并在多台设备间同步。无需其他设置。"))
@@ -3272,7 +6553,9 @@ class WeTongbuSettingTab extends PluginSettingTab {
               toggle.setDisabled(true);
               await this.plugin.setVaultSyncEnabled(value);
               if (value) {
-                new Notice("Vault 多端同步已开启：请点击“立即同步”，或配置自动同步间隔", 7000);
+                new Notice(this.plugin.settings.vaultSyncIntervalMinutes === null
+                  ? "Vault 多端同步已开启为手动模式；请点击“立即同步”，或选择自动同步间隔"
+                  : "Vault 多端同步已开启：文件变更会自动触发同步，首次同步按安全提示处理", 8000);
               } else {
                 new Notice("Vault 多端同步已暂停");
               }
@@ -3287,16 +6570,199 @@ class WeTongbuSettingTab extends PluginSettingTab {
       );
     vaultSyncSetting.settingEl.addClass("wetongbu-vault-sync-setting");
 
+    if (this.plugin.settings.syncTargetId) {
+      new Setting(containerEl)
+        .setName("当前同步 Vault UUID")
+        .setDesc("复制当前连接的云端 Vault 标识，用于专用空测试 Vault 的基线核验。UUID 不是访问凭证；请勿使用日常 Vault 进行生产 canary，也不要分享整个插件设置文件。")
+        .addButton((button) => button
+          .setButtonText("复制 UUID")
+          .onClick(async () => {
+            try {
+              await navigator.clipboard.writeText(this.plugin.settings.syncTargetId);
+              new Notice("当前同步 Vault UUID 已复制到剪贴板");
+            } catch {
+              new Notice("复制 UUID 失败，请稍后重试；不要分享整个插件设置文件。", 10000);
+            }
+          }));
+    }
+
+    if (this.plugin.settings.syncTargetId && this.plugin.settings.vaultInstallationId) {
+      const pathMoveProgress = new Setting(containerEl)
+        .setName("文件改名/移动进度")
+        .setDesc("正在读取本机待办数量…");
+      const refreshPathMoveProgress = async () => {
+        const summary = await createVaultSyncPathIntentStore(this.plugin.app, {
+          apiBaseUrl: normalizeApiBaseUrl(this.plugin.settings.apiBaseUrl),
+          targetId: this.plugin.settings.syncTargetId,
+          installationId: this.plugin.settings.vaultInstallationId,
+        }).summary();
+        const status: string[] = [];
+        if (summary.directoryMoveGroupCount > 0) {
+          status.push(`目录移动 ${summary.directoryMoveGroupCount} 组：已处理 ${summary.directoryMoveSettledCount}/${summary.directoryMoveTotalCount} 项，剩余 ${summary.directoryMoveRemainingCount} 项，其中冲突 ${summary.directoryMoveConflictCount} 项`);
+        }
+        if (summary.pendingCount > 0 || summary.conflictCount > 0) {
+          status.push(`全部路径变更队列待同步 ${summary.pendingCount} 项，冲突 ${summary.conflictCount} 项`);
+        }
+        const description = status.length
+          ? `${status.join("；")}。${summary.conflictCount > 0 ? "冲突项请在冲突中心处理。" : ""}剩余项目逐项提交，应用重启后可继续。这里只显示数量，不显示文件路径。`
+          : "没有未完成的文件改名或移动待办。这里只显示数量，不显示文件路径。";
+        pathMoveProgress.setDesc(description);
+      };
+      pathMoveProgress.addButton((button) => button
+        .setButtonText("刷新进度")
+        .onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await refreshPathMoveProgress();
+          } catch {
+            pathMoveProgress.setDesc("暂时无法读取本机改名/移动待办数量；同步状态不变。请稍后重试。");
+          } finally {
+            button.setDisabled(false);
+          }
+        }));
+      void refreshPathMoveProgress().catch(() => {
+        pathMoveProgress.setDesc("暂时无法读取本机改名/移动待办数量；同步状态不变。可稍后刷新重试。");
+      });
+    }
+
+    if (this.plugin.settings.vaultSyncEnabled && canVaultSync) {
+      const progress = this.plugin.vaultSyncDeviceProgress;
+      const stateLabel = (state: "up_to_date" | "catching_up" | "unknown") => state === "up_to_date"
+        ? "已追平"
+        : state === "catching_up" ? "正在追赶" : "暂无应用回执";
+      const progressExplanation = "设备‘已追平’表示已应用游标达到当前云端游标；已应用游标按连续变更计算，尚未提交到云端的本地改动（包括待确认删除）不会显示在这里。确认删除成功提示中的‘云端变更游标’可与接收设备的‘已应用游标’比较；后者达到或超过该值，才表示该设备已应用这条删除变更。“查询于”是本机完成刷新状态时记下的时间，不是传播计时；不同设备查询时间的差值不能直接作为笔记同步耗时。设备名后的 ID 前缀可与冲突详情里的来源设备对应。";
+      const pendingDeletionCount = this.plugin.pendingDeletionCount;
+      const pendingDeletionProgress = formatPendingDeletionDeviceProgress(pendingDeletionCount);
+      const progressDescription = progress
+        ? [`云端游标 ${progress.changeCursor}`,
+          ...progress.devices.map((device) => `${device.deviceName}（ID ${device.deviceId.slice(0, 8)}${device.deviceId === this.plugin.settings.vaultDeviceId ? "，本机" : ""}）：${stateLabel(device.state)}（${formatVaultSyncDeviceCursors(device)}）`),
+          `查询于 ${this.plugin.vaultSyncDeviceProgressFetchedAt || "刚刚"}`,
+          ...(pendingDeletionProgress ? [pendingDeletionProgress] : []),
+          progressExplanation].join("；")
+        : `状态依据各设备已应用 ACK；旧设备或尚未完成首次快照的设备会显示为未知。${pendingDeletionProgress ? `${pendingDeletionProgress} ` : ""}${progressExplanation}`;
+      new Setting(containerEl)
+        .setName("设备追平状态")
+        .setDesc(progressDescription)
+        .addButton((button) => button
+          .setButtonText("刷新设备状态")
+          .onClick(async () => {
+            try {
+              button.setDisabled(true);
+              await this.plugin.refreshVaultSyncDeviceProgress();
+              this.displayPreservingScroll();
+            } catch (error) {
+              new Notice(`读取设备同步状态失败：${error instanceof Error ? error.message : String(error)}`, 8000);
+            } finally {
+              button.setDisabled(false);
+            }
+          }));
+      if (pendingDeletionCount > 0) {
+        new Setting(containerEl)
+          .setName("本机待提交删除")
+          .setDesc("设备追平状态不包含本机待审删除；云端尚未收到这些删除。")
+          .addButton((button) => button
+            .setButtonText(`处理 ${pendingDeletionCount} 项待确认删除`)
+            .onClick(() => { void this.plugin.openPendingDeletionReview(); }));
+      }
+
+      const diagnostics = this.plugin.vaultSyncDiagnostics.snapshot();
+      const formatSeconds = (value: number | null | undefined) => value === null || value === undefined
+        ? "—"
+        : `${(value / 1000).toFixed(1)} 秒`;
+      const latest = diagnostics.latest;
+      const eventIssueLabels: Record<string, string> = {
+        ticket_unauthorized: "票据请求未授权",
+        ticket_rate_limited: "票据请求限流",
+        ticket_server_error: "票据服务端错误",
+        ticket_http_error: "票据 HTTP 请求失败",
+        ticket_response_invalid: "票据响应无效",
+        ticket_session_mismatch: "设备会话不匹配",
+        ticket_transport_error: "票据请求网络错误",
+        websocket_unavailable: "WebSocket 不可用",
+        websocket_open_timeout: "WebSocket 建连超时",
+        websocket_ready_timeout: "WebSocket 认证握手超时",
+      } as const;
+      const eventIssueDescription = (issue: typeof diagnostics.lastEventIssue) => {
+        if (!issue) return "";
+        const stagedClose = issue.match(/^websocket_closed_(before_open|before_ready|after_ready)_(0|[1-4][0-9]{3})$/);
+        if (stagedClose) {
+          const stageLabels: Record<string, string> = {
+            before_open: "连接建立前中断",
+            before_ready: "认证握手完成前中断",
+            after_ready: "认证连接建立后断开",
+          };
+          return `最近异常：WebSocket ${stageLabels[stagedClose[1]]}，关闭码 ${stagedClose[2]}。`;
+        }
+        if (issue.startsWith("websocket_closed_")) return `最近异常：WebSocket 关闭码 ${issue.slice("websocket_closed_".length)}。`;
+        return `最近异常：${eventIssueLabels[issue]}。`;
+      };
+      const diagnosticStageLabels: Record<VaultSyncDiagnosticStage, string> = {
+        device_auth: "设备凭据",
+        remote_status: "云端状态",
+        encryption_setup: "加密准备",
+        capability_read: "能力读取",
+        local_prepare: "本机准备",
+        pull: "拉取",
+        push: "推送",
+        finalize: "收尾",
+        legacy_sync: "旧版同步",
+      };
+      const work = latest?.work;
+      const localWorkDescription = work ? [
+        work.scanEntryCount === undefined
+          ? "本机扫描未运行"
+          : `本机扫描 ${work.scanEntryCount} 个文件${work.scanIssueCount ? `，扫描异常 ${work.scanIssueCount} 项` : ""}`,
+        work.pushCommittedCount === undefined
+          ? "推送阶段未运行"
+          : `推送：已提交 ${work.pushCommittedCount}、改名 ${work.pushRenamedCount ?? 0}、删除 ${work.pushDeletedCount ?? 0}、冲突 ${work.pushConflictCount ?? 0}、失败 ${work.pushFailedCount ?? 0}、需重基 ${work.pushNeedsRebaseCount ?? 0}、预算暂缓 ${work.pushSkippedForBudgetCount ?? 0}、删除待审核 ${work.pendingDeletionReviewCount ?? 0}`,
+        work.outboxReadable === false
+          ? "本机 outbox 读取失败"
+          : work.outboxSnapshotPresent === false
+            ? "本机 outbox 没有可用快照"
+            : work.outboxSnapshotPresent
+              ? `本机 outbox：排队 ${work.outboxQueuedCount ?? 0}、准备 ${work.outboxPreparingCount ?? 0}、已上传 ${work.outboxUploadedCount ?? 0}、提交中 ${work.outboxCommittingCount ?? 0}、已确认未清理 ${work.outboxConfirmedCount ?? 0}、冲突 ${work.outboxConflictCount ?? 0}、需重基 ${work.outboxNeedsRebaseCount ?? 0}；inbox 未应用 ${work.inboxReceivedCount ?? 0}、待解决 ${work.inboxNeedsResolutionCount ?? 0}`
+              : "本机 outbox 状态未采集",
+      ].join("。 ") + "。" : "";
+      const diagnosticDescription = [
+        `仅本机内存保留本次 Obsidian 运行期的耗时、聚合计数和状态，不上传，重启后清空。完整同步 ${diagnostics.completedCount} 轮：总用时 P50 ${formatSeconds(diagnostics.durationP50Ms)} / P95 ${formatSeconds(diagnostics.durationP95Ms)}。`,
+        "“需重基”表示已停止自动重试的旧请求，保留供核对；不会阻塞其他独立笔记同步。点击“查看需重基项”可查看操作类型、原因和路径。",
+        `v2 拉取 P95 ${formatSeconds(diagnostics.pullP95Ms)}，推送阶段 P95 ${formatSeconds(diagnostics.pushP95Ms)}。`,
+        `推送 CAS 自动合并：尝试 ${diagnostics.pushCasAutoMergeAttemptCount} 次、持久重提 ${diagnostics.pushCasAutoMergeRetryQueuedCount} 次、云端确认 ${diagnostics.pushCasAutoMergeRetryCommittedCount} 次。`,
+        `CAS（比较并交换）统计只覆盖符合条件的 Markdown 推送冲突：尝试表示开始自动重算，持久重提表示合并结果已存入本机待办，云端确认表示云端已确认提交。三项均为 0 表示本轮没有触发这条重试路径，不代表同步失败。`,
+        `云端提交→本机安全应用 P50 ${formatSeconds(diagnostics.appliedLatencyP50Ms)} / P95 ${formatSeconds(diagnostics.appliedLatencyP95Ms)}（${diagnostics.appliedLatencySampleCount} 个样本；包含提交后等待本机安全落盘的时间，打开中的笔记会使应用延后；不含本机编辑到云端提交前的等待与上传）。`,
+        `自动同步总等待 P95 ${formatSeconds(diagnostics.queueWaitP95Ms)}（${diagnostics.queueWaitSampleCount} 个样本；按系统时钟从本机变更计到同步启动，可能包含后台或离线暂停，也可能受系统时钟校准影响）。未暂停调度等待 P95 ${formatSeconds(diagnostics.activeQueueWaitP95Ms)}（${diagnostics.activeQueueWaitSampleCount} 个样本；只累计调度器未暂停时间，不代表系统睡眠检测或设备间传播时延）；事件通道${({ stopped: "已停止", offline: "离线", connecting: "连接中", connected: "已连接", polling: "轮询回退" } as const)[diagnostics.connectionStatus]}；本次运行成功重连 ${diagnostics.successfulReconnectCount} 次。${eventIssueDescription(diagnostics.lastEventIssue)}`,
+        latest ? `最近一轮：${latest.protocol} / ${latest.outcome} / ${formatSeconds(latest.durationMs)}${latest.stage ? ` / 阶段 ${diagnosticStageLabels[latest.stage]}` : ""}${latest.failureCode ? ` / ${latest.failureCode}` : ""}。` : "尚无本次运行的同步样本。",
+        localWorkDescription,
+      ].join(" ");
+      new Setting(containerEl)
+        .setName("本地同步性能统计")
+        .setDesc(diagnosticDescription)
+        .addButton((button) => button
+          .setButtonText("刷新统计")
+          .onClick(() => this.displayPreservingScroll()))
+        .addButton((button) => button
+          .setButtonText("查看需重基项")
+          .onClick(() => { void this.plugin.openVaultSyncNeedsRebaseReview(); }))
+        .addButton((button) => button
+          .setButtonText("清空")
+          .onClick(() => {
+            this.plugin.vaultSyncDiagnostics.clear();
+            this.displayPreservingScroll();
+          }));
+    }
+
     if (this.plugin.accountCanVaultSync) {
       const currentInterval = this.plugin.settings.vaultSyncIntervalMinutes;
       new Setting(containerEl)
         .setName("自动同步 Vault")
         .setDesc(this.plugin.settings.vaultSyncEnabled
-          ? (currentInterval === null ? "当前为无限：不会自动同步，请在上方点击“立即同步”。" : `每 ${currentInterval} 分钟自动同步一次；仍可随时点击“立即同步”。`)
-          : "先开启多端同步；设置为“无限”可关闭自动同步。")
+          ? (currentInterval === null
+            ? "当前为手动模式：文件变更不会自动上传，请点击“立即同步”。"
+            : `本机文件变更后约 0.8 秒触发同步；每 ${currentInterval} 分钟另做一次对账兜底。端到端耗时取决于网络和设备，可随时点击“立即同步”。`)
+          : "先开启多端同步；新安装默认自动同步（文件事件触发，1 分钟对账兜底），已有手动选择会保留。")
         .addDropdown((dropdown) => {
           dropdown
-            .addOption("1", "1 分钟")
+            .addOption("1", "1 分钟（默认；文件变更即时触发）")
             .addOption("5", "5 分钟")
             .addOption("10", "10 分钟")
             .addOption("20", "20 分钟")
@@ -3312,21 +6778,30 @@ class WeTongbuSettingTab extends PluginSettingTab {
         });
     }
 
-    if (this.plugin.settings.vaultSyncEnabled && this.plugin.accountCanVaultSync) {
+    if (this.plugin.accountCanVaultSync) {
       new Setting(containerEl)
         .setName("同步范围")
-        .setDesc("选择要同步的范围。整个 Vault 会包含所有笔记；仅微同步目录只同步剪藏产生的内容。")
+        .setDesc(this.plugin.settings.vaultSyncEnabled
+          ? "这是 Vault 级同步策略；更改后会立即按新范围重建快照并同步。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认；缩小范围时，范围外云端文件会保留且不会被当作删除。"
+          : "首次启用前可先选择同步范围。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认。若当前 Vault 含有日常文件，请先把“微同步目录”改为仅含合成测试数据的专用目录，再选择仅同步该目录。")
         .addDropdown((dropdown) =>
           dropdown
             .addOption("whole_vault", "整个 Vault（推荐）")
             .addOption("root_folder", `仅 ${this.plugin.settings.rootFolder} 目录`)
             .setValue(this.plugin.settings.vaultSyncScope)
             .onChange(async (value) => {
-              this.plugin.settings.vaultSyncScope = value as VaultSyncScope;
-              await this.plugin.saveSettings();
+              try {
+                await this.plugin.setVaultSyncScope(value as VaultSyncScope);
+              } catch (error) {
+                new Notice(`同步范围更新失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+              } finally {
+                this.displayPreservingScroll();
+              }
             }),
         );
+    }
 
+    if (this.plugin.settings.vaultSyncEnabled && this.plugin.accountCanVaultSync) {
       new Setting(containerEl)
         .setName("首次同步方向")
         .setDesc("仅在此设备第一次同步时生效。推荐自动判断：电脑先建立空云端基线，新设备与云端非破坏性合并；已有同步基线后不再使用。")
@@ -3342,6 +6817,34 @@ class WeTongbuSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
             }),
         );
+
+      new Setting(containerEl)
+        .setName("Markdown 自动合并")
+        .setDesc(this.plugin.settings.vaultSyncMergeMode === "automatic"
+          ? "共同基线可验证且修改不重叠时自动合并；重叠修改仍会进入冲突处理。"
+          : "严格模式：任何双端同时修改都保留双方并进入冲突处理；你仍可在冲突中心明确选择采用云端。")
+        .addDropdown((dropdown) => dropdown
+          .addOption("automatic", "自动合并（推荐）")
+          .addOption("manual", "严格保留双方")
+          .setValue(this.plugin.settings.vaultSyncMergeMode)
+          .onChange(async (value) => {
+            await this.plugin.setVaultSyncMergeMode(value as VaultSyncMergeMode);
+            this.display();
+          }));
+
+      new Setting(containerEl)
+        .setName("本机删除提交策略")
+        .setDesc(this.plugin.settings.vaultSyncDeleteMode === "automatic"
+          ? "此策略只控制本机删除何时提交云端：小批量自动提交，大批量仍按保护设置检查。云端删除一经提交，其他设备会自动应用；接收端仅在本机副本与同步基线一致、未打开且无待提交改名时应用，并遵循该设备 Obsidian“设置 → 文件与链接 → 已删除文件”的选项，移入 Obsidian 回收站、系统回收站或永久删除。"
+          : "此策略只控制本机删除何时提交云端：先保留云端副本，提醒你逐项确认后才提交。云端删除一经确认，其他设备会自动应用；接收端仅在本机副本与同步基线一致、未打开且无待提交改名时应用，并遵循该设备 Obsidian“设置 → 文件与链接 → 已删除文件”的选项，移入 Obsidian 回收站、系统回收站或永久删除。")
+        .addDropdown((dropdown) => dropdown
+          .addOption("review", "逐项确认（默认）")
+          .addOption("automatic", "自动同步小批量删除")
+          .setValue(this.plugin.settings.vaultSyncDeleteMode)
+          .onChange(async (value) => {
+            await this.plugin.setVaultSyncDeleteMode(value as VaultSyncDeleteMode);
+            this.display();
+          }));
 
       new Setting(containerEl)
         .setName("大批量变更保护")
@@ -3374,7 +6877,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("端到端加密（可选）")
         .setDesc(this.plugin.settings.vaultEncryptionEnabled
-          ? "已启用：笔记内容在本地加密后才上传。其他设备需要输入相同密码；忘记密码无法恢复云端内容。"
+          ? "已启用：笔记内容在本地加密后才上传。此处用于保存当前密码到本机 SecretStorage；更换密码需要完成客户端重加密迁移。忘记密码无法恢复云端内容。"
           : "启用后，微同步服务器和托管对象存储都不会看到笔记明文；请在每台设备输入相同密码。")
         .addText((text) => {
           text.inputEl.type = "password";
@@ -3382,7 +6885,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
             .onChange((value) => { this.plugin.vaultEncryptionInput = value; });
         })
         .addButton((button) => button
-          .setButtonText(this.plugin.settings.vaultEncryptionEnabled ? "更新密码" : "启用加密")
+          .setButtonText(this.plugin.settings.vaultEncryptionEnabled ? "保存此设备密码" : "启用加密")
           .onClick(async () => {
             try {
               await this.plugin.enableVaultEncryption(this.plugin.vaultEncryptionInput);
@@ -3400,6 +6903,60 @@ class WeTongbuSettingTab extends PluginSettingTab {
             this.display();
             new Notice("端到端加密已停用；已有云端文件仍保持加密，请先转存或继续使用原密码");
           }));
+
+      const rotationPending = Boolean(this.plugin.settings.vaultEncryptionRotationOperationId
+        || this.plugin.settings.vaultEncryptionRotationId || this.plugin.settings.vaultEncryptionRotationSecretId);
+      if (this.plugin.vaultEncryptionRotationAvailable || rotationPending) {
+        new Setting(containerEl)
+          .setName("更换 Vault 加密密码")
+          .setDesc(this.plugin.vaultEncryptionRotationStatus
+            || (rotationPending
+              ? "检测到未完成的密码迁移；请在发起迁移的设备继续，旧密码会保留到迁移完成。"
+              : "迁移会逐个下载、校验并重新加密云端对象；期间多设备同步暂停，可在此设备继续或安全中止。新密码保存在本机 SecretStorage。"))
+          .addText((text) => {
+            text.inputEl.type = "password";
+            text.setPlaceholder(rotationPending ? "续跑时留空即可" : "至少 8 个字符")
+              .setValue(this.plugin.vaultEncryptionRotationInput)
+              .onChange((value) => { this.plugin.vaultEncryptionRotationInput = value; });
+          })
+          .addButton((button) => button
+            .setButtonText(this.plugin.vaultEncryptionRotationRunning
+              ? "正在迁移…"
+              : rotationPending ? "继续迁移" : "更换密码并迁移")
+            .setDisabled(this.plugin.vaultEncryptionRotationRunning
+              || (!rotationPending && !this.plugin.vaultEncryptionRotationAvailable))
+            .onClick(async () => {
+              try {
+                button.setDisabled(true);
+                const result = await this.plugin.rotateVaultEncryptionKey(this.plugin.vaultEncryptionRotationInput);
+                this.displayPreservingScroll();
+                new Notice(result.completed
+                  ? "Vault 加密密码已更换，旧对象清理完成"
+                  : `新密码已启用，${result.remainingSourceObjects} 个旧对象将在下载 lease 到期后清理；稍后继续即可`, 10000);
+              } catch (error) {
+                new Notice(`密钥迁移未完成：${error instanceof Error ? error.message : String(error)}`, 10000);
+              } finally {
+                button.setDisabled(false);
+                this.displayPreservingScroll();
+              }
+            }))
+          .addButton((button) => button
+            .setButtonText("中止迁移")
+            .setDisabled(!rotationPending || this.plugin.vaultEncryptionRotationRunning)
+            .onClick(async () => {
+              if (!window.confirm("中止会回滚尚未激活的对象引用，保留原密码和原文件。确定中止密钥迁移吗？")) return;
+              try {
+                button.setDisabled(true);
+                await this.plugin.abortVaultEncryptionKeyRotation();
+                new Notice("密钥迁移已中止；原密码和原文件仍可使用");
+              } catch (error) {
+                new Notice(`无法中止密钥迁移：${error instanceof Error ? error.message : String(error)}`, 10000);
+              } finally {
+                button.setDisabled(false);
+                this.displayPreservingScroll();
+              }
+            }));
+      }
     }
 
     const hasPluginToken = this.plugin.hasPluginToken();
