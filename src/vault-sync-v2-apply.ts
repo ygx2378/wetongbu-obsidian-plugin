@@ -1483,6 +1483,89 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
     return !(await adapter.exists(stagedApplyMarkerPath(entry.item.fileId, entry.item.cursor)));
   }
 
+  async function advanceNetZeroRemoteUpdateChain(entry: VaultSyncInboxEntry): Promise<boolean> {
+    const item = entry.item;
+    const maxBytes = 2 * 1024 * 1024;
+    const path = normalizeVaultPath(item.path);
+    if (entry.state === "applied" || item.eventType !== "update" || item.isDeleted
+      || item.content?.kind !== "object" || !path || path !== item.path || !path.toLowerCase().endsWith(".md")
+      || !contentFitsPlaintextLimit(item, maxBytes, options.allowEncryptedSize)) return false;
+
+    const initial = await options.journal?.load();
+    const currentEntry = initial?.inbox.find((candidate) => candidate.cursor === entry.cursor);
+    if (!initial || !currentEntry || currentEntry.state === "applied" || currentEntry.resolution
+      || currentEntry.item.fileId !== item.fileId || currentEntry.item.fileVersionId !== item.fileVersionId
+      || initial.operations.some((operation) => operation.fileId === item.fileId)) return false;
+
+    const chain = initial.inbox.filter((candidate) => candidate.item.fileId === item.fileId
+      && BigInt(candidate.cursor) >= BigInt(entry.cursor))
+      .sort((left, right) => BigInt(left.cursor) < BigInt(right.cursor) ? -1 : BigInt(left.cursor) > BigInt(right.cursor) ? 1 : 0);
+    if (!chain.length || chain[0].cursor !== entry.cursor) return false;
+
+    const prior = await options.baseline.get(item.fileId);
+    if (!prior || prior.isDeleted || prior.path !== path || !prior.plaintextHash
+      || prior.fileVersionId !== item.previousVersionId) return false;
+    if (isVaultPathOpenInMarkdownEditor(options.app, path) || !fileAt(path)) return false;
+    const localBytesBefore = await localBytes(path);
+    if (!localBytesBefore || localBytesBefore.byteLength > maxBytes) return false;
+    const localHashBefore = await sha256Hex(localBytesBefore);
+    if (localHashBefore === prior.plaintextHash) return false;
+    const generationBefore = options.getPathGeneration?.(path);
+
+    let expectedPreviousVersionId = prior.fileVersionId;
+    for (const candidate of chain) {
+      const change = candidate.item;
+      if (candidate.state === "applied" || candidate.resolution || change.eventType !== "update"
+        || change.isDeleted || change.path !== path || change.previousVersionId !== expectedPreviousVersionId
+        || change.content?.kind !== "object" || !contentFitsPlaintextLimit(change, maxBytes, options.allowEncryptedSize)) {
+        return false;
+      }
+      if (await adapter.exists(stagedApplyMarkerPath(change.fileId, change.cursor))) return false;
+      expectedPreviousVersionId = change.fileVersionId;
+    }
+
+    const latest = chain[chain.length - 1];
+    const latestBytes = await options.download(latest.item);
+    if (!downloadedPlaintextMatchesItem(latest.item, latestBytes, maxBytes, options.allowEncryptedSize)) {
+      throw fail("v2_apply_integrity_mismatch", "同路径远端更新链的最新 Markdown 正文校验失败；本机内容保持不变");
+    }
+    const latestHash = await sha256Hex(latestBytes);
+    if (latestHash !== prior.plaintextHash || latestBytes.byteLength !== prior.byteSize) return false;
+
+    return withVaultPathWriteLock(path, async () => {
+      const current = await options.journal?.load();
+      const currentChain = current?.inbox.filter((candidate) => candidate.item.fileId === item.fileId
+        && BigInt(candidate.cursor) >= BigInt(entry.cursor))
+        .sort((left, right) => BigInt(left.cursor) < BigInt(right.cursor) ? -1 : BigInt(left.cursor) > BigInt(right.cursor) ? 1 : 0);
+      if (!current || !currentChain || currentChain.length !== chain.length
+        || current.operations.some((operation) => operation.fileId === item.fileId)
+        || currentChain.some((candidate, index) => candidate.cursor !== chain[index].cursor
+          || candidate.item.fileVersionId !== chain[index].item.fileVersionId
+          || candidate.item.previousVersionId !== chain[index].item.previousVersionId
+          || candidate.item.path !== chain[index].item.path || candidate.state === "applied" || !!candidate.resolution)) {
+        return false;
+      }
+      for (const candidate of currentChain) {
+        if (await adapter.exists(stagedApplyMarkerPath(candidate.item.fileId, candidate.cursor))) return false;
+      }
+      const latestPrior = await options.baseline.get(item.fileId);
+      if (!latestPrior || latestPrior.isDeleted || latestPrior.fileVersionId !== prior.fileVersionId
+        || latestPrior.cursor !== prior.cursor || latestPrior.path !== prior.path
+        || latestPrior.plaintextHash !== prior.plaintextHash || latestPrior.byteSize !== prior.byteSize
+        || isVaultPathOpenInMarkdownEditor(options.app, path) || !fileAt(path)) return false;
+      if (generationBefore !== undefined && options.getPathGeneration?.(path) !== generationBefore) return false;
+      const localBytesAfter = await localBytes(path);
+      if (!localBytesAfter || localBytesAfter.byteLength !== localBytesBefore.byteLength
+        || await sha256Hex(localBytesAfter) !== localHashBefore) return false;
+
+      await persistBaseline([{
+        fileId: item.fileId, fileVersionId: latest.item.fileVersionId, cursor: latest.cursor,
+        path, plaintextHash: latestHash, byteSize: latestBytes.byteLength, isDeleted: false,
+      }]);
+      return true;
+    });
+  }
+
   async function applyReceivedInbox(): Promise<{ applied: number; blocked: number; deferredPaths?: string[] }> {
     if (!options.journal) throw new Error("v2 inbox journal is required");
     await clearCompletedCaseDirectoryRenameMarkers(true);
@@ -1505,6 +1588,11 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       // are especially likely to echo on their source device, where the final
       // path may already be present.
       if (await inboxEntryAlreadyRepresentedByBaseline(entry)) {
+        await options.journal.markInboxItem(entry.cursor, "applied");
+        applied += 1;
+        continue;
+      }
+      if (await advanceNetZeroRemoteUpdateChain(entry)) {
         await options.journal.markInboxItem(entry.cursor, "applied");
         applied += 1;
         continue;
