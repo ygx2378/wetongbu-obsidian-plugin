@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "candidate": "0.11.35-prodtest1.0.300",
+  "candidate": "0.11.35-prodtest1.0.301",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
@@ -11,7 +11,7 @@
     "build_api_base_url": "https://api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 78,
-    "source_fingerprint_sha256": "303a92dc8bba588d15df1dc9e8f7813178c6a33879b8b35d1ff3ad26489c5b7c",
+    "source_fingerprint_sha256": "85a51086cbd69d3fbbd490c7c009488124ad01b32e4575b2e17fcacbea0c4450",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/src/shared/vault-layout.mjs",
@@ -211,7 +211,7 @@
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-apply.ts",
-        "sha256": "f7ca25efa504348ae5e9bb3ebf2652d38d74f7599fa490899c603ef086031b60"
+        "sha256": "5531dea3a04cbbf42c43be7de521ca5280d49b1f1e305865c105fd53294cbe8f"
       },
       {
         "path": "apps/obsidian-plugin/src/vault-sync-v2-pull.ts",
@@ -342,14 +342,14 @@
       }
     ],
     "main_js_reproduced": true,
-    "main_js_sha256": "2ce0138b8eae92de23024a41834f8c12f37b54582c5a394f9163390158807fc3",
-    "main_js_bytes": 794623
+    "main_js_sha256": "3a6a1dcb040dbee0c92e740149767e22e765b2a2abee46d81ba0df6e4af73834",
+    "main_js_bytes": 794643
   },
   "assets": {
-    "manifest_sha256": "97c6a65fe8173ea60f096415cf7744f5e5f4b8c95397e6d98d899eb3ef6d433c",
-    "main_js_sha256": "2ce0138b8eae92de23024a41834f8c12f37b54582c5a394f9163390158807fc3",
+    "manifest_sha256": "1cf413ed143efe69424b2fa051529c05df78972f7c868abd656b78d2f26c9a74",
+    "main_js_sha256": "3a6a1dcb040dbee0c92e740149767e22e765b2a2abee46d81ba0df6e4af73834",
     "styles_css_sha256": "b496d585d3284a196178cba1ca40c1053bfa464b29f35e566ab4356d4593666d",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
-    "main_js_bytes": 794623
+    "main_js_bytes": 794643
   }
 }
