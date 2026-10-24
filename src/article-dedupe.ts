@@ -44,28 +44,167 @@ export function normalizeMarkdownForCompare(value: string): string {
   return value.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trimEnd();
 }
 
+function isEscapedMarkdownCharacter(value: string, index: number): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) backslashes += 1;
+  return backslashes % 2 === 1;
+}
+
+function inlineCodeDelimiterLength(value: string, start: number): number {
+  let end = start;
+  while (value[end] === "\x60") end += 1;
+  return end - start;
+}
+
+function findInlineCodeClosingEnd(value: string, start: number, delimiterLength: number): number {
+  for (let index = start; index < value.length;) {
+    if (value[index] !== "\x60" || isEscapedMarkdownCharacter(value, index)) {
+      index += 1;
+      continue;
+    }
+    const length = inlineCodeDelimiterLength(value, index);
+    if (length === delimiterLength) return index + length;
+    index += length;
+  }
+  return -1;
+}
+
+function mapMarkdownOutsideInlineCode(value: string, transform: (prose: string) => string): string {
+  let result = "";
+  let proseStart = 0;
+  for (let index = 0; index < value.length;) {
+    if (value[index] !== "\x60" || isEscapedMarkdownCharacter(value, index)) {
+      index += 1;
+      continue;
+    }
+    const delimiterLength = inlineCodeDelimiterLength(value, index);
+    const closingEnd = findInlineCodeClosingEnd(value, index + delimiterLength, delimiterLength);
+    if (closingEnd < 0) {
+      index += delimiterLength;
+      continue;
+    }
+    result += transform(value.slice(proseStart, index));
+    result += value.slice(index, closingEnd);
+    index = closingEnd;
+    proseStart = index;
+  }
+  return result + transform(value.slice(proseStart));
+}
+
+function mapMarkdownOutsideFencedCode(value: string, transform: (prose: string) => string): string {
+  const lines = value.split("\n");
+  let result = "";
+  let prose = "";
+  let fence: { character: string; length: number } | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const hasNewline = index < lines.length - 1;
+    const completeLine = line + (hasNewline ? "\n" : "");
+    if (fence) {
+      result += completeLine;
+      const closing = /^(?: {0,3})(\x60+|~+)[ \t]*$/.exec(line);
+      if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const opening = /^ {0,3}(\x60{3,}|~{3,})(.*)$/.exec(line);
+    if (opening) {
+      result += mapMarkdownOutsideInlineCode(prose, transform) + completeLine;
+      prose = "";
+      fence = { character: opening[1][0], length: opening[1].length };
+      continue;
+    }
+    prose += completeLine;
+  }
+  return result + mapMarkdownOutsideInlineCode(prose, transform);
+}
+
+function stripGeneratedMarkerPairForCompare(value: string): string {
+  const lines = value.split("\n");
+  let fence: { character: string; length: number } | null = null;
+  let inlineCodeLength = 0;
+  let startIndex = -1;
+  let endIndex = -1;
+  let startCount = 0;
+  let endCount = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence) {
+      const closing = /^(?: {0,3})(\x60+|~+)[ \t]*$/.exec(line);
+      if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = null;
+      continue;
+    }
+
+    if (inlineCodeLength === 0) {
+      const opening = /^ {0,3}(\x60{3,}|~{3,})(.*)$/.exec(line);
+      if (opening) {
+        fence = { character: opening[1][0], length: opening[1].length };
+        continue;
+      }
+    }
+
+    if (inlineCodeLength === 0) {
+      const marker = /^ {0,3}<!--\s*wetongbu:generated:(start|end)\s*-->[ \t]*$/i.exec(line);
+      if (marker?.[1].toLowerCase() === "start") {
+        startCount += 1;
+        startIndex = index;
+      } else if (marker?.[1].toLowerCase() === "end") {
+        endCount += 1;
+        endIndex = index;
+      }
+    }
+
+    for (let cursor = 0; cursor < line.length;) {
+      if (line[cursor] !== "\x60" || isEscapedMarkdownCharacter(line, cursor)) {
+        cursor += 1;
+        continue;
+      }
+      const length = inlineCodeDelimiterLength(line, cursor);
+      if (inlineCodeLength === 0) inlineCodeLength = length;
+      else if (inlineCodeLength === length) inlineCodeLength = 0;
+      cursor += length;
+    }
+  }
+
+  if (startCount !== 1 || endCount !== 1 || startIndex >= endIndex) return value;
+  return lines.filter((_, index) => index !== startIndex && index !== endIndex).join("\n");
+}
+
 /** Ignore task-specific attachment names when comparing an article body. */
 export function normalizeArticleBodyForCompare(value: string): string {
-  return normalizeMarkdownForCompare(value)
-    .replace(/^[ \t]*<!--\s*wetongbu:generated:(?:start|end)\s*-->[ \t]*\r?\n?/gim, "")
-    .replace(/WTB-\d{8}-\d{6}-[a-z0-9]{8}-\d{3}(?=\.[a-z0-9]+)?/gi, "WTB-ASSET")
-    .replace(/assets\/image-\d{3}(?:\.[a-z0-9]+)?/gi, "assets/image-ASSET")
-    .trimEnd();
+  const markdown = stripGeneratedMarkerPairForCompare(normalizeMarkdownForCompare(value)).trimEnd();
+  const imageLink = /(!\[[^\]]*\]\(\s*)(?:<([^>]+)>|([^\s)]+))(\s*\))/g;
+  const normalizeImageLinks = (prose: string) => prose.replace(imageLink, (match, prefix: string, angleTarget: string | undefined, plainTarget: string | undefined, suffix: string) => {
+    const target = angleTarget ?? plainTarget;
+    if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//")) return match;
+    const separator = Math.max(target.lastIndexOf("/"), target.lastIndexOf("\\"));
+    const filename = target.slice(separator + 1);
+    const normalizedFilename = filename
+      .replace(/^WTB-\d{8}-\d{6}-[a-z0-9]{8}-\d{3}(?=\.[a-z0-9]+$)/i, "WTB-ASSET")
+      .replace(/^image-\d{3}(?=\.[a-z0-9]+$)/i, "image-ASSET");
+    if (normalizedFilename === filename) return match;
+    const normalizedTarget = target.slice(0, separator + 1) + normalizedFilename;
+    return prefix + (angleTarget !== undefined ? "<" + normalizedTarget + ">" : normalizedTarget) + suffix;
+  });
+  return mapMarkdownOutsideFencedCode(markdown, (prose) => mapMarkdownOutsideInlineCode(prose, normalizeImageLinks)).trimEnd();
 }
 
 /** Extract only the generated local attachment references used for article dedupe. */
 export function generatedAssetReferences(value: string): string[] {
   const references: string[] = [];
   const imageLink = /!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))/g;
-  for (const match of value.matchAll(imageLink)) {
-    const target = (match[1] ?? match[2] ?? "").trim();
-    if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//")) continue;
-    const filename = target.split(/[\\/]/).at(-1) ?? "";
-    if (/^WTB-[a-z0-9_-]+\.[a-z0-9]+$/i.test(filename)
-      || /^image-\d{3}\.[a-z0-9]+$/i.test(filename)) {
-      references.push(target);
+  mapMarkdownOutsideFencedCode(value, (prose) => mapMarkdownOutsideInlineCode(prose, (text) => {
+    for (const match of text.matchAll(imageLink)) {
+      const target = (match[1] ?? match[2] ?? "").trim();
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//")) continue;
+      const filename = target.split(/[\\/]/).at(-1) ?? "";
+      if (/^WTB-[a-z0-9_-]+\.[a-z0-9]+$/i.test(filename)
+        || /^image-\d{3}\.[a-z0-9]+$/i.test(filename)) {
+        references.push(target);
+      }
     }
-  }
+    return text;
+  }));
   return references;
 }
 
@@ -93,14 +232,25 @@ export async function articleAssetFingerprintFromVault(
   notePath: string,
   body: string,
 ): Promise<string> {
+  return articleAssetFingerprintFromResolver(notePath, body, async (path) => {
+    try { return await adapter.readBinary(path); } catch { return null; }
+  });
+}
+
+export async function articleAssetFingerprintFromResolver(
+  notePath: string,
+  body: string,
+  readBinary: (path: string) => Promise<ArrayBuffer | null>,
+): Promise<string> {
   const folder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
   const hashes: string[] = [];
   for (const reference of generatedAssetReferences(body)) {
     const targetPath = resolveVaultRelativePath(folder, reference);
-    try {
-      hashes.push(await sha256Hex(new Uint8Array(await adapter.readBinary(targetPath))));
-    } catch {
+    const asset = await readBinary(targetPath);
+    if (!asset) {
       hashes.push(`missing:${targetPath}`);
+    } else {
+      hashes.push(await sha256Hex(new Uint8Array(asset)));
     }
   }
   return `${hashes.length}:${hashes.join("|")}`;
@@ -175,6 +325,53 @@ export function articleCandidate(path: string, content: string): ArticleCandidat
     || frontmatter.tags?.some((tag) => tag === "微同步" || tag === "网页剪藏" || tag === "微信剪藏" || tag === "飞书同步"),
   );
   return { path, content, frontmatter, body, sourceKey, taskId: frontmatter.taskId, managed };
+}
+
+function articleCandidateForConflict(path: string, markdown: string): ArticleCandidate {
+  const taskMarker = /<!--\s*wetongbu:task_id:([a-zA-Z0-9_-]+)\s*-->/i.exec(markdown)?.[1];
+  const content = markdown.replace(/^(?:\uFEFF)?[ \t]*<!--\s*wetongbu:task_id:[a-zA-Z0-9_-]+\s*-->[ \t]*(?:\r?\n|$)/i, "");
+  const candidate = articleCandidate(path, content);
+  return { ...candidate, taskId: candidate.taskId ?? taskMarker };
+}
+
+function articleConflictIdentity(candidate: ArticleCandidate): string | null {
+  const captureIds = [candidate.frontmatter.wetongbu_capture_id, candidate.frontmatter.capture_id]
+    .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+    .map((value) => value.trim());
+  const uniqueCaptureIds = [...new Set(captureIds)];
+  if (uniqueCaptureIds.length > 1) return null;
+  if (uniqueCaptureIds.length === 1) return `capture:${uniqueCaptureIds[0]}`;
+  return candidate.taskId?.trim() ? `task:${candidate.taskId.trim()}` : null;
+}
+
+function frontmatterForConflictCompare(markdown: string): string {
+  const content = markdown.replace(/^(?:\uFEFF)?[ \t]*<!--\s*wetongbu:task_id:[a-zA-Z0-9_-]+\s*-->[ \t]*(?:\r?\n|$)/i, "");
+  const { frontmatter } = splitMarkdownFrontmatter(content);
+  return normalizeMarkdownForCompare(frontmatter)
+    .split("\n")
+    .filter((line) => !/^wetongbu_task_id\s*:/i.test(line))
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Permit conflict convergence only when both sides are the same managed
+ * capture, source, generated body, and user-visible frontmatter. Attachment
+ * bytes are checked separately before the caller replaces the local note.
+ */
+export function canConvergeManagedArticleContent(path: string, localMarkdown: string, remoteMarkdown: string): boolean {
+  const local = articleCandidateForConflict(path, localMarkdown);
+  const remote = articleCandidateForConflict(path, remoteMarkdown);
+  const identity = articleConflictIdentity(local);
+  if (!local.managed || !remote.managed || !local.sourceKey || local.sourceKey !== remote.sourceKey
+    || !identity || identity !== articleConflictIdentity(remote)) return false;
+  if (frontmatterForConflictCompare(localMarkdown) !== frontmatterForConflictCompare(remoteMarkdown)) return false;
+  return normalizeArticleBodyForCompare(local.body) === normalizeArticleBodyForCompare(remote.body);
+}
+
+/** Missing generated assets never qualify for automatic conflict convergence. */
+export function articleAssetFingerprintsMatch(local: string, remote: string): boolean {
+  return local === remote && !local.includes("missing:");
 }
 
 /**

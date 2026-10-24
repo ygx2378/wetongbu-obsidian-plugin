@@ -29,15 +29,31 @@ import {
   type LocalIndex, type PrevSyncState, type PrevSyncStore,
   scanLocalFiles, prevSyncAsMap, advancePrevSync,
 } from "./vault-sync-local.ts";
+import type { LocalFileHashCache } from "./vault-sync-local.ts";
+import { getVaultSyncRetryAfterFromError, isRetryableVaultSyncError } from "./vault-sync-retry.ts";
 import {
   actionFor, deletionPlanFingerprint, isDeletionDecision, pendingDeletions,
   type DeletionResolution, type PendingDeletion,
 } from "./vault-sync-deletion.ts";
 import type { VaultSyncStorage } from "./vault-sync-storage";
 import { sha256Hex as computeHash } from "./shared/hash.ts";
-import { normalizeMarkdownForCompare } from "./article-dedupe.ts";
+import {
+  articleAssetFingerprintFromVault,
+  articleAssetFingerprintFromResolver,
+  articleAssetFingerprintsMatch,
+  canConvergeManagedArticleContent,
+  normalizeMarkdownForCompare,
+} from "./article-dedupe.ts";
 import { normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
+import { excludeDeferredEmptyNotes } from "./vault-sync-empty-note-grace.ts";
 import type { VaultSyncRemoteClient, ManifestItem } from "./vault-sync-remote";
+import {
+  assertSafeTextReplacement,
+  assertVaultPathGeneration,
+  isVaultPathOpenInMarkdownEditor,
+  withVaultPathWriteLock,
+  type VaultPathGenerationReader,
+} from "./vault-sync-write-safety.ts";
 
 function manifestAsMap(items: ManifestItem[]): Map<string, FileEntity> {
   const map = new Map<string, FileEntity>();
@@ -68,6 +84,16 @@ export interface VaultSyncOrchestratorDeps {
   storage: VaultSyncStorage;
   remote: VaultSyncRemoteClient;
   store: PrevSyncStore;
+  /** Optional event-fed content hash cache; an audit wheel detects missed filesystem events. */
+  localHashCache?: LocalFileHashCache;
+  /** Optional wider local hash audit for the periodic catch-up scan. */
+  auditBatchSize?: number;
+  /** New blank notes whose path may still change; only untracked zero-byte paths are deferred. */
+  deferredEmptyNotePaths?: Iterable<string>;
+  /** Event-fed path generation; protects delayed remote writes after edit-then-revert races. */
+  getPathGeneration?: VaultPathGenerationReader;
+  /** Called when applying a remote tombstone so UI can suppress a local-delete reminder. */
+  trashLocalFile?: (path: string) => Promise<void>;
   deviceId: string;
   /** 同步范围根目录（undefined = 整个 vault）。 */
   rootFolder?: string | undefined;
@@ -77,8 +103,12 @@ export interface VaultSyncOrchestratorDeps {
   bootstrapMode?: "auto" | "manual";
   /** 当前设备是否是用户指定的存储管理电脑。 */
   isStorageManagerDevice?: boolean;
+  /** 托管存储下，是否为可自动建立空云端基线的桌面设备。 */
+  canEstablishEmptyCloudBaselineAutomatically?: boolean;
   /** 是否在 UI 弹 Notice。后台静默同步传 false。 */
   notify?: (msg: string) => void;
+  /** Surface first-sync direction blocks even when the rest of an automatic run is quiet. */
+  notifyBootstrapDecisionRequired?: (msg: string) => void;
   /** 大比例变更保护；默认启用并使用 50%。 */
   safetyEnabled?: boolean;
   safetyRatio?: number;
@@ -96,6 +126,10 @@ export interface SyncResult {
   conflicts: number;
   failed: number;
   failureMessages?: string[];
+  /** Safe, machine-readable error codes for local diagnostics; never includes raw messages or paths. */
+  failureCodes?: string[];
+  retryAfterMs?: number;
+  hasRetryableFailure?: boolean;
   aborted?: boolean;
   needsBootstrapDecision?: boolean;
   safetyBlocked?: boolean;
@@ -112,6 +146,12 @@ export interface SyncResult {
   conflictPaths?: string[];
 }
 
+function recordSafeFailureCode(result: SyncResult, code: unknown) {
+  if (typeof code !== "string" || !/^[a-z0-9_]{1,64}$/i.test(code)) return;
+  result.failureCodes ??= [];
+  if (result.failureCodes.length < 3 && !result.failureCodes.includes(code)) result.failureCodes.push(code);
+}
+
 // Keep the orchestrator importable in a headless test and on mobile. The
 // plugin UI injects an Obsidian Notice callback for interactive runs.
 const DEFAULT_NOTIFY = (_msg: string) => {};
@@ -122,6 +162,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
   const bootstrapDirection = deps.bootstrapDirection;
   const bootstrapMode = deps.bootstrapMode ?? "manual";
   const isStorageManagerDevice = deps.isStorageManagerDevice === true;
+  const canEstablishEmptyCloudBaselineAutomatically = deps.canEstablishEmptyCloudBaselineAutomatically === true;
   const notify = deps.notify ?? DEFAULT_NOTIFY;
 
   async function runOnce(): Promise<SyncResult> {
@@ -134,20 +175,22 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     const prevMap = prevSyncAsMap(prev);
 
     // 2. 扫描本地
-    const scan = await scanLocalFiles(app, rootFolder);
+    const scan = await scanLocalFiles(app, rootFolder, undefined, deps.localHashCache, {
+      auditBatchSize: deps.auditBatchSize,
+    });
     const localIndex = scan.index;
     if (scan.pathCollisions.length > 0) {
       const examples = scan.pathCollisions.slice(0, 3).map((paths) => paths.join(" / ")).join("；");
       notify(`Vault 同步暂停：发现跨平台路径冲突（${examples}），请先重命名其中一个文件`);
-      return { ...result, aborted: true };
+      return { ...result, aborted: true, failureCodes: ["vault_sync_path_collision"] };
     }
     if (scan.invalidPaths.length > 0) {
       notify(`Vault 同步暂停：有 ${scan.invalidPaths.length} 个文件名不兼容跨平台同步（${scan.invalidPaths.slice(0, 3).join("、")}）`);
-      return { ...result, aborted: true };
+      return { ...result, aborted: true, failureCodes: ["vault_sync_invalid_path"] };
     }
     if (scan.unreadablePaths.length > 0) {
       notify(`Vault 同步暂停：有 ${scan.unreadablePaths.length} 个文件暂时无法读取，未传播删除`);
-      return { ...result, aborted: true };
+      return { ...result, aborted: true, failureCodes: ["vault_sync_local_read_failed"] };
     }
 
     // 3. 拉远端 manifest（增量）
@@ -187,6 +230,16 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       }
     }
 
+    // Obsidian can briefly create a zero-byte default-path note before the
+    // user assigns its final name. Keep it out of this pass only while that
+    // path is new; a previously tracked or remotely known file must remain in
+    // the plan so sync never mistakes it for a deletion or hides a conflict.
+    const localSyncIndex = excludeDeferredEmptyNotes(
+      localIndex,
+      deps.deferredEmptyNotePaths ?? [],
+      [...prevMap.keys(), ...remoteMap.keys()],
+    );
+
     // A first run that failed before committing any file can leave an empty
     // state file behind. Treat that state as no baseline; otherwise the safety
     // guard would classify every local note as a mass change and block the
@@ -196,11 +249,25 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     // 4. diff。首次双侧都有内容时，用用户明确选择的一侧作为基线：
     // remote 表示把电脑端内容下载到本机，local 表示把本机内容上传到远端。
     const remoteHasLiveFiles = [...remoteMap.values()].some((entry) => !entry.isDeleted);
-    const localHasFiles = localIndex.size > 0;
+    const localHasFiles = localSyncIndex.size > 0;
     const autoBootstrap = isBootstrap && bootstrapMode === "auto";
-    if (autoBootstrap && !isStorageManagerDevice && !remoteHasLiveFiles && localHasFiles) {
-      notify("首次同步已暂停：请先在存储管理电脑完成一次同步，建立 Vault 基线后再连接此设备。为避免误删，本机内容暂不上传。");
-      return { ...result, aborted: true, needsBootstrapDecision: true };
+    const remoteTombstonePathKeys = new Set([...remoteMap.entries()]
+      .filter(([, entry]) => entry.isDeleted)
+      .map(([path]) => portableVaultPathKey(path)!));
+    const localPathsWithRemoteTombstones = [...localSyncIndex.keys()].filter((path) =>
+      remoteTombstonePathKeys.has(portableVaultPathKey(path)!));
+    if (autoBootstrap && localPathsWithRemoteTombstones.length > 0) {
+      const message = "首次同步已暂停：云端已有同路径删除记录，而本机仍有文件，无法判断它是新文件还是旧文件副本，因此不会自动覆盖删除记录。请到“设置 → 微同步 → 首次同步方向”确认从电脑/云端下载或从本机上传，再手动同步；本机内容已保留。";
+      notify(message);
+      deps.notifyBootstrapDecisionRequired?.(message);
+      return { ...result, aborted: true, needsBootstrapDecision: true, failureCodes: ["vault_sync_bootstrap_decision_required"] };
+    }
+    if (autoBootstrap && !isStorageManagerDevice && !canEstablishEmptyCloudBaselineAutomatically
+      && !remoteHasLiveFiles && localHasFiles) {
+      const message = "首次同步已暂停：本机不是存储管理设备，云端目前没有活动文件，因此不会自动上传本机内容。若确认这是空的独立测试 Vault 且本机应建立云端基线，请到“设置 → 微同步 → 首次同步方向”选择“从本机上传到电脑/云端”，再手动同步；否则先由存储管理电脑建立基线。本机内容已保留。";
+      notify(message);
+      deps.notifyBootstrapDecisionRequired?.(message);
+      return { ...result, aborted: true, needsBootstrapDecision: true, failureCodes: ["vault_sync_bootstrap_decision_required"] };
     }
     // With no baseline, an automatic merge uses an empty base. Local-only and
     // remote-only files are preserved; same-path differences become conflict
@@ -208,22 +275,24 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     const bootstrapBaseline = autoBootstrap
       ? new Map<string, FileEntity>()
       : isBootstrap && bootstrapDirection === "remote"
-        ? localIndex
+        ? localSyncIndex
         : isBootstrap && bootstrapDirection === "local"
           ? remoteMap
           : prevMap;
-    const plan = planSync(localIndex, remoteMap, bootstrapBaseline);
+    const plan = planSync(localSyncIndex, remoteMap, bootstrapBaseline);
     const deletionFingerprint = deletionPlanFingerprint(plan);
     const deletionItems = pendingDeletions(plan);
     const hasPendingDeletion = deletionItems.length > 0;
 
     // 5. 安全阀。首次同步只有一侧有内容时可安全建立基线；两侧同时
     // 有内容而没有 prevSync 时，无法判断覆盖方向，必须先让用户确认。
-    const oneSidedBootstrap = isBootstrap && (localIndex.size === 0 || remoteMap.size === 0);
-    if (isBootstrap && !autoBootstrap && shouldAbortForBootstrap(localIndex.size, remoteMap.size, plan)
+    const oneSidedBootstrap = isBootstrap && (localSyncIndex.size === 0 || remoteMap.size === 0);
+    if (isBootstrap && !autoBootstrap && shouldAbortForBootstrap(localSyncIndex.size, remoteMap.size, plan)
       && !bootstrapDirection) {
-      notify("首次同步发现本机和电脑端都有内容，请在设置中选择“从电脑同步到本机”或“从本机上传到电脑”后重试。\n选择会决定首次同步方向，不会自动覆盖内容。");
-      return { ...result, aborted: true, needsBootstrapDecision: true };
+      const message = "首次同步发现本机和云端都有内容，方向尚未确认，因此没有覆盖或上传任何文件。请到“设置 → 微同步 → 首次同步方向”选择“从电脑/云端下载到本机”或“从本机上传到电脑/云端”，确认方向后手动同步。";
+      notify(message);
+      deps.notifyBootstrapDecisionRequired?.(message);
+      return { ...result, aborted: true, needsBootstrapDecision: true, failureCodes: ["vault_sync_bootstrap_decision_required"] };
     }
     const safetyRatio = deps.safetyRatio ?? 0.5;
     const safetyFingerprint = safetyPlanFingerprint(plan);
@@ -234,6 +303,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         ...result,
         aborted: true,
         safetyBlocked: true,
+        failureCodes: ["vault_sync_safety_blocked"],
         safetyChangeCount: plan.modifyCount,
         safetyTotalCount: plan.totalCount,
         safetyRatio,
@@ -254,8 +324,17 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
     for (const op of sorted) {
       try {
-        const deletionAction = isDeletionDecision(op.decision)
+        const reviewedDeletionAction = isDeletionDecision(op.decision)
           ? actionFor(op, deps.deletionResolution, deletionFingerprint)
+          : undefined;
+        const hasExplicitKeep = isDeletionDecision(op.decision)
+          && deps.deletionResolution?.fingerprint === deletionFingerprint
+          && deps.deletionResolution.decisions[op.path] === "keep";
+        const autoApplyCommittedRemoteDelete = reviewedDeletionAction === "keep"
+          && !hasExplicitKeep
+          && isVerifiedCommittedRemoteDelete(op);
+        const deletionAction = isDeletionDecision(op.decision)
+          ? autoApplyCommittedRemoteDelete ? "delete" : reviewedDeletionAction
           : undefined;
         if (isDeletionDecision(op.decision) && deletionAction === "keep") {
           hasUnresolvedDeletion = true;
@@ -265,6 +344,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
           op,
           deletionAction === "delete" || deletionAction === "restore" ? deletionAction : undefined,
           conflictAssetAliases,
+          remoteMap,
         );
         if (applied.prevUpdate) prevUpdates.push(applied.prevUpdate);
         if (applied.prevUpdates) prevUpdates.push(...applied.prevUpdates);
@@ -279,6 +359,16 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         // 单文件失败不阻塞整体；该文件下次同步会重试（prevSync 未推进）。
         hadFailures = true;
         result.failed += 1;
+        const retryAfterMs = getVaultSyncRetryAfterFromError(error);
+        if (retryAfterMs !== null) result.retryAfterMs = Math.max(result.retryAfterMs ?? 0, retryAfterMs);
+        if (isRetryableVaultSyncError(error)) result.hasRetryableFailure = true;
+        const rawCode = (error as { code?: unknown } | null)?.code;
+        const status = (error as { status?: unknown } | null)?.status;
+        if (typeof rawCode === "string" && /^[a-z0-9_]{1,64}$/i.test(rawCode)) {
+          recordSafeFailureCode(result, rawCode);
+        } else if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+          recordSafeFailureCode(result, `http_${status}`);
+        }
         const rawMessage = error instanceof Error ? error.message : String(error);
         const safeMessage = rawMessage
           .replace(/https?:\/\/[^\s)]+/gi, "[url]")
@@ -308,6 +398,25 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     return result;
   }
 
+  function isVerifiedCommittedRemoteDelete(op: PlannedOp): boolean {
+    const local = op.local;
+    const remote = op.remote;
+    const previous = op.prev;
+    // V1 has no durable inbox, so only infer the one-confirm rule from an
+    // explicit newer cloud tombstone and an exact content-addressed baseline.
+    // Metadata-only legacy baselines still require review rather than risking
+    // deletion of bytes that merely share the same size and mtime.
+    return op.decision === VAULT_SYNC_DECISION.REMOTE_DELETED_PROPAGATE
+      && remote?.isDeleted === true
+      && !!local?.contentHash
+      && !!previous?.contentHash
+      && local.contentHash === previous.contentHash
+      && local.byteSize === previous.byteSize
+      && Number.isSafeInteger(remote.revision)
+      && Number.isSafeInteger(previous.revision)
+      && remote.revision! > previous.revision!;
+  }
+
   function priority(decision: string): number {
     // 冲突先处理（改名后才上传），其他无强顺序。
     if (decision === VAULT_SYNC_DECISION.CONFLICT) return 0;
@@ -318,6 +427,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     op: PlannedOp,
     deletionAction?: "delete" | "restore",
     conflictAssetAliases: Map<string, string> = new Map(),
+    remoteFiles: Map<string, FileEntity> = new Map(),
   ): Promise<{
     counts: Partial<SyncResult>;
     prevUpdate?: { path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean };
@@ -326,6 +436,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     conflictUpdate?: { path: string; originalPath: string; createdAt: string; localHash: string | null; remoteHash: string | null };
   }> {
     const { decision, path } = op;
+    const pathGeneration = deps.getPathGeneration?.(path);
     const empty = { counts: {} };
 
     if (decision === VAULT_SYNC_DECISION.EQUAL) {
@@ -339,6 +450,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const bytes = new Uint8Array(body);
       const hash = await computeHash(bytes);
       const upload = await storage.put(hash, bytes);
+      await assertLocalUploadSnapshotUnchanged(app, path, hash, pathGeneration, deps.getPathGeneration);
       const resp = await remote.commit([{
         path, contentHash: hash, byteSize: bytes.byteLength, storageByteSize: upload?.storageByteSize,
         uploadId: upload?.uploadId, mtimeMs: local.mtimeMs,
@@ -347,7 +459,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const r = resp.results[0];
       if (r.status === "conflict") {
         // commit 被判冲突（别的设备刚写了）：走冲突副本路径。
-        return await applyConflict(op, r.head ?? op.remote, conflictAssetAliases);
+        return await applyConflict(op, r.head ?? op.remote, conflictAssetAliases, pathGeneration, remoteFiles);
       }
       return {
         counts: { uploaded: 1 },
@@ -360,7 +472,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       const remoteEnt = op.remote!;
       if (!remoteEnt.contentHash) throw new Error(`远端条目缺 contentHash：${path}`);
       const body = await storage.get(remoteEnt.contentHash);
-      await writeVaultFile(app, path, body);
+      await writeVaultFileSafely(app, path, body, op.local, pathGeneration, deps.getPathGeneration);
       return {
         counts: { downloaded: 1 },
         prevUpdate: { path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength, mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false },
@@ -372,7 +484,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         const remoteEnt = op.remote;
         if (!remoteEnt?.contentHash) throw new Error(`待恢复的远端条目缺 contentHash：${path}`);
         const body = await storage.get(remoteEnt.contentHash);
-        await writeVaultFile(app, path, body);
+        await writeVaultFileSafely(app, path, body, undefined, pathGeneration, deps.getPathGeneration);
         return {
           counts: { downloaded: 1 },
           prevUpdate: { path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength, mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false },
@@ -403,6 +515,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         const bytes = new Uint8Array(body);
         const hash = await computeHash(bytes);
         const upload = await storage.put(hash, bytes);
+        await assertLocalUploadSnapshotUnchanged(app, path, hash, pathGeneration, deps.getPathGeneration);
         const resp = await remote.commit([{
           path,
           contentHash: hash,
@@ -422,7 +535,11 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       }
       if (deletionAction !== "delete") return empty;
       // 远端已删 → 本地 trash。
-      await trashVaultFile(app, path);
+      await withVaultPathWriteLock(path, async () => {
+        await assertSafeToApplyRemote(app, path, op.local, pathGeneration, deps.getPathGeneration);
+        if (deps.trashLocalFile) await deps.trashLocalFile(path);
+        else await trashVaultFile(app, path);
+      });
       return {
         counts: { deletedLocal: 1 },
         prevUpdate: { path, contentHash: null, byteSize: 0, mtimeMs: Date.now(), revision: op.remote?.revision, isDeleted: true },
@@ -430,7 +547,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     }
 
     if (decision === VAULT_SYNC_DECISION.CONFLICT) {
-      return await applyConflict(op, op.remote, conflictAssetAliases);
+      return await applyConflict(op, op.remote, conflictAssetAliases, pathGeneration, remoteFiles);
     }
 
     return empty;
@@ -447,6 +564,8 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     lastWriterDeviceId: string | null;
     } | null,
     conflictAssetAliases: Map<string, string> = new Map(),
+    pathGeneration?: number,
+    remoteFiles: Map<string, FileEntity> = new Map(),
   ): Promise<{
     counts: Partial<SyncResult>;
     prevUpdate?: { path: string; contentHash: string | null; byteSize: number; mtimeMs: number; revision?: number; isDeleted?: boolean };
@@ -459,6 +578,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     const local = op.local;
     const remoteEnt = latestHead ?? op.remote;
     const localBody = local ? new Uint8Array(await app.vault.readBinary(fileByPath(app, op.path))) : null;
+    const localBodyHash = localBody ? await computeHash(localBody) : null;
     const conflictBody = localBody && isMarkdownPath(op.path) && conflictAssetAliases.size > 0
       ? new TextEncoder().encode(rewriteMarkdownAssetReferences(
         op.path,
@@ -470,9 +590,32 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     if (remoteEnt) {
       if (!remoteEnt.contentHash) throw new Error(`冲突的远端条目缺 contentHash：${op.path}`);
       const body = await storage.get(remoteEnt.contentHash);
-      if (localBody && isMarkdownPath(op.path)
-        && normalizeMarkdownForCompare(new TextDecoder().decode(localBody)) === normalizeMarkdownForCompare(new TextDecoder().decode(body))) {
-        await writeVaultFile(app, op.path, body);
+      await assertSafeToApplyRemote(app, op.path, local, pathGeneration, deps.getPathGeneration);
+      const localMarkdown = localBody && isMarkdownPath(op.path) ? new TextDecoder().decode(localBody) : null;
+      const remoteMarkdown = isMarkdownPath(op.path) ? new TextDecoder().decode(body) : null;
+      let equivalentMarkdown = Boolean(localMarkdown && remoteMarkdown
+        && normalizeMarkdownForCompare(localMarkdown) === normalizeMarkdownForCompare(remoteMarkdown));
+      if (!equivalentMarkdown && localMarkdown && remoteMarkdown
+        && canConvergeManagedArticleContent(op.path, localMarkdown, remoteMarkdown)) {
+        const localAssets = await articleAssetFingerprintFromVault(app.vault.adapter, op.path, localMarkdown);
+        const remoteAssetBytes = new Map<string, ArrayBuffer>();
+        const remoteAssets = await articleAssetFingerprintFromResolver(op.path, remoteMarkdown, async (assetPath) => {
+          const normalizedPath = normalizeVaultPath(assetPath);
+          const remoteAsset = normalizedPath ? remoteFiles.get(normalizedPath) : undefined;
+          if (!remoteAsset || remoteAsset.isDeleted || !remoteAsset.contentHash) {
+            return null;
+          }
+          const cached = remoteAssetBytes.get(remoteAsset.contentHash);
+          if (cached) return cached.slice(0);
+          const bytes = await storage.get(remoteAsset.contentHash);
+          const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+          remoteAssetBytes.set(remoteAsset.contentHash, buffer.slice(0));
+          return buffer;
+        });
+        equivalentMarkdown = articleAssetFingerprintsMatch(localAssets, remoteAssets);
+      }
+      if (localMarkdown && remoteMarkdown && equivalentMarkdown) {
+        await writeVaultFileSafely(app, op.path, body, local, pathGeneration, deps.getPathGeneration);
         return {
           counts: { downloaded: 1 },
           prevUpdate: { path: op.path, contentHash: remoteEnt.contentHash, byteSize: body.byteLength, mtimeMs: remoteEnt.mtimeMs, revision: remoteEnt.revision, isDeleted: false },
@@ -484,6 +627,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
         // 上传冲突副本到 storage（按 hash 寻址，新 path 指向同 hash）+ commit。
         const upload = await storage.put(localHash!, conflictBody!);
         for (let attempt = 0; attempt < 3; attempt += 1) {
+          await assertLocalUploadSnapshotUnchanged(app, op.path, localBodyHash!, pathGeneration, deps.getPathGeneration);
           const response = await remote.commit([{
             path: conflictPath, contentHash: localHash!, byteSize: conflictBody!.byteLength,
             storageByteSize: upload?.storageByteSize, uploadId: upload?.uploadId, mtimeMs: local!.mtimeMs,
@@ -500,15 +644,30 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
       }
       // 把远端版本写到原路径（覆盖本地旧内容）。为安全：先把本地原文件改名成冲突副本，
       // 再写远端版本到原路径。Obsidian 的 vault.rename 实现原子改名。
-      if (local) {
-        await renameVaultFile(app, op.path, conflictPath);
-        if (conflictBody) await writeVaultFile(app, conflictPath, conflictBody);
-        if (!isMarkdownPath(op.path)) {
-          conflictAssetAliases.set(op.path, conflictPath);
-          await rewriteExistingConflictMarkdownReferences(app, op.path, conflictPath);
+      await withVaultPathWriteLock(op.path, async () => {
+        await assertSafeToApplyRemote(app, op.path, local, pathGeneration, deps.getPathGeneration);
+        if (local) {
+          await renameVaultFile(app, op.path, conflictPath);
+          if (conflictBody) {
+            const conflictFile = {
+              ...local,
+              path: conflictPath,
+              contentHash: localHash,
+              byteSize: conflictBody.byteLength,
+            };
+            await withVaultPathWriteLock(conflictPath, async () => {
+              await assertSafeToApplyRemote(app, conflictPath, conflictFile);
+              await writeVaultFile(app, conflictPath, conflictBody);
+            });
+          }
+          if (!isMarkdownPath(op.path)) {
+            conflictAssetAliases.set(op.path, conflictPath);
+            await rewriteExistingConflictMarkdownReferences(app, op.path, conflictPath, deps.getPathGeneration);
+          }
         }
-      }
-      await writeVaultFile(app, op.path, body);
+        await assertSafeToApplyRemote(app, op.path, undefined);
+        await writeVaultFile(app, op.path, body);
+      });
       const conflictFiles = conflictBody && conflictRevision !== undefined
         ? [{ path: conflictPath, contentHash: localHash, byteSize: conflictBody.byteLength, mtimeMs: local!.mtimeMs, revision: conflictRevision, isDeleted: false }]
         : [];
@@ -592,32 +751,48 @@ function rewriteMarkdownAssetReferences(
   return rewritten;
 }
 
-async function rewriteExistingConflictMarkdownReferences(app: App, originalPath: string, conflictPath: string) {
+async function rewriteExistingConflictMarkdownReferences(
+  app: App,
+  originalPath: string,
+  conflictPath: string,
+  getPathGeneration?: VaultPathGenerationReader,
+) {
   const aliases = new Map([[originalPath, conflictPath]]);
   if (typeof (app.vault as any).getMarkdownFiles !== "function") return;
   for (const file of app.vault.getMarkdownFiles()) {
     if (!file.path.includes(".sync-conflict-")) continue;
+    const pathGeneration = getPathGeneration?.(file.path);
     const body = await app.vault.cachedRead(file);
     const rewritten = rewriteMarkdownAssetReferences(file.path, body, aliases);
     if (rewritten === body) continue;
-    const adapter = app.vault.adapter as any;
-    const temporary = `${file.path}.wetongbu-conflict-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
-    await adapter.write(temporary, rewritten);
-    if ((await adapter.read(temporary)) !== rewritten) {
-      await adapter.remove(temporary).catch(() => {});
-      throw new Error(`冲突副本引用更新校验失败：${file.path}`);
-    }
-    try {
-      if (typeof adapter.rename === "function") await adapter.rename(temporary, file.path);
-      else {
-        await adapter.write(file.path, rewritten);
-        if ((await adapter.read(file.path)) !== rewritten) throw new Error(`冲突副本引用替换校验失败：${file.path}`);
+    await withVaultPathWriteLock(file.path, async () => {
+      assertVaultPathGeneration(file.path, pathGeneration, getPathGeneration);
+      await assertSafeTextReplacement(app, file.path, body);
+      const adapter = app.vault.adapter as any;
+      const temporary = `${file.path}.wetongbu-conflict-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+      await adapter.write(temporary, rewritten);
+      if ((await adapter.read(temporary)) !== rewritten) {
         await adapter.remove(temporary).catch(() => {});
+        throw new Error(`冲突副本引用更新校验失败：${file.path}`);
       }
-    } catch (error) {
-      await adapter.remove(temporary).catch(() => {});
-      throw error;
-    }
+      try {
+        if (typeof adapter.rename === "function") {
+          assertVaultPathGeneration(file.path, pathGeneration, getPathGeneration);
+          await assertSafeTextReplacement(app, file.path, body);
+          await adapter.rename(temporary, file.path);
+        }
+        else {
+          assertVaultPathGeneration(file.path, pathGeneration, getPathGeneration);
+          await assertSafeTextReplacement(app, file.path, body);
+          await adapter.write(file.path, rewritten);
+          if ((await adapter.read(file.path)) !== rewritten) throw new Error(`冲突副本引用替换校验失败：${file.path}`);
+          await adapter.remove(temporary).catch(() => {});
+        }
+      } catch (error) {
+        await adapter.remove(temporary).catch(() => {});
+        throw error;
+      }
+    });
   }
 }
 
@@ -637,6 +812,111 @@ function fileByPathOrNull(app: App, path: string) {
   return app.vault.getFiles().find((file: any) => normalizeVaultPath(file.path) === normalized) ?? null;
 }
 
+async function assertSafeToApplyRemote(
+  app: App,
+  path: string,
+  expectedLocal?: FileEntity,
+  expectedGeneration?: number,
+  getPathGeneration?: VaultPathGenerationReader,
+) {
+  assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, "vault_sync_local_changed_during_download");
+  if (isVaultPathOpenInMarkdownEditor(app, path)) {
+    throw Object.assign(new Error(`该文件仍在编辑器中打开，已暂缓远端覆盖：${path}`), { code: "vault_sync_active_editor_busy", path });
+  }
+
+  const current = fileByPathOrNull(app, path);
+  if (!expectedLocal) {
+    if (current) throw Object.assign(new Error(`同步期间本地新建了同名文件，已暂缓远端写入：${path}`), { code: "vault_sync_local_changed_during_download" });
+    return;
+  }
+  if (!current) throw Object.assign(new Error(`同步期间本地文件已移动或删除，已暂缓远端写入：${path}`), { code: "vault_sync_local_changed_during_download" });
+  const currentBytes = new Uint8Array(await app.vault.readBinary(current as any));
+  const currentHash = await computeHash(currentBytes);
+  const stillMatches = expectedLocal.contentHash
+    ? currentHash === expectedLocal.contentHash
+    : currentBytes.byteLength === expectedLocal.byteSize && Number((current as any).stat?.mtime ?? 0) === expectedLocal.mtimeMs;
+  if (!stillMatches) {
+    throw Object.assign(new Error(`同步期间本地内容已变化，已暂缓远端覆盖：${path}`), { code: "vault_sync_local_changed_during_download" });
+  }
+  // Reading and hashing the local file yield to UI events. Check the editor
+  // and event-fed generation once more after those awaits, immediately before
+  // the caller starts its guarded write.
+  assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, "vault_sync_local_changed_during_download");
+  if (isVaultPathOpenInMarkdownEditor(app, path)) {
+    throw Object.assign(new Error(`该文件仍在编辑器中打开，已暂缓远端覆盖：${path}`), { code: "vault_sync_active_editor_busy", path });
+  }
+}
+
+/** Do not commit an upload snapshot after its local source changed in flight. */
+async function assertLocalUploadSnapshotUnchanged(
+  app: App,
+  path: string,
+  expectedHash: string,
+  expectedGeneration?: number,
+  getPathGeneration?: VaultPathGenerationReader,
+) {
+  const code = "vault_sync_local_changed_during_upload";
+  assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, code);
+  const current = fileByPathOrNull(app, path);
+  if (!current) {
+    throw Object.assign(new Error("本机文件在上传期间已移动或删除；已取消旧内容提交"), { code });
+  }
+  const currentBytes = new Uint8Array(await app.vault.readBinary(current as any));
+  if (await computeHash(currentBytes) !== expectedHash) {
+    throw Object.assign(new Error("本机文件在上传期间已变化；已取消旧内容提交"), { code });
+  }
+  assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, code);
+}
+
+async function writeVaultFileSafely(
+  app: App,
+  path: string,
+  body: Uint8Array,
+  expectedLocal?: FileEntity,
+  expectedGeneration?: number,
+  getPathGeneration?: VaultPathGenerationReader,
+) {
+  await withVaultPathWriteLock(path, async () => {
+    await assertSafeToApplyRemote(app, path, expectedLocal, expectedGeneration, getPathGeneration);
+    assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, "vault_sync_local_changed_during_download");
+    if (isVaultPathOpenInMarkdownEditor(app, path)) {
+      throw Object.assign(new Error(`该文件仍在编辑器中打开，已暂缓远端覆盖：${path}`), { code: "vault_sync_active_editor_busy", path });
+    }
+    const current = fileByPathOrNull(app, path);
+    if (expectedLocal && !current) {
+      throw Object.assign(new Error(`同步期间本地文件已移动或删除，已暂缓远端写入：${path}`), { code: "vault_sync_local_changed_during_download" });
+    }
+    if (!expectedLocal && current) {
+      throw Object.assign(new Error(`同步期间本地新建了同名文件，已暂缓远端写入：${path}`), { code: "vault_sync_local_changed_during_download" });
+    }
+    if (expectedLocal) {
+      await writeVaultFile(app, path, body);
+      return;
+    }
+
+    // Create the complete body in one exclusive operation. Do not publish an
+    // empty placeholder and then await before filling it: the user could open
+    // and edit that placeholder during the gap.
+    await ensureVaultParent(app, path);
+    assertVaultPathGeneration(path, expectedGeneration, getPathGeneration, "vault_sync_local_changed_during_download");
+    if (isVaultPathOpenInMarkdownEditor(app, path) || fileByPathOrNull(app, path)) {
+      throw Object.assign(new Error(`同步期间本地新建了同名文件，已暂缓远端写入：${path}`), { code: "vault_sync_local_changed_during_download" });
+    }
+    const arrayBuffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
+    if (typeof (app.vault as any).createBinary !== "function") {
+      throw new Error("当前 Obsidian Vault API 不支持安全创建远端文件");
+    }
+    await (app.vault as any).createBinary(path, arrayBuffer);
+  });
+}
+
+async function ensureVaultParent(app: App, path: string) {
+  const slash = path.lastIndexOf("/");
+  if (slash <= 0) return;
+  const dir = path.slice(0, slash);
+  if (!app.vault.getAbstractFileByPath(dir)) await app.vault.createFolder(dir);
+}
+
 async function writeVaultFile(app: App, path: string, body: Uint8Array) {
   // writeBinary 需要 ArrayBuffer；Uint8Array 的 buffer 可能是更大 ArrayBuffer 的视图，
   // 用 slice 切出精确范围。
@@ -645,16 +925,14 @@ async function writeVaultFile(app: App, path: string, body: Uint8Array) {
   if (existing) {
     await app.vault.adapter.writeBinary((existing as any).path, arrayBuffer);
   } else {
-    // 确保父目录存在。
-    const slash = path.lastIndexOf("/");
-    if (slash > 0) {
-      const dir = path.slice(0, slash);
-      if (!app.vault.getAbstractFileByPath(dir)) {
-        await app.vault.createFolder(dir);
-      }
+    await ensureVaultParent(app, path);
+    if (fileByPathOrNull(app, path)) {
+      throw Object.assign(new Error(`本地文件刚占用了远端写入路径：${path}`), { code: "vault_sync_local_changed_during_download" });
     }
-    await app.vault.create(path, "");
-    await app.vault.adapter.writeBinary(path, arrayBuffer);
+    if (typeof (app.vault as any).createBinary !== "function") {
+      throw new Error("当前 Obsidian Vault API 不支持安全创建远端文件");
+    }
+    await (app.vault as any).createBinary(path, arrayBuffer);
   }
 }
 

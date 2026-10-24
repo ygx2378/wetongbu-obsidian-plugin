@@ -2,9 +2,13 @@
 // 封装 requestUrl 调用 /api/sync-targets/:id/vault/* 路由。
 // 用 vault device token（registerDevice 返回的一次性 token）认证。
 
-import { requestUrl } from "obsidian";
 import { normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
 import type { FileEntity } from "./vault-sync-diff";
+import { VaultSyncV2RemoteClient } from "./vault-sync-v2-remote.ts";
+import type { VaultSyncCapabilities, VaultSyncOperationReceiptOutcome, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
+import type { VaultSyncV2Request } from "./vault-sync-outbox.ts";
+import { getVaultSyncRetryAfterFromResponse } from "./vault-sync-retry.ts";
+export type { VaultSyncCapabilities, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
 
 export interface ManifestItem {
   path: string;
@@ -62,6 +66,11 @@ export interface VaultSyncStatus {
     enabled: boolean;
     salt_hex: string | null;
     version: number;
+    key_versions?: Array<{
+      key_version: number;
+      salt_hex: string;
+      status: "active" | "retained" | "retired";
+    }>;
   };
 }
 
@@ -72,6 +81,10 @@ export interface VaultSyncClientOptions {
   pluginToken: string;
   /** device token（用于 manifest / commit / download；首次启用前为空） */
   deviceToken?: string;
+  /** Host-provided transport; host API modules are not dynamically resolvable. */
+  requestTransport: (request: any) => Promise<any>;
+  /** Keeps server-measured application latency in the current Obsidian process only. */
+  onAppliedLatencyMs?: (durationMs: number) => void;
 }
 
 export class VaultSyncRemoteClient {
@@ -79,39 +92,54 @@ export class VaultSyncRemoteClient {
   private targetId: string;
   private pluginToken: string;
   private deviceToken: string;
+  private requestTransport: (request: any) => Promise<any>;
+  private onAppliedLatencyMs?: (durationMs: number) => void;
+  private v2: VaultSyncV2RemoteClient;
 
   constructor(opts: VaultSyncClientOptions) {
     this.base = opts.apiBaseUrl.replace(/\/$/, "");
     this.targetId = opts.targetId;
     this.pluginToken = opts.pluginToken;
     this.deviceToken = opts.deviceToken ?? "";
+    if (typeof opts.requestTransport !== "function") {
+      throw new Error("VaultSyncRemoteClient requires a host request transport");
+    }
+    this.requestTransport = opts.requestTransport;
+    this.onAppliedLatencyMs = opts.onAppliedLatencyMs;
+    this.v2 = new VaultSyncV2RemoteClient(this.targetId, (path, init) => this.request(path, init));
   }
 
   setDeviceToken(token: string) {
     this.deviceToken = token;
   }
 
-  private async request(path: string, init: { method: string; token: "plugin" | "device"; body?: any; query?: Record<string, string> }) {
+  private async request(path: string, init: {
+    method: string; token: "plugin" | "device"; body?: any; query?: Record<string, string>; headers?: Record<string, string>;
+  }) {
     const url = new URL(`${this.base}${path}`);
     if (init.query) for (const [k, v] of Object.entries(init.query)) url.searchParams.set(k, v);
     const token = init.token === "plugin" ? this.pluginToken : this.deviceToken;
     if (!token) throw new Error("vault sync 未授权：缺少 token");
-    const resp = await requestUrl({
+    const resp = await this.requestTransport({
       url: url.toString(),
       method: init.method,
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { ...(init.headers ?? {}), Authorization: `Bearer ${token}` },
       contentType: "application/json",
       body: init.body !== undefined ? JSON.stringify(init.body) : "",
       throw: false,
     });
-    if (resp.status === 401) throw new Error("Vault 同步凭证已失效，请重新启用");
+    const retryAfterMs = getVaultSyncRetryAfterFromResponse(resp);
+    const retryMetadata = retryAfterMs === null ? {} : { retryAfterMs };
+    if (resp.status === 401) throw Object.assign(new Error("Vault 同步凭证已失效，请重新启用"), { status: resp.status });
     if (resp.status === 503) {
       const code = resp.json?.code ?? "vault_sync_disabled";
-      throw Object.assign(new Error(resp.json?.error ?? "vault 同步暂未启用"), { code });
+      throw Object.assign(new Error(resp.json?.error ?? "vault 同步暂未启用"), { code, status: resp.status, ...retryMetadata });
     }
     if (resp.status >= 400) {
       throw Object.assign(new Error(resp.json?.error ?? `vault sync 请求失败（${resp.status}）`), {
         code: resp.json?.code,
+        status: resp.status,
+        ...retryMetadata,
       });
     }
     return resp.json;
@@ -119,6 +147,170 @@ export class VaultSyncRemoteClient {
 
   async getStatus(): Promise<VaultSyncStatus> {
     return this.request(`/api/sync-targets/${this.targetId}/vault/status`, { method: "GET", token: "plugin" });
+  }
+
+  async getCapabilities(): Promise<VaultSyncCapabilities> {
+    return this.v2.getCapabilities();
+  }
+
+  async getV2DeviceProgress(): Promise<VaultSyncV2DeviceProgress> {
+    return this.v2.getDeviceProgress();
+  }
+
+  async createOperationWindow(): Promise<VaultSyncOperationWindow> {
+    return this.v2.createOperationWindow();
+  }
+
+  async startV2DeviceSession(): Promise<VaultSyncV2DeviceSession> {
+    return this.v2.startDeviceSession();
+  }
+
+  async claimV2Initialization(protocolEpoch: number): Promise<VaultSyncV2Initialization> {
+    return this.v2.claimInitialization(protocolEpoch);
+  }
+
+  async completeV2Initialization(input: { protocolEpoch: number; leaseId: string }): Promise<VaultSyncV2Initialization> {
+    return this.v2.completeInitialization(input);
+  }
+
+  async createEventTicket() {
+    return this.v2.createEventTicket();
+  }
+
+  async getV2Changes(input: { protocolEpoch: number; sessionGeneration: string; after: string; through?: string; limit?: number }): Promise<VaultSyncV2ChangePage> {
+    return this.v2.getChanges(input);
+  }
+
+  async acknowledgeV2Changes(input: VaultSyncV2Ack): Promise<VaultSyncV2Ack> {
+    const result = await this.v2.acknowledgeChanges(input);
+    if (result.appliedLatencyMs !== undefined) this.onAppliedLatencyMs?.(result.appliedLatencyMs);
+    return result;
+  }
+
+  async createV2Snapshot(input: { protocolEpoch: number; sessionGeneration: string; snapshotRequestId?: string }): Promise<VaultSyncV2SnapshotSummary> {
+    return this.v2.createSnapshot(input);
+  }
+
+  async getV2SnapshotPage(input: { snapshotId: string; afterItem?: string; limit?: number }): Promise<VaultSyncV2SnapshotPage> {
+    return this.v2.getSnapshotPage(input);
+  }
+
+  async renewV2Snapshot(snapshotId: string): Promise<{ snapshotId: string; expiresAt: string }> {
+    return this.v2.renewSnapshot(snapshotId);
+  }
+
+  async acquireV2SnapshotApplyLease(snapshotId: string, input: {
+    protocolEpoch: number; scopeVersion: number; sessionGeneration: string;
+  }): Promise<VaultSyncV2SnapshotApplyLease> {
+    return this.v2.acquireSnapshotApplyLease(snapshotId, input);
+  }
+
+  async renewV2SnapshotApplyLease(snapshotId: string, leaseId: string) {
+    return this.v2.renewSnapshotApplyLease(snapshotId, leaseId);
+  }
+
+  async releaseV2SnapshotApplyLease(snapshotId: string, leaseId: string) {
+    return this.v2.releaseSnapshotApplyLease(snapshotId, leaseId);
+  }
+
+  async completeV2Snapshot(snapshotId: string, input: {
+    protocolEpoch: number; sessionGeneration: string; snapshotCursor: string; itemCount: number; applyLeaseId?: string;
+  }): Promise<VaultSyncV2Ack> {
+    return this.v2.completeSnapshot(snapshotId, input);
+  }
+
+  async commitOperation(request: VaultSyncV2Request): Promise<VaultSyncOperationResult> {
+    return this.v2.commitOperation(request);
+  }
+
+  async reserveContentObject(input: { ciphertextHash: string; byteSize: number; keyVersion?: number }): Promise<VaultSyncV2ObjectReservation> {
+    return this.v2.reserveContentObject(input);
+  }
+
+  async prepareContentObjects(items: Array<{ ciphertextHash: string; byteSize: number; keyVersion?: number }>) {
+    return this.v2.prepareContentObjects(items);
+  }
+
+  async cancelContentObjectReservations(reservationIds: string[]) {
+    return this.v2.cancelContentObjectReservations(reservationIds);
+  }
+
+  async beginContentObjectMultipartUpload(reservationId: string) {
+    return this.v2.beginContentObjectMultipartUpload(reservationId);
+  }
+
+  async getContentObjectMultipartPartUrl(reservationId: string, partNumber: number) {
+    return this.v2.getContentObjectMultipartPartUrl(reservationId, partNumber);
+  }
+
+  async completeContentObjectMultipartUpload(reservationId: string) {
+    return this.v2.completeContentObjectMultipartUpload(reservationId);
+  }
+
+  async finalizeContentObject(reservationId: string) {
+    return this.v2.finalizeContentObject(reservationId);
+  }
+
+  async getContentObject(objectId: string): Promise<VaultSyncV2ObjectDownload> {
+    return this.v2.getContentObject(objectId);
+  }
+
+  async getFileVersions(input: { fileId: string; beforeVersionNumber?: string; limit?: number }): Promise<VaultSyncV2FileVersionsPage> {
+    return this.v2.getFileVersions(input);
+  }
+
+  async getFileVersionContent(fileId: string, versionId: string): Promise<VaultSyncV2ObjectDownload> {
+    return this.v2.getFileVersionContent(fileId, versionId);
+  }
+
+  async startEncryptionKeyRotation(input: {
+    operationId: string; sourceKeyVersion: number; sourceSaltHex: string;
+    targetKeyVersion: number; targetSaltHex: string;
+  }): Promise<VaultSyncV2EncryptionRotation> {
+    return this.v2.startEncryptionKeyRotation(input);
+  }
+
+  async getEncryptionKeyRotation(rotationId: string): Promise<VaultSyncV2EncryptionRotation> {
+    return this.v2.getEncryptionKeyRotation(rotationId);
+  }
+
+  async listEncryptionKeyRotationObjects(input: { rotationId: string; after?: string | null; limit?: number }): Promise<VaultSyncV2EncryptionRotationObjectPage> {
+    return this.v2.listEncryptionKeyRotationObjects(input);
+  }
+
+  async getEncryptionRotationSourceContent(input: { rotationId: string; sourceObjectId: string }): Promise<VaultSyncV2ObjectDownload> {
+    return this.v2.getEncryptionRotationSourceContent(input);
+  }
+
+  async prepareEncryptionRotationObject(input: {
+    rotationId: string; sourceObjectId: string; operationId: string;
+    ciphertextHash: string; byteSize: number; keyVersion: number;
+  }): Promise<VaultSyncV2EncryptionRotationReservation> {
+    return this.v2.prepareEncryptionRotationObject(input);
+  }
+
+  async finalizeEncryptionRotationObject(input: { rotationId: string; sourceObjectId: string; reservationId: string }) {
+    return this.v2.finalizeEncryptionRotationObject(input);
+  }
+
+  async activateEncryptionKeyRotation(input: { rotationId: string; operationId: string }): Promise<VaultSyncV2EncryptionRotation> {
+    return this.v2.activateEncryptionKeyRotation(input);
+  }
+
+  async completeEncryptionKeyRotation(rotationId: string) {
+    return this.v2.completeEncryptionKeyRotation(rotationId);
+  }
+
+  async abortEncryptionKeyRotation(rotationId: string) {
+    return this.v2.abortEncryptionKeyRotation(rotationId);
+  }
+
+  async getOperationReceipt(operationId: string): Promise<VaultSyncOperationResult | { operationId: string; receiptStatus: "unknown" | "expired" }> {
+    return this.v2.getOperationReceipt(operationId);
+  }
+
+  async getOperationReceiptOutcome(operationId: string): Promise<VaultSyncOperationReceiptOutcome> {
+    return this.v2.getOperationReceiptOutcome(operationId);
   }
 
   async enable(enabled: boolean, scope: string, encryption?: { enabled: boolean; saltHex: string; version: number }): Promise<{ enabled: boolean; scope: string; encryption?: { enabled: boolean; saltHex: string | null; version: number } }> {

@@ -7,6 +7,13 @@
  * Crypto is available on Obsidian mobile without a native dependency.
  */
 import { sha256Hex } from "./hash.ts";
+import {
+  createVaultSyncChunkedObjectCrypto,
+  type VaultSyncChunkedObjectResult,
+  type VaultSyncCiphertextSource,
+  type VaultSyncPlaintextSource,
+  type VaultSyncChunkSink,
+} from "./vault-sync-chunked-crypto.ts";
 
 const VERSION = 1;
 const ITERATIONS = 210_000;
@@ -52,16 +59,89 @@ async function deterministicNonce(key: CryptoKey, contentHash: string): Promise<
 }
 
 export interface VaultSyncCrypto {
+  /** Server object key version this key is allowed to write and decrypt. */
+  keyVersion: number;
   saltHex: string;
   encrypt(contentHash: string, plaintext: Uint8Array): Promise<Uint8Array>;
   decrypt(contentHash: string, ciphertext: Uint8Array): Promise<Uint8Array>;
+  /** v2 envelope keeps plaintext hashes inside the client boundary. */
+  /** Callers may pass a SHA-256 they just computed for these exact bytes. */
+  encryptObject(plaintext: Uint8Array, knownPlaintextHash?: string): Promise<Uint8Array>;
+  decryptObject(ciphertext: Uint8Array): Promise<{ plaintext: Uint8Array; plaintextHash: string }>;
 }
 
-export async function createVaultSyncCrypto(passphrase: string, saltHex?: string): Promise<VaultSyncCrypto> {
+/** Experimental v3 codec primitives. The active sync writer remains v2 until
+ * format negotiation, durable temp-file output, and the reader compatibility
+ * fence are integrated. */
+export interface VaultSyncChunkedObjectCrypto {
+  encryptObjectChunked(
+    plaintext: Uint8Array,
+    writeCiphertextChunk: VaultSyncChunkSink,
+    knownPlaintextHash?: string,
+  ): Promise<VaultSyncChunkedObjectResult>;
+  encryptObjectChunkedStream(
+    plaintext: VaultSyncPlaintextSource,
+    plaintextBytes: number,
+    writeCiphertextChunk: VaultSyncChunkSink,
+    knownPlaintextHash?: string,
+  ): Promise<VaultSyncChunkedObjectResult>;
+  decryptObjectChunked(
+    ciphertext: VaultSyncCiphertextSource,
+    writePlaintextChunk: VaultSyncChunkSink,
+    expectedPlaintextBytes?: number,
+  ): Promise<VaultSyncChunkedObjectResult>;
+  decryptObjectChunkedToBytes(ciphertext: Uint8Array): Promise<{ plaintext: Uint8Array; plaintextHash: string }>;
+}
+
+export interface VaultSyncCryptoKeyring {
+  activeKeyVersion: number;
+  forVersion(keyVersion: number): VaultSyncCrypto | undefined;
+}
+
+export function assertVaultEncryptionCredentialChangeSafe(input: {
+  currentVaultEncrypted: boolean;
+  storedPassphrase: string;
+  submittedPassphrase: string;
+}): void {
+  if (input.currentVaultEncrypted && input.storedPassphrase && input.storedPassphrase !== input.submittedPassphrase) {
+    throw new Error("不能直接替换已保存的 Vault 密码；必须先完成客户端重加密迁移");
+  }
+}
+
+export function createVaultSyncCryptoKeyring(
+  activeKeyVersion: number,
+  keys: VaultSyncCrypto[],
+): VaultSyncCryptoKeyring {
+  if (!Number.isSafeInteger(activeKeyVersion) || activeKeyVersion < 1) {
+    throw new Error("Vault 加密版本无效");
+  }
+  const byVersion = new Map<number, VaultSyncCrypto>();
+  for (const key of keys) {
+    if (!Number.isSafeInteger(key.keyVersion) || key.keyVersion < 1 || byVersion.has(key.keyVersion)) {
+      throw new Error("Vault 加密密钥版本重复或无效");
+    }
+    byVersion.set(key.keyVersion, key);
+  }
+  if (!byVersion.has(activeKeyVersion)) throw new Error("缺少当前 Vault 加密密钥");
+  return {
+    activeKeyVersion,
+    forVersion(keyVersion) { return byVersion.get(keyVersion); },
+  };
+}
+
+export async function createVaultSyncCrypto(
+  passphrase: string,
+  saltHex?: string,
+  keyVersion = 1,
+): Promise<VaultSyncCrypto & VaultSyncChunkedObjectCrypto> {
+  if (!Number.isSafeInteger(keyVersion) || keyVersion < 1) throw new Error("Vault 加密版本无效");
   const salt = saltHex ? hexToBytes(saltHex) : globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
   const key = await deriveAesKey(passphrase, salt);
+  const chunkedCrypto = createVaultSyncChunkedObjectCrypto(key);
   return {
+    keyVersion,
     saltHex: bytesToHex(salt),
+    ...chunkedCrypto,
     async encrypt(contentHash, plaintext) {
       const nonce = await deterministicNonce(key, contentHash);
       const cipher = await globalThis.crypto.subtle.encrypt(
@@ -88,6 +168,37 @@ export async function createVaultSyncCrypto(passphrase: string, saltHex?: string
       const body = new Uint8Array(plain);
       if (await sha256Hex(body) !== contentHash) throw new Error("Vault 解密内容哈希不一致");
       return body;
+    },
+    async encryptObject(plaintext, knownPlaintextHash) {
+      const plaintextHash = knownPlaintextHash ?? await sha256Hex(plaintext);
+      if (!/^[a-f0-9]{64}$/i.test(plaintextHash)) throw new Error("Vault v2 明文摘要无效");
+      const nonce = await deterministicNonce(key, plaintextHash);
+      const cipher = await globalThis.crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce as Uint8Array<ArrayBuffer> },
+        key,
+        plaintext as Uint8Array<ArrayBuffer>,
+      );
+      const envelope = new Uint8Array(1 + NONCE_BYTES + cipher.byteLength);
+      envelope[0] = 2;
+      envelope.set(nonce, 1);
+      envelope.set(new Uint8Array(cipher), 1 + NONCE_BYTES);
+      return envelope;
+    },
+    async decryptObject(ciphertext) {
+      if (ciphertext[0] === 3) return chunkedCrypto.decryptObjectChunkedToBytes(ciphertext);
+      if (ciphertext.length < 1 + NONCE_BYTES + 16 || ciphertext[0] !== 2) {
+        throw new Error("Vault v2 加密对象版本无效");
+      }
+      const nonce = ciphertext.slice(1, 1 + NONCE_BYTES);
+      const plaintext = new Uint8Array(await globalThis.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: nonce as Uint8Array<ArrayBuffer> },
+        key,
+        ciphertext.subarray(1 + NONCE_BYTES) as Uint8Array<ArrayBuffer>,
+      ));
+      const plaintextHash = await sha256Hex(plaintext);
+      const expectedNonce = await deterministicNonce(key, plaintextHash);
+      if (bytesToHex(nonce) !== bytesToHex(expectedNonce)) throw new Error("Vault v2 加密对象完整性校验失败");
+      return { plaintext, plaintextHash };
     },
   };
 }

@@ -34,5 +34,6 @@ await esbuild.build({
 if (production) {
   const output = "main.js";
   const bundled = await readFile(output, "utf8");
-  await writeFile(output, bundled.replace(/[ \t]+$/gm, ""));
+  const withoutCommonJsDirective = bundled.replace(/^"use strict";/, "");
+  await writeFile(output, withoutCommonJsDirective.replace(/[ \t]+$/gm, ""));
 }

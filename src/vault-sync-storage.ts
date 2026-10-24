@@ -10,11 +10,16 @@
 // Free 用手写 AWS Signature V4（避免把 @aws-sdk/client-s3 的 5MB 打进插件 bundle）。
 // Pro 用预签名 URL，插件只做 HTTP PUT/GET，不持有平台凭证。
 
-import { requestUrl } from "obsidian";
 import { sha256Hex } from "./shared/hash";
 import type { VaultSyncCrypto } from "./shared/vault-sync-crypto";
 import { buildFreeS3BaseUrl, deriveS3Config } from "./vault-sync-storage-config";
 export { deriveS3Config } from "./vault-sync-storage-config";
+
+type StorageRequest = typeof import("obsidian").requestUrl;
+
+function httpStatusError(message: string, status: number): Error & { status: number } {
+  return Object.assign(new Error(message), { status });
+}
 
 export interface VaultSyncStorage {
   /** 写入内容（按 hash 寻址）。上传 Pro 需先 prepare。 */
@@ -48,7 +53,7 @@ export interface FreeStorageConfig {
   verifyHash?: boolean;
 }
 
-export function createFreeS3Storage(config: FreeStorageConfig, request: typeof requestUrl = requestUrl): VaultSyncStorage {
+export function createFreeS3Storage(config: FreeStorageConfig, request: StorageRequest): VaultSyncStorage {
   const region = config.region || "auto";
   const baseUrl = buildFreeS3BaseUrl(config);
 
@@ -108,17 +113,19 @@ export function createFreeS3Storage(config: FreeStorageConfig, request: typeof r
     async put(hash, body) {
       const resp = await signedRequest("PUT", objectKey(hash), body);
       if (resp.status >= 200 && resp.status < 300) return;
-      throw new Error(`storage put 失败：HTTP ${resp.status}`);
+      throw httpStatusError(`storage put 失败：HTTP ${resp.status}`, resp.status);
     },
     async get(hash) {
       const resp = await signedRequest("GET", objectKey(hash));
-      if (resp.status === 404) throw Object.assign(new Error(`对象不存在：${hash.slice(0, 12)}`), { code: "NotFound" });
+      if (resp.status === 404) {
+        throw Object.assign(new Error(`对象不存在：${hash.slice(0, 12)}`), { code: "NotFound", status: resp.status });
+      }
       if (resp.status >= 200 && resp.status < 300 && resp.body) {
         const actualHash = await sha256Hex(resp.body);
         if (config.verifyHash !== false && actualHash !== hash) throw new Error("storage get 完整性校验失败");
         return resp.body;
       }
-      throw new Error(`storage get 失败：HTTP ${resp.status}`);
+      throw httpStatusError(`storage get 失败：HTTP ${resp.status}`, resp.status);
     },
     async delete(hash) {
       // Content-addressed objects can be referenced by multiple paths. Until
@@ -129,7 +136,7 @@ export function createFreeS3Storage(config: FreeStorageConfig, request: typeof r
       const resp = await signedRequest("HEAD", objectKey("probe-" + Date.now()));
       // 404 也说明凭证有效、bucket 可达（只是对象不存在）。
       if (resp.status === 404 || (resp.status >= 200 && resp.status < 300)) return;
-      throw new Error(`存储验证失败：HTTP ${resp.status}（请检查 endpoint、bucket、Access Key 和 Secret Key）`);
+      throw httpStatusError(`存储验证失败：HTTP ${resp.status}（请检查 endpoint、bucket、Access Key 和 Secret Key）`, resp.status);
     },
   };
 }
@@ -143,37 +150,39 @@ export interface ProStorageConfig {
   verifyHash?: boolean;
 }
 
-export function createProHostedStorage(remote: ProStorageConfig): VaultSyncStorage {
+export function createProHostedStorage(remote: ProStorageConfig, request: StorageRequest): VaultSyncStorage {
   return {
     async put(hash, body, plaintextByteSize = body.byteLength) {
       const prep = await remote.prepareUpload(hash, body.byteLength);
       if (prep.deduped) return; // 服务端已有同 hash 块，无需重复上传。
       if (!prep.uploadUrl) throw new Error("Pro 上传未获得预签名 URL");
       // 直接 PUT 到预签名 URL（S3 预签名 URL 已含签名，不要再加 Authorization 头）。
-      const resp = await requestUrl({
+      const resp = await request({
         url: prep.uploadUrl,
         method: "PUT",
         body: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer,
         throw: false,
       });
       if (resp.status >= 200 && resp.status < 300) return { uploadId: prep.uploadId ?? undefined, storageByteSize: body.byteLength };
-      throw new Error(`Pro 上传失败：HTTP ${resp.status}`);
+      throw httpStatusError(`Pro 上传失败：HTTP ${resp.status}`, resp.status);
     },
     async get(hash) {
       const prep = await remote.prepareDownload(hash);
       if (!prep.downloadUrl) throw new Error("Pro 下载未获得预签名 URL");
-      const resp = await requestUrl({
+      const resp = await request({
         url: prep.downloadUrl,
         method: "GET",
         throw: false,
       });
-      if (resp.status === 404) throw Object.assign(new Error(`对象不存在：${hash.slice(0, 12)}`), { code: "NotFound" });
+      if (resp.status === 404) {
+        throw Object.assign(new Error(`对象不存在：${hash.slice(0, 12)}`), { code: "NotFound", status: resp.status });
+      }
       if (resp.status >= 200 && resp.status < 300 && resp.arrayBuffer) {
         const body = new Uint8Array(resp.arrayBuffer);
         if (remote.verifyHash !== false && await sha256Hex(body) !== hash) throw new Error("Pro 下载完整性校验失败");
         return body;
       }
-      throw new Error(`Pro 下载失败：HTTP ${resp.status}`);
+      throw httpStatusError(`Pro 下载失败：HTTP ${resp.status}`, resp.status);
     },
     // Pro 的删除由服务端 GC 处理（按 block 引用计数），插件不直接删。
     async delete() { /* no-op：内容寻址，引用计数由服务端管理 */ },
