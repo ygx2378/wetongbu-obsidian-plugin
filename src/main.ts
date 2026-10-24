@@ -1336,9 +1336,6 @@ export default class WeTongbuPlugin extends Plugin {
       text: "若关闭提醒，可在命令面板搜索“微同步：处理待确认删除”重新检查并处理。",
     });
     const actions = message.createEl("div", { cls: "wetongbu-deletion-notice-actions" });
-    actions.style.display = "flex";
-    actions.style.flexWrap = "wrap";
-    actions.style.gap = "0.5em";
     const action = actions.createEl("button", { text: "立即同步检查" });
     action.addClass("mod-cta");
     const dismiss = actions.createEl("button", { text: "关闭提醒" });
@@ -3869,9 +3866,6 @@ export default class WeTongbuPlugin extends Plugin {
       text: "提醒关闭后，可在命令面板搜索“微同步：处理待确认删除”重新打开。",
     });
     const actions = message.createEl("div", { cls: "wetongbu-deletion-notice-actions" });
-    actions.style.display = "flex";
-    actions.style.flexWrap = "wrap";
-    actions.style.gap = "0.5em";
     const action = actions.createEl("button", { text: "查看并处理删除" });
     action.addClass("mod-cta");
     const dismiss = actions.createEl("button", { text: "关闭提醒" });
