@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "candidate": "0.11.37-test1.0.313",
+  "candidate": "0.11.37-test1.0.315",
   "source": {
     "base_head": "9747b5a61d1e975261bc8b9827d788f83aac709e",
     "branch": "codex/local-clipper-1.0.1",
     "working_tree_dirty": true,
     "node_version": "v26.12.1",
     "esbuild_version": "0.28.1",
-    "package_lock_sha256": "a09d9021670fbf443ebaec4fad4b483190bc39f3575db72ee24154d0dc5209bc",
+    "package_lock_sha256": "e3399d368a4748a6c5ce135ea23cca3ba6ce8c44a51215fe2af3eeeae85a8cfb",
     "build_api_base_url": "https://staging-api.wetongbu.com",
     "source_fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in esbuild metafile input order",
     "source_input_count": 78,
@@ -330,7 +330,7 @@
   "build": {
     "input_count": 2,
     "fingerprint_algorithm": "SHA-256 of JSON.stringify([[path, sha256], ...]) in provenance build input order",
-    "fingerprint_sha256": "317578a35a01e1007fdf1f2998d87b1f25a928d1dee16594ac68083bb343a327",
+    "fingerprint_sha256": "7e560cf90c3dcaf61d0dd2ca5bccd1c6e8b96f5d7b964ed893ba4969c780a9cd",
     "inputs": [
       {
         "path": "apps/obsidian-plugin/esbuild.config.mjs",
@@ -338,7 +338,7 @@
       },
       {
         "path": "package-lock.json",
-        "sha256": "a09d9021670fbf443ebaec4fad4b483190bc39f3575db72ee24154d0dc5209bc"
+        "sha256": "e3399d368a4748a6c5ce135ea23cca3ba6ce8c44a51215fe2af3eeeae85a8cfb"
       }
     ],
     "main_js_reproduced": true,
@@ -346,7 +346,7 @@
     "main_js_bytes": 809043
   },
   "assets": {
-    "manifest_sha256": "c5968dfc67c5969229813c827144bff512e498a5cf8efe5600e7d836be885629",
+    "manifest_sha256": "7f7940394abd5139a9bbb8f9ae6e31e9e28eb5b458f269a12b3a3f8b604faa88",
     "main_js_sha256": "01fba4d07532b11d48ee402b7cd162fcb27dda9e89ef82f0645cc98e0668a4c0",
     "styles_css_sha256": "59f69c01345f9da695172d770b6a76d137a100ddd6c1c9e7021648cd7fe73f36",
     "icon_png_sha256": "3f73303f0c4aff9e006c1de2d4ddd5e5bb0a70afe786eaa2d2a2f5d377a5b1dd",
