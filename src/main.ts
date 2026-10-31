@@ -17,10 +17,11 @@ import { buildVaultPaths } from "./shared/vault-layout.mjs";
 import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
 import { validateWebclipManifest, verifyWebclipPackageFiles } from "./shared/feishu-package.mjs";
 import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
-import { VaultSyncRemoteClient, type VaultSyncClientOptions } from "./vault-sync-remote";
+import { VaultSyncRemoteClient, type VaultSyncClientOptions, type VaultSyncDeviceManagement, type VaultSyncManagedDevice } from "./vault-sync-remote";
 import type { VaultSyncV2DeviceProgress, VaultSyncV2FileVersion, VaultSyncV2FileVersionsPage } from "./vault-sync-v2-remote";
 import {
   createPrevSyncStore,
+  formatOversizedFileNotice,
   runV2PushAfterCompleteLocalScan,
   scanLocalFiles,
   shouldSyncPath,
@@ -101,7 +102,7 @@ import {
   VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
 } from "./vault-sync-history";
 import { createVaultSyncObjectWorkGate } from "./vault-sync-object-work-gate";
-import { assertVaultSyncScopeConfigured, saveVaultSyncScopeAfterRemoteConfirmation, type VaultSyncScope } from "./vault-sync-scope-update";
+import { assertVaultSyncScopeConfigured, assertVaultSyncSettingsAcknowledged, describeVaultSyncScope, saveVaultSyncScopeAfterRemoteConfirmation, type VaultSyncScope } from "./vault-sync-scope-update";
 import { restoreConflictEditorTextFormat, submitManualConflictMerge } from "./vault-sync-conflict-merge";
 import { resolveConflictAndScheduleFollowUp } from "./vault-sync-conflict-actions";
 import {
@@ -473,6 +474,7 @@ export default class WeTongbuPlugin extends Plugin {
   hostedMediaUsedBytes = 0;
   lastSafeErrorCode = "";
   private vaultSyncing = false;
+  private vaultSyncPauseRequested = false;
   private vaultSyncScopeChanging = false;
   private vaultDeviceTokenCache = "";
   private accountPollTimer: number | null = null;
@@ -523,6 +525,8 @@ export default class WeTongbuPlugin extends Plugin {
   vaultEncryptionRotationInput = "";
   vaultSyncDeviceProgress: VaultSyncV2DeviceProgress | null = null;
   vaultSyncDeviceProgressFetchedAt = "";
+  vaultSyncDeviceManagement: VaultSyncDeviceManagement | null = null;
+  vaultSyncDeviceManagementFetchedAt = "";
   private pluginTokenMissingNoticeShown = false;
 
   async onload() {
@@ -1619,6 +1623,8 @@ export default class WeTongbuPlugin extends Plugin {
     this.settings.accountPlanType = "free";
     this.settings.vaultDeviceTokenSecretId = "";
     this.settings.vaultDeviceId = "";
+    this.vaultSyncDeviceManagement = null;
+    this.vaultSyncDeviceManagementFetchedAt = "";
     this.settings.vaultEncryptionRotationOperationId = "";
     this.settings.vaultEncryptionRotationId = "";
     this.settings.vaultEncryptionRotationSecretId = "";
@@ -1816,6 +1822,8 @@ export default class WeTongbuPlugin extends Plugin {
       this.hidePendingDeletionReviewNotice();
       this.settings.vaultDeviceTokenSecretId = "";
       this.settings.vaultDeviceId = "";
+      this.vaultSyncDeviceManagement = null;
+      this.vaultSyncDeviceManagementFetchedAt = "";
       this.vaultDeviceTokenCache = "";
       await createPrevSyncStore(this.app).clear();
     }
@@ -2121,6 +2129,21 @@ export default class WeTongbuPlugin extends Plugin {
   }
 
   async setVaultSyncEnabled(enabled: boolean) {
+    if (!enabled) this.vaultSyncPauseRequested = true;
+    try {
+      await this.applyVaultSyncEnabled(enabled);
+    } catch (error) {
+      // The settings UI restores the still-enabled toggle after a rejected
+      // pause request, so release the in-memory guard with that same state.
+      if (!enabled && this.settings.vaultSyncEnabled) {
+        this.vaultSyncPauseRequested = false;
+        this.requestAutomaticVaultSync();
+      }
+      throw error;
+    }
+  }
+
+  private async applyVaultSyncEnabled(enabled: boolean) {
     if (enabled) assertVaultSyncScopeConfigured(this.settings.vaultSyncScope, this.settings.rootFolder);
     if (enabled && (!this.accountLoggedIn || !this.accountCanVaultSync)) {
       throw new Error(this.accountLoggedIn
@@ -2137,6 +2160,7 @@ export default class WeTongbuPlugin extends Plugin {
         this.settings.vaultSyncEnabled = false;
         this.settings.vaultSyncAutoEnablePending = false;
         await this.saveSettings();
+        this.vaultSyncPauseRequested = false;
         this.restartVaultSyncTimer();
         return;
       }
@@ -2147,8 +2171,10 @@ export default class WeTongbuPlugin extends Plugin {
       targetId: this.settings.syncTargetId,
       pluginToken,
     });
-    const current = await remote.getStatus();
-    const remoteEncryption = current.encryption;
+    // Disabling must reach the server without an extra status round trip. A
+    // multipart upload may be in flight while the user pauses sync, so fetch
+    // remote encryption metadata only on the enable path where it is needed.
+    const remoteEncryption = enabled ? (await remote.getStatus()).encryption : undefined;
     if (enabled && remoteEncryption?.enabled && !remoteEncryption.salt_hex) {
       throw Object.assign(new Error("云端 Vault 已启用加密，但没有返回有效盐值；已暂停同步以保护数据"), {
         code: "encryption_key_material_mismatch",
@@ -2179,9 +2205,11 @@ export default class WeTongbuPlugin extends Plugin {
         ? { enabled: true, saltHex: this.settings.vaultEncryptionSaltHex, version: this.settings.vaultEncryptionKeyVersion || 1 }
         : undefined,
     );
+    const confirmedScope = assertVaultSyncSettingsAcknowledged(result, enabled, this.settings.vaultSyncScope);
     this.settings.vaultSyncEnabled = result.enabled;
+    this.vaultSyncPauseRequested = false;
     this.settings.vaultSyncAutoEnablePending = false;
-    this.settings.vaultSyncScope = result.scope === "root_folder" ? "root_folder" : "whole_vault";
+    this.settings.vaultSyncScope = confirmedScope;
     if (result.encryption?.enabled && result.encryption.saltHex) {
       this.settings.vaultEncryptionEnabled = true;
       this.settings.vaultEncryptionSaltHex = result.encryption.saltHex;
@@ -2879,6 +2907,7 @@ export default class WeTongbuPlugin extends Plugin {
     deletionResolution?: DeletionResolution,
     diagnosticsContext?: { queueWaitMs?: number; activeQueueWaitMs?: number; auditBatchSize?: number },
   ) {
+    if (this.vaultSyncPauseRequested) return;
     if (!this.vaultSyncLifecycleActive) return;
     if (!this.vaultSyncWriteRecoveryReady) {
       this.vaultSyncEventPending = true;
@@ -2901,6 +2930,7 @@ export default class WeTongbuPlugin extends Plugin {
       if (!this.vaultSyncLifecycleActive || lifecycleGeneration !== this.vaultSyncLifecycleGeneration) {
         return Promise.resolve();
       }
+      if (this.vaultSyncPauseRequested) return Promise.resolve();
       return this.runVaultSyncUnderObjectWorkGate(quiet, deletionResolution, diagnosticsContext);
     });
     if (!this.vaultSyncLifecycleActive || lifecycleGeneration !== this.vaultSyncLifecycleGeneration) return;
@@ -2922,6 +2952,7 @@ export default class WeTongbuPlugin extends Plugin {
     deletionResolution?: DeletionResolution,
     diagnosticsContext?: { queueWaitMs?: number; activeQueueWaitMs?: number; auditBatchSize?: number },
   ) {
+    if (this.vaultSyncPauseRequested) return;
     if (!this.settings.vaultSyncEnabled) return;
     if (!this.settings.syncTargetId) return;
     if (this.vaultSyncScopeChanging) {
@@ -2988,6 +3019,7 @@ export default class WeTongbuPlugin extends Plugin {
     let diagnosticV2Journal: ReturnType<typeof createVaultSyncOutboxStore> | null = null;
     let diagnosticWork: VaultSyncDiagnosticWorkSummary | undefined;
     let diagnosticMultipartTransfer: VaultSyncMultipartTransferDiagnostic | undefined;
+    let oversizedPathsForNotice: string[] = [];
     let initializationLeaseKeeper: ReturnType<typeof createVaultSyncInitializationLeaseKeeper> | null = null;
     this.stopVaultSyncV2Events();
     try {
@@ -3182,6 +3214,11 @@ export default class WeTongbuPlugin extends Plugin {
         const baseline = createVaultSyncV2BaselineStore(this.app, identity);
         const baseContent = createVaultSyncV2BaseContentStore(this.app, identity, vaultCryptoKeyring ?? vaultCrypto);
         const staging = createVaultSyncV2SnapshotStageStore(this.app, identity);
+        const assertCanContinueVaultSyncWrite = () => {
+          if (this.vaultSyncPauseRequested || !this.settings.vaultSyncEnabled) {
+            throw Object.assign(new Error("Vault 同步已暂停；待办已保留以供恢复"), { code: "vault_sync_paused" });
+          }
+        };
         const objectTransport = createV2HostedObjectTransport(remote, async (input) => {
           const response = await requestUrl({
             url: input.url,
@@ -3193,6 +3230,7 @@ export default class WeTongbuPlugin extends Plugin {
           return { status: response.status, headers: response.headers, arrayBuffer: response.arrayBuffer };
         }, vaultCryptoKeyring ?? vaultCrypto, {
           downloadStage: createVaultSyncV2DownloadStageStore(this.app, identity),
+          assertCanContinue: assertCanContinueVaultSyncWrite,
           onMultipartTransfer: (value) => { diagnosticMultipartTransfer = value; },
         });
         const pluginApp = this.app;
@@ -3210,6 +3248,7 @@ export default class WeTongbuPlugin extends Plugin {
           assertInitializationLease: initializationLeaseKeeper
             ? () => initializationLeaseKeeper!.assertValid()
             : undefined,
+          assertCanWrite: assertCanContinueVaultSyncWrite,
           getForegroundPath: () => {
             if (typeof document === "undefined" || document.visibilityState !== "visible") return null;
             const activePath = this.app.workspace.getActiveFile()?.path ?? "";
@@ -3288,12 +3327,12 @@ export default class WeTongbuPlugin extends Plugin {
           if (!canPushIndependentFiles && !quiet) {
             if (deferredPaths.length && unresolvedConflictCount === 0) {
               const resume = this.settings.vaultSyncIntervalMinutes !== null
-                ? "关闭笔记后会自动继续"
-                : "关闭笔记后再次运行同步即可继续";
-              new Notice(`云端删除已确认；接收端笔记仍在编辑器中，已安全暂缓。${resume}，无需再次确认删除。`, 12000);
+                ? "结束后会自动继续"
+                : "结束后再次运行同步即可继续";
+              new Notice(`本机仍在编辑笔记或输入文件名，相关远端变更已安全暂缓。${resume}。若其中包含发起端已确认的删除，无需再次确认。`, 12000);
             } else {
               const blockedCount = unresolvedConflictCount > 0 ? `${unresolvedConflictCount} 项` : "部分";
-              const deferredHint = deferredPaths.length ? "；打开中的笔记关闭后会自动重试对应删除" : "";
+              const deferredHint = deferredPaths.length ? "；结束对应笔记编辑或文件名输入后会自动重试这些变更" : "";
               new Notice(`${blockedCount}远端变更暂不能安全应用；双方内容均已保留。${deferredHint} 请运行“微同步：处理待解决同步冲突”查看并处理其他冲突。`, 12000);
             }
           }
@@ -3335,6 +3374,7 @@ export default class WeTongbuPlugin extends Plugin {
             maxFileBytes: VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
             auditBatchSize: diagnosticsContext?.auditBatchSize,
           });
+          oversizedPathsForNotice = scan.oversizedPaths;
           diagnosticWork = {
             ...diagnosticWork,
             scanEntryCount: scan.index.size,
@@ -3650,7 +3690,9 @@ export default class WeTongbuPlugin extends Plugin {
       await this.reconcileCaptureHandoffs();
       if (!quiet) {
         if (result.aborted) {
-          new Notice("Vault 同步已中止，请检查后重试", 10000);
+          if (!result.failureCodes?.includes("vault_sync_file_too_large")) {
+            new Notice("Vault 同步已中止，请检查后重试", 10000);
+          }
         } else if (result.failed > 0) {
           const reason = result.failureMessages?.[0];
           new Notice(`Vault 同步未完成：${result.failed} 个文件失败${reason ? `（${reason}）` : ""}，请重试`, 12000);
@@ -3707,6 +3749,8 @@ export default class WeTongbuPlugin extends Plugin {
       }
       if (!quiet) new Notice(upgradeNotice ?? (writeRecoveryAmbiguous
         ? `笔记写入结果无法确认，已保留本机内容和恢复文件并暂停 Vault 同步；请检查 ${(error as any)?.path ?? "目标笔记"} 及同目录 .wetongbu-update 临时文件后重载 Obsidian`
+        : String((error as any)?.code ?? "") === "vault_sync_v2_local_scan_incomplete" && oversizedPathsForNotice.length > 0
+        ? formatOversizedFileNotice(oversizedPathsForNotice)
         : editorBusy
         ? (this.settings.vaultSyncIntervalMinutes === null
           ? "该笔记仍在编辑器中打开，远端更新已安全暂缓；关闭该笔记后点击“立即同步”继续，本机内容已保留"
@@ -4025,6 +4069,35 @@ export default class WeTongbuPlugin extends Plugin {
     this.vaultSyncDeviceProgressFetchedAt = new Date().toISOString();
   }
 
+  async refreshVaultSyncDeviceManagement() {
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const installationId = this.settings.vaultInstallationId;
+    if (!pluginToken || !this.settings.syncTargetId || !installationId) {
+      throw new Error("请先登录并连接当前 Vault");
+    }
+    const remote = createVaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+    });
+    this.vaultSyncDeviceManagement = await remote.getVaultDeviceManagement(installationId);
+    this.vaultSyncDeviceManagementFetchedAt = new Date().toISOString();
+  }
+
+  async retireVaultSyncDevice(deviceId: string) {
+    const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    const installationId = this.settings.vaultInstallationId;
+    if (!pluginToken || !this.settings.syncTargetId || !installationId) {
+      throw new Error("请先登录并连接当前 Vault");
+    }
+    const remote = createVaultSyncRemoteClient({
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      pluginToken,
+    });
+    return remote.retireVaultDevice(deviceId, installationId);
+  }
+
   async openDeletedVaultHistory() {
     const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     const deviceToken = this.vaultDeviceTokenCache || (this.settings.vaultDeviceTokenSecretId
@@ -4323,6 +4396,7 @@ export default class WeTongbuPlugin extends Plugin {
         autoMergeEnabled: this.settings.vaultSyncMergeMode === "automatic",
         allowEncryptedSize: this.settings.vaultEncryptionEnabled,
         objectWorkGate: vaultSyncObjectWorkGate,
+        isPathComposing: (path) => this.vaultSyncCompositionGuard?.isComposing(path) ?? false,
         rootFolder: this.settings.vaultSyncScope === "root_folder" ? this.settings.rootFolder : undefined,
         async download(item) {
           const content = item.content;
@@ -6226,6 +6300,51 @@ class AccountLogoutConfirmModal extends Modal {
   }
 }
 
+class VaultSyncRetireDeviceModal extends Modal {
+  constructor(
+    app: App,
+    private readonly device: VaultSyncManagedDevice,
+    private readonly onConfirm: () => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.titleEl.setText("确认停用同步设备？");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: `${this.device.deviceName}（ID ${this.device.deviceId.slice(0, 8)}）将无法继续同步当前 Vault；与该设备关联的微同步插件凭证也会撤销，之后需要在该设备重新登录并连接。`,
+    });
+    this.contentEl.createEl("p", {
+      text: "若该设备还有未同步的本地修改，这些修改不会进入云端；请先确保已在其他位置保存。停用不会删除云端文件、历史版本或此设备的 ACK 记录。之后可在该设备重新登录并重新连接。",
+    });
+    const status = this.contentEl.createEl("p", { cls: "setting-item-description", attr: { role: "status" } });
+    let confirming = false;
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("取消").onClick(() => this.close()))
+      .addButton((button) => button
+        .setButtonText("确认停用设备")
+        .setWarning()
+        .onClick(() => {
+          if (confirming) return;
+          confirming = true;
+          button.setDisabled(true).setButtonText("正在停用…");
+          void this.onConfirm().then(
+            () => this.close(),
+            (error) => {
+              confirming = false;
+              button.setDisabled(false).setButtonText("确认停用设备");
+              status.setText(`停用设备失败：${error instanceof Error ? error.message : String(error)}`);
+            },
+          );
+        }));
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class VaultSyncV2DeletionReviewModal extends Modal {
   private confirming = false;
   private handledCount = 0;
@@ -6987,6 +7106,53 @@ class WeTongbuSettingTab extends PluginSettingTab {
       });
     }
 
+    if (this.plugin.accountLoggedIn && this.plugin.settings.syncTargetId && this.plugin.settings.vaultInstallationId) {
+      const management = this.plugin.vaultSyncDeviceManagement;
+      const stateLabel = (state: VaultSyncManagedDevice["state"]) => state === "up_to_date"
+        ? "已追平" : state === "catching_up" ? "正在追赶" : "暂无应用回执";
+      const cursors = (device: VaultSyncManagedDevice) => `applied ${device.appliedCursor ?? "未知"} / received ${device.receivedCursor ?? "未知"}`;
+      new Setting(containerEl)
+        .setName("同步设备管理")
+        .setDesc(`查看当前 Vault 的已登记设备。只有当前 Vault 同步暂停、凭证关联完整且没有被其他活动设备共用时才能停用；云端文件、历史版本与 ACK 记录保留，未同步的本地修改不会进入云端。${this.plugin.vaultSyncDeviceManagementFetchedAt ? ` 最近查询：${this.plugin.vaultSyncDeviceManagementFetchedAt}。` : ""}`)
+        .addButton((button) => button
+          .setButtonText("刷新设备列表")
+          .onClick(async () => {
+            button.setDisabled(true);
+            try {
+              await this.plugin.refreshVaultSyncDeviceManagement();
+              this.displayPreservingScroll();
+            } catch (error) {
+              new Notice(`读取同步设备失败：${error instanceof Error ? error.message : String(error)}`, 8000);
+            } finally {
+              button.setDisabled(false);
+            }
+          }));
+      if (management) {
+        for (const device of management.devices) {
+          const suffix = device.isCurrent ? "，本机" : "";
+          const canRetire = !this.plugin.settings.vaultSyncEnabled && device.canRetire;
+          const description = `最近同步：${device.lastSyncAt || "未知"}；${cursors(device)}；${stateLabel(device.state)}${!device.isCurrent && !device.canRetire ? "；凭证关联缺失或仍被其他活动设备共用，不能安全停用" : ""}${!device.isCurrent && device.canRetire && this.plugin.settings.vaultSyncEnabled ? "；请先暂停当前 Vault 同步" : ""}`;
+          const deviceSetting = new Setting(containerEl)
+            .setName(`${device.deviceName}（ID ${device.deviceId.slice(0, 8)}${suffix}）`)
+            .setDesc(description);
+          if (!device.isCurrent && canRetire) {
+            deviceSetting.addButton((button) => button
+              .setButtonText("停用设备…")
+              .setWarning()
+              .onClick(() => new VaultSyncRetireDeviceModal(this.app, device, async () => {
+                await this.plugin.retireVaultSyncDevice(device.deviceId);
+                await this.plugin.refreshVaultSyncDeviceManagement();
+                this.displayPreservingScroll();
+                new Notice("该设备已从当前 Vault 同步中停用");
+              }).open()));
+          }
+        }
+        if (management.devices.length === 0) {
+          new Setting(containerEl).setName("当前没有已登记的同步设备");
+        }
+      }
+    }
+
     if (this.plugin.settings.vaultSyncEnabled && canVaultSync) {
       const progress = this.plugin.vaultSyncDeviceProgress;
       const stateLabel = (state: "up_to_date" | "catching_up" | "unknown") => state === "up_to_date"
@@ -7158,11 +7324,15 @@ class WeTongbuSettingTab extends PluginSettingTab {
     }
 
     if (this.plugin.accountCanVaultSync) {
-      new Setting(containerEl)
+      const selectedScope = describeVaultSyncScope(
+        this.plugin.settings.vaultSyncScope,
+        this.plugin.settings.rootFolder,
+      );
+      const scopeSetting = new Setting(containerEl)
         .setName("同步范围")
         .setDesc(this.plugin.settings.vaultSyncEnabled
-          ? "这是 Vault 级同步策略；更改后会立即按新范围重建快照并同步。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认；缩小范围时，范围外云端文件会保留且不会被当作删除。"
-          : "首次启用前可先选择同步范围。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认。若当前 Vault 含有日常文件，请先把“微同步目录”改为仅含合成测试数据的专用目录，再选择仅同步该目录。")
+          ? `当前已选：${selectedScope}。这是 Vault 级同步策略；更改后会立即按新范围重建快照并同步。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认；缩小范围时，范围外云端文件会保留且不会被当作删除。`
+          : `当前已选：${selectedScope}。首次启用前可先选择同步范围。同步以文件为单位，创建或删除空文件夹不会触发同步或云端删除确认。若当前 Vault 含有日常文件，请先把“微同步目录”改为仅含合成测试数据的专用目录，再选择仅同步该目录。`)
         .addDropdown((dropdown) =>
           dropdown
             .addOption("whole_vault", "整个 Vault（推荐）")
@@ -7178,6 +7348,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
               }
             }),
         );
+      scopeSetting.settingEl.addClass("wetongbu-vault-sync-scope-setting");
     }
 
     if (this.plugin.settings.vaultSyncEnabled && this.plugin.accountCanVaultSync) {

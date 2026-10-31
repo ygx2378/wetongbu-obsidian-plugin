@@ -175,6 +175,8 @@ export interface VaultSyncV2ApplyOptions {
   rootFolder?: string;
   /** Event-fed local generation used to detect edit-then-revert races during downloads. */
   getPathGeneration?: VaultPathGenerationReader;
+  /** Native Obsidian filename input may be composing even when no Markdown leaf is open. */
+  isPathComposing?(path: string): boolean;
   /** Rebase the sole matching local update conflict after a complete net-zero remote chain is proven. */
   rebaseNetZeroConflict?(input: { operationId: string; expectedVersionId: string }): Promise<boolean>;
   /** Batch durable metadata writes to avoid quadratic work for large snapshots. */
@@ -272,7 +274,22 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
     await renameFile.call(app.fileManager, file, path);
   }
 
+  function isPathComposing(path: string): boolean {
+    try {
+      return options.isPathComposing?.(path) ?? false;
+    } catch {
+      return true;
+    }
+  }
+
+  function assertNotComposing(path: string): void {
+    if (isPathComposing(path)) {
+      throw Object.assign(fail("v2_apply_composition_busy", "文件名仍处于输入组合状态，远端变更已暂缓"), { path });
+    }
+  }
+
   function assertNotEditing(path: string): void {
+    assertNotComposing(path);
     if (isVaultPathOpenInMarkdownEditor(options.app, path)) {
       throw Object.assign(fail("v2_apply_active_editor_busy", "该笔记仍在编辑器中打开，远端更新已暂缓"), { path });
     }
@@ -770,6 +787,8 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       }
       const currentFiles = (options.app.vault.getFiles?.() ?? []) as any[];
       const affectedFiles = currentFiles.filter((file) => normalizeVaultPath(file.path)?.startsWith(sourcePrefix));
+      const composingFile = affectedFiles.find((file) => isPathComposing(file.path));
+      if (composingFile) assertNotComposing(composingFile.path);
       const openFile = affectedFiles.find((file) => isVaultPathOpenInMarkdownEditor(options.app, file.path));
       if (openFile) {
         throw Object.assign(fail("v2_apply_active_editor_busy", "改名目录中有笔记仍在编辑器打开，远端改名已暂缓"), { path: openFile.path });
@@ -1674,6 +1693,14 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         applied += 1;
         continue;
       }
+      const composingPath = [entry.item.path, entry.item.previousPath]
+        .find((path): path is string => !!path && isPathComposing(path));
+      if (composingPath) {
+        blocked += 1;
+        deferredPaths.push(normalizeVaultPath(composingPath) ?? composingPath);
+        deferredFileIds.add(entry.item.fileId);
+        continue;
+      }
       // Older builds parked every received tombstone in `needs_resolution`
       // when the receiver's delete mode required review. Re-check unresolved
       // tombstones with no explicit user resolution under the new one-confirm
@@ -1703,6 +1730,12 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         await options.journal.markInboxItem(entry.cursor, "applied");
         applied += 1;
       } catch (error: any) {
+        if (error?.code === "v2_apply_composition_busy") {
+          blocked += 1;
+          deferredPaths.push(normalizeVaultPath(error.path ?? entry.item.path) ?? entry.item.path);
+          deferredFileIds.add(entry.item.fileId);
+          continue;
+        }
         if (error?.code === "v2_apply_active_editor_busy") {
           if (entry.item.eventType !== "update" || entry.item.isDeleted) throw error;
           // A normal content update can wait for its editor to close while
@@ -1824,6 +1857,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       if (!movedFile || "children" in movedFile || !movedBytes) {
         throw fail("v2_delete_requires_resolution", "本机改名后的文件无法核验；云端删除暂缓应用");
       }
+      assertNotComposing(movedPath);
       if (isVaultPathOpenInMarkdownEditor(options.app, movedPath)) {
         throw fail("v2_delete_editor_busy", "本机改名后的文件仍在编辑器中打开；自动删除已暂缓");
       }
@@ -1832,6 +1866,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       await withVaultPathWriteLock(movedPath, async () => {
         await assertSnapshotApplyLease();
         assertVaultPathGeneration(movedPath, movedGeneration, options.getPathGeneration, "v2_delete_requires_review");
+        assertNotComposing(movedPath);
         if (isVaultPathOpenInMarkdownEditor(options.app, movedPath)) {
           throw fail("v2_delete_editor_busy", "本机改名后的文件在应用删除时打开；自动删除已暂缓");
         }
@@ -1853,6 +1888,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       return tombstone;
     }
     const generation = options.getPathGeneration?.(candidatePath);
+    assertNotComposing(candidatePath);
     if (isVaultPathOpenInMarkdownEditor(options.app, candidatePath)) {
       throw fail("v2_delete_editor_busy", "本机文件仍在编辑器中打开；自动删除已暂缓");
     }
@@ -1861,6 +1897,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
     await withVaultPathWriteLock(candidatePath, async () => {
       await assertSnapshotApplyLease();
       assertVaultPathGeneration(candidatePath, generation, options.getPathGeneration, "v2_delete_requires_review");
+      assertNotComposing(candidatePath);
       if (isVaultPathOpenInMarkdownEditor(options.app, candidatePath)) {
         throw fail("v2_delete_editor_busy", "删除期间文件在编辑器中打开；自动删除已暂缓");
       }
@@ -1893,6 +1930,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         await assertSnapshotApplyLease();
         assertVaultPathGeneration(candidatePath, generation, options.getPathGeneration, "v2_delete_requires_review");
         assertVaultPathGeneration(conflictCopyPath, conflictCopyGeneration, options.getPathGeneration, "v2_delete_requires_review");
+        assertNotComposing(candidatePath);
         if (isVaultPathOpenInMarkdownEditor(options.app, candidatePath)) {
           throw fail("v2_delete_editor_busy", "本机文件在保留副本时打开；自动删除已暂缓");
         }
@@ -1906,6 +1944,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         await ensureParent(conflictCopyPath);
         assertVaultPathGeneration(candidatePath, generation, options.getPathGeneration, "v2_delete_requires_review");
         assertVaultPathGeneration(conflictCopyPath, conflictCopyGeneration, options.getPathGeneration, "v2_delete_requires_review");
+        assertNotComposing(candidatePath);
         if (isVaultPathOpenInMarkdownEditor(options.app, candidatePath)) {
           throw fail("v2_delete_editor_busy", "本机文件在保留副本时打开；自动删除已暂缓");
         }
@@ -1916,6 +1955,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         }
         assertVaultPathGeneration(candidatePath, generation, options.getPathGeneration, "v2_delete_requires_review");
         assertVaultPathGeneration(conflictCopyPath, conflictCopyGeneration, options.getPathGeneration, "v2_delete_requires_review");
+        assertNotComposing(candidatePath);
         if (isVaultPathOpenInMarkdownEditor(options.app, candidatePath)) {
           throw fail("v2_delete_editor_busy", "本机文件在保留副本时打开；自动删除已暂缓");
         }
@@ -1959,6 +1999,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
     const pathMove = (await options.pathIntents?.load() ?? []).find((move) => move.fileId === item.fileId
       || (!move.fileId && move.fromPath === prior.path));
     if (pathMove) throw fail("v2_delete_requires_resolution", "云端删除已由发起设备确认；接收端改名文件需要核验后再应用");
+    assertNotComposing(item.path);
     if (isVaultPathOpenInMarkdownEditor(options.app, item.path)) {
       throw fail("v2_delete_editor_busy", "本机文件仍在编辑器中打开；自动删除已暂缓");
     }
@@ -1969,6 +2010,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
       const generation = options.getPathGeneration?.(item.path);
       await withVaultPathWriteLock(item.path, async () => {
         assertVaultPathGeneration(item.path, generation, options.getPathGeneration, "v2_delete_requires_review");
+          assertNotComposing(item.path);
         if (isVaultPathOpenInMarkdownEditor(options.app, item.path)) {
           throw fail("v2_delete_editor_busy", "本机删除文件仍在编辑器中打开；云端删除已暂缓");
         }
@@ -1991,6 +2033,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
     const generation = options.getPathGeneration?.(item.path);
     await withVaultPathWriteLock(item.path, async () => {
       assertVaultPathGeneration(item.path, generation, options.getPathGeneration, "v2_delete_requires_review");
+      assertNotComposing(item.path);
       if (isVaultPathOpenInMarkdownEditor(options.app, item.path)) {
         throw fail("v2_delete_editor_busy", "删除期间文件在编辑器中打开；自动删除已暂缓");
       }
@@ -1999,6 +2042,7 @@ export function createVaultSyncV2ApplyEngine(options: VaultSyncV2ApplyOptions) {
         throw fail("v2_delete_requires_resolution", "删除期间本机文件发生变化；文件保持不变");
       }
       assertVaultPathGeneration(item.path, generation, options.getPathGeneration, "v2_delete_requires_review");
+      assertNotComposing(item.path);
       if (isVaultPathOpenInMarkdownEditor(options.app, item.path)) {
         throw fail("v2_delete_editor_busy", "删除期间文件在编辑器中打开；自动删除已暂缓");
       }

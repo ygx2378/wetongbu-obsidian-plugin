@@ -2,7 +2,7 @@
 // 封装 requestUrl 调用 /api/sync-targets/:id/vault/* 路由。
 // 用 vault device token（registerDevice 返回的一次性 token）认证。
 
-import { normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
+import { isValidVaultSyncInt8Decimal, normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
 import type { FileEntity } from "./vault-sync-diff";
 import { VaultSyncV2RemoteClient } from "./vault-sync-v2-remote.ts";
 import type { VaultSyncCapabilities, VaultSyncOperationReceiptOutcome, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
@@ -72,6 +72,23 @@ export interface VaultSyncStatus {
       status: "active" | "retained" | "retired";
     }>;
   };
+}
+
+export interface VaultSyncManagedDevice {
+  deviceId: string;
+  deviceName: string;
+  lastSyncAt: string | null;
+  receivedCursor: string | null;
+  appliedCursor: string | null;
+  state: "up_to_date" | "catching_up" | "unknown";
+  isCurrent: boolean;
+  canRetire: boolean;
+}
+
+export interface VaultSyncDeviceManagement {
+  protocolEpoch: number;
+  changeCursor: string;
+  devices: VaultSyncManagedDevice[];
 }
 
 export interface VaultSyncClientOptions {
@@ -155,6 +172,56 @@ export class VaultSyncRemoteClient {
 
   async getV2DeviceProgress(): Promise<VaultSyncV2DeviceProgress> {
     return this.v2.getDeviceProgress();
+  }
+
+  async getVaultDeviceManagement(installationId: string): Promise<VaultSyncDeviceManagement> {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuid.test(installationId)) throw new Error("同步安装 ID 无效");
+    const value = await this.request(`/api/sync-targets/${this.targetId}/vault/devices/management`, {
+      method: "GET", token: "plugin", query: { installation_id: installationId },
+    });
+    if (!value || Object.keys(value).sort().join(",") !== "changeCursor,devices,protocolEpoch"
+      || !Number.isSafeInteger(value.protocolEpoch) || value.protocolEpoch < 1
+      || !isValidVaultSyncInt8Decimal(value.changeCursor)
+      || !Array.isArray(value.devices) || value.devices.length > 100) {
+      throw new Error("同步设备列表响应无效");
+    }
+    const seen = new Set<string>();
+    for (const device of value.devices) {
+      if (!device || Object.keys(device).sort().join(",") !== "appliedCursor,canRetire,deviceId,deviceName,isCurrent,lastSyncAt,receivedCursor,state"
+        || !uuid.test(device.deviceId) || typeof device.deviceName !== "string"
+        || !(device.lastSyncAt === null || (typeof device.lastSyncAt === "string" && !Number.isNaN(Date.parse(device.lastSyncAt))))
+        || !(device.receivedCursor === null || isValidVaultSyncInt8Decimal(device.receivedCursor))
+        || !(device.appliedCursor === null || isValidVaultSyncInt8Decimal(device.appliedCursor))
+        || !["up_to_date", "catching_up", "unknown"].includes(device.state)
+        || typeof device.isCurrent !== "boolean" || typeof device.canRetire !== "boolean") {
+        throw new Error("同步设备列表响应无效");
+      }
+      if (seen.has(device.deviceId.toLowerCase())) throw new Error("同步设备列表包含重复设备");
+      seen.add(device.deviceId.toLowerCase());
+      if (device.appliedCursor !== null && device.receivedCursor !== null
+        && BigInt(device.appliedCursor) > BigInt(device.receivedCursor)) {
+        throw new Error("同步设备游标响应无效");
+      }
+      if ((device.state === "unknown" && (device.receivedCursor !== null || device.appliedCursor !== null))
+        || (device.state === "up_to_date" && (device.appliedCursor === null
+          || BigInt(device.appliedCursor) < BigInt(value.changeCursor)))
+        || (device.state === "catching_up" && (device.appliedCursor === null
+          || BigInt(device.appliedCursor) >= BigInt(value.changeCursor)))) {
+        throw new Error("同步设备状态与游标不一致");
+      }
+    }
+    return value as VaultSyncDeviceManagement;
+  }
+
+  async retireVaultDevice(deviceId: string, installationId: string): Promise<{ status: "retired" | "already_retired" }> {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuid.test(deviceId) || !uuid.test(installationId)) throw new Error("同步设备 ID 无效");
+    const value = await this.request(`/api/sync-targets/${this.targetId}/vault/devices/${deviceId}/retire`, {
+      method: "POST", token: "plugin", body: { confirmation: "retire_device", current_installation_id: installationId },
+    });
+    if (!value || !["retired", "already_retired"].includes(value.status)) throw new Error("设备停用响应无效");
+    return value as { status: "retired" | "already_retired" };
   }
 
   async createOperationWindow(): Promise<VaultSyncOperationWindow> {

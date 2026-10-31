@@ -94,6 +94,8 @@ export interface VaultSyncV2PreparedUpload {
 export interface VaultSyncV2HostedObjectTransportOptions {
   downloadStage?: VaultSyncV2DownloadStageStore;
   downloadRangeBytes?: number;
+  /** Synchronous local pause boundary checked before writes and after in-flight requests. */
+  assertCanContinue?: () => void;
   /** Process-local, allowlisted stage/status observations; callback failures never affect transfer. */
   onMultipartTransfer?: (diagnostic: VaultSyncMultipartTransferDiagnostic) => void;
 }
@@ -129,6 +131,8 @@ export function createV2HostedObjectTransport(
         ...(httpStatus === undefined ? {} : { httpStatus }), ...(errorCode === undefined ? {} : { errorCode }) });
     } catch { /* diagnostics must not affect sync */ }
   };
+
+  const assertCanContinue = () => options.assertCanContinue?.();
 
   const trackMultipartTransfer = async <T>(
     stage: VaultSyncMultipartTransferDiagnostic["stage"],
@@ -623,9 +627,11 @@ export function createV2HostedObjectTransport(
     },
 
     async transfer(prepared: VaultSyncV2PreparedUpload): Promise<void> {
+      assertCanContinue();
       const { content, objectBytes } = prepared;
       if (!prepared.deduped) {
         const finalize = async () => trackMultipartTransfer("finalize", async () => {
+          assertCanContinue();
           const finalized = await remote.finalizeContentObject(content.reservationId);
           if (finalized.objectId !== content.objectId || finalized.encryptionDomainId !== content.encryptionDomainId
             || finalized.keyVersion !== content.keyVersion || finalized.byteSize !== content.byteSize
@@ -647,6 +653,7 @@ export function createV2HostedObjectTransport(
             }
             return value;
           });
+          assertCanContinue();
           if (session.deduped) {
             await finalize();
             return;
@@ -654,6 +661,7 @@ export function createV2HostedObjectTransport(
           const partSize = session.partSize as number;
           const uploadedByNumber = new Map(session.uploadedParts.map((part) => [part.partNumber, part.byteSize]));
           for (let partNumber = 1; partNumber <= session.partCount; partNumber += 1) {
+            assertCanContinue();
             const offset = (partNumber - 1) * partSize;
             const part = objectBytes.subarray(offset, Math.min(offset + partSize, objectBytes.byteLength));
             if (uploadedByNumber.get(partNumber) === part.byteLength) continue;
@@ -662,6 +670,7 @@ export function createV2HostedObjectTransport(
             for (let attempt = 0; attempt < 2; attempt += 1) {
               const signed = await trackMultipartTransfer("part_url",
                 () => remote.getContentObjectMultipartPartUrl!(content.reservationId, partNumber));
+              assertCanContinue();
               reportMultipartTransfer("part_upload", "started");
               try {
                 response = await request({ url: signed.uploadUrl, method: "PUT", body, throw: false });
@@ -674,18 +683,21 @@ export function createV2HostedObjectTransport(
               reportMultipartTransfer("part_upload", response.status >= 200 && response.status < 300 ? "succeeded" : "failed",
                 Number.isSafeInteger(response.status) && response.status >= 100 && response.status <= 599
                   ? response.status : undefined);
+              assertCanContinue();
               if (response.status !== 401 && response.status !== 403) break;
             }
             if (response.status < 200 || response.status >= 300) {
               throw storageError(`对象第 ${partNumber} 段上传暂未完成`, response, "object_upload_failed");
             }
           }
+          assertCanContinue();
           await trackMultipartTransfer("complete", async () => {
             const completed = await remote.completeContentObjectMultipartUpload!(content.reservationId);
             if (!completed.completed) {
               throw Object.assign(new Error("对象分段尚未完成"), { code: "multipart_parts_incomplete" });
             }
           });
+          assertCanContinue();
           await finalize();
           return;
         }
@@ -695,7 +707,9 @@ export function createV2HostedObjectTransport(
           : objectBytes.buffer.slice(objectBytes.byteOffset, objectBytes.byteOffset + objectBytes.byteLength) as ArrayBuffer;
         let uploadUrl = prepared.uploadUrl;
         let response = await request({ url: uploadUrl, method: "PUT", body: makeBody(), throw: false });
+        assertCanContinue();
         if (response.status === 401 || response.status === 403) {
+          assertCanContinue();
           const renewed = await remote.reserveContentObject({
             ciphertextHash: content.ciphertextHash,
             byteSize: content.byteSize,
@@ -711,10 +725,12 @@ export function createV2HostedObjectTransport(
           }
           uploadUrl = renewed.uploadUrl;
           response = await request({ url: uploadUrl, method: "PUT", body: makeBody(), throw: false });
+          assertCanContinue();
         }
         if (response.status < 200 || response.status >= 300) {
           throw storageError("对象上传暂未完成", response, "object_upload_failed");
         }
+        assertCanContinue();
         await finalize();
       }
     },

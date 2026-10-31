@@ -27,7 +27,7 @@ import {
 } from "./vault-sync-diff.ts";
 import {
   type LocalIndex, type PrevSyncState, type PrevSyncStore,
-  scanLocalFiles, prevSyncAsMap, advancePrevSync,
+  scanLocalFiles, prevSyncAsMap, advancePrevSync, formatOversizedFileNotice,
 } from "./vault-sync-local.ts";
 import type { LocalFileHashCache } from "./vault-sync-local.ts";
 import { getVaultSyncRetryAfterFromError, isRetryableVaultSyncError } from "./vault-sync-retry.ts";
@@ -36,6 +36,7 @@ import {
   type DeletionResolution, type PendingDeletion,
 } from "./vault-sync-deletion.ts";
 import type { VaultSyncStorage } from "./vault-sync-storage";
+import { VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES } from "./vault-sync-history.ts";
 import { sha256Hex as computeHash } from "./shared/hash.ts";
 import {
   articleAssetFingerprintFromVault,
@@ -176,6 +177,7 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
 
     // 2. 扫描本地
     const scan = await scanLocalFiles(app, rootFolder, undefined, deps.localHashCache, {
+      maxFileBytes: VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES,
       auditBatchSize: deps.auditBatchSize,
     });
     const localIndex = scan.index;
@@ -187,6 +189,10 @@ export function createVaultSyncOrchestrator(deps: VaultSyncOrchestratorDeps) {
     if (scan.invalidPaths.length > 0) {
       notify(`Vault 同步暂停：有 ${scan.invalidPaths.length} 个文件名不兼容跨平台同步（${scan.invalidPaths.slice(0, 3).join("、")}）`);
       return { ...result, aborted: true, failureCodes: ["vault_sync_invalid_path"] };
+    }
+    if (scan.oversizedPaths.length > 0) {
+      notify(formatOversizedFileNotice(scan.oversizedPaths));
+      return { ...result, aborted: true, failureCodes: ["vault_sync_file_too_large"] };
     }
     if (scan.unreadablePaths.length > 0) {
       notify(`Vault 同步暂停：有 ${scan.unreadablePaths.length} 个文件暂时无法读取，未传播删除`);

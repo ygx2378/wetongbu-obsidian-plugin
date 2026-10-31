@@ -109,6 +109,8 @@ export interface VaultSyncV2PushOptions {
   onAutoMergePhase?(phase: VaultSyncPushCasAutoMergePhase): void;
   /** Confirms the first-initialization owner lease immediately before each remote write. */
   assertInitializationLease?(): Promise<void>;
+  /** Synchronous local pause boundary checked immediately before a remote commit. */
+  assertCanWrite?(): void;
   now?: () => Date;
 }
 
@@ -165,6 +167,7 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
   }
 
   function commitRemote(operation: VaultSyncOutboxOperation, request = operation.request) {
+    options.assertCanWrite?.();
     return options.remote.commitOperation(request);
   }
 

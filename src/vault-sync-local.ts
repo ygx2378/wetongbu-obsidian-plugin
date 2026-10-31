@@ -30,6 +30,20 @@ export interface ScanResult {
   auditRehashes: number;
 }
 
+/** Local-only notice for files that cannot enter the sync manifest. Never persist this in diagnostics. */
+export function formatOversizedFileNotice(paths: string[]): string {
+  const examples = paths.slice(0, 3).map((path) => {
+    const safe = Array.from(path.replace(/[\u0000-\u001f\u007f]/g, "�"));
+    const label = safe.length > 120 ? `${safe.slice(0, 117).join("")}…` : safe.join("");
+    return `“${label}”`;
+  });
+  const remaining = Math.max(0, paths.length - examples.length);
+  const detail = examples.length
+    ? `超限路径（仅本机显示）：${examples.join("、")}${remaining ? `，另有 ${remaining} 个` : ""}。`
+    : "";
+  return `Vault 同步已暂停：有 ${paths.length} 个文件超过单文件同步上限，未传播删除。${detail}请核实这些本地文件后再重试。`;
+}
+
 /** V2 writes must pause when any in-scope file could not be represented safely. */
 export function assertV2LocalScanComplete(scan: ScanResult): void {
   const issueCount = scan.unreadablePaths.length + scan.oversizedPaths.length
