@@ -12,6 +12,9 @@ import {
   normalizePath,
   requestUrl,
   type App,
+  type Editor,
+  type MarkdownFileInfo,
+  type MarkdownView,
 } from "obsidian";
 import { buildVaultPaths } from "./shared/vault-layout.mjs";
 import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
@@ -35,6 +38,7 @@ import { resolveAssetTarget } from "./asset-target";
 import { applyMediaContinuationAsset, commitMediaContinuationNoteAndEvidence, localClipImageLayoutAssets, processLocalClipImages, replaceMarkdownDestination } from "./media-continuation";
 import { completeLocalClipTaskWithRetry } from "./local-clip-completion";
 import { unzipWebclipArchive } from "./webclip-zip";
+import { localPastedImageName, replacePlaceholder, selectPastedImages, uploadPastedImages } from "./paste-image-upload";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { createVaultSyncBootstrapNoticeGate } from "./vault-sync-bootstrap-notice";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
@@ -209,6 +213,8 @@ interface WeTongbuSettings {
   processedTaskIds: string[];
   processedSourceUrls: string[];
   imageDeliveryMode: ImageDeliveryMode;
+  /** Upload images pasted or dropped into notes to hosted media (Plus only). */
+  pasteImageUploadEnabled: boolean;
   articleSyncIntervalSeconds: number;
   vaultSyncEnabled: boolean;
   /** Deprecated compatibility field; automatic enablement is disabled. */
@@ -291,6 +297,7 @@ const VAULT_SAFETY_RATIO_OPTIONS = [0.3, 0.5, 0.7, 0.9, 1] as const;
 const VAULT_SYNC_RETRY_AFTER_LOCAL_STORAGE_KEY = "wetongbu-vault-sync-retry-after-v1";
 const LOCAL_CLIP_IMAGE_QUEUE_KEY = "wetongbu-local-clip-image-queue-v1";
 const LOCAL_CLIP_IMAGE_QUEUE_TTL_MS = 24 * 60 * 60 * 1000;
+const PASTED_IMAGE_EXPIRY_NOTICE = "Plus 到期后云端图片仍可访问 30 天，宽限期结束后笔记中的云端图片链接将失效且图片会被清理，请在到期前续费或自行备份。";
 
 const WETONGBU_RIBBON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -371,6 +378,7 @@ const DEFAULT_SETTINGS: WeTongbuSettings = {
   processedTaskIds: [],
   processedSourceUrls: [],
   imageDeliveryMode: "local",
+  pasteImageUploadEnabled: false,
   articleSyncIntervalSeconds: 30,
   vaultSyncEnabled: false,
   vaultSyncAutoEnablePending: false,
@@ -650,6 +658,7 @@ export default class WeTongbuPlugin extends Plugin {
       () => [...this.vaultSyncEditorDeferredPaths],
       () => this.requestAutomaticVaultSync(),
     )) this.registerEvent(event);
+    this.registerPasteImageUpload();
     this.registerObsidianProtocolHandler("wetongbu-import", (params) => {
       void this.handleLocalClipImport(params as Record<string, unknown>);
     });
@@ -5119,6 +5128,64 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
+  private registerPasteImageUpload() {
+    const handler = (evt: ClipboardEvent | DragEvent, editor: Editor, info: MarkdownView | MarkdownFileInfo) => {
+      if (evt.defaultPrevented || !this.settings.pasteImageUploadEnabled || !this.canHostImages) return;
+      if (!this.accountLoggedIn || !this.settings.syncTargetId) return;
+      const transfer = "clipboardData" in evt ? evt.clipboardData : evt.dataTransfer;
+      const files = selectPastedImages(Array.from(transfer?.files ?? []));
+      const sourceFile = info.file;
+      if (!files.length || !sourceFile) return;
+      evt.preventDefault();
+      void uploadPastedImages({
+        files,
+        createId: () => crypto.randomUUID(),
+        insert: (text) => editor.replaceSelection(text),
+        replace: async (placeholder, replacement) => {
+          if (info.file?.path === sourceFile.path) {
+            const index = editor.getValue().indexOf(placeholder);
+            if (index >= 0) {
+              editor.replaceRange(replacement, editor.offsetToPos(index), editor.offsetToPos(index + placeholder.length));
+              return;
+            }
+          }
+          await this.app.vault.process(sourceFile, (content) => replacePlaceholder(content, placeholder, replacement) ?? content);
+        },
+        upload: (file) => this.uploadPastedImage(file),
+        saveLocally: async (file) => {
+          const path = await this.app.fileManager.getAvailablePathForAttachment(localPastedImageName(file), sourceFile.path);
+          const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
+          return `!${this.app.fileManager.generateMarkdownLink(created, sourceFile.path)}`;
+        },
+        notify: (message) => new Notice(message, 10000),
+      }).catch((error) => {
+        new Notice(`图片粘贴处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+      });
+    };
+    this.registerEvent(this.app.workspace.on("editor-paste", handler));
+    this.registerEvent(this.app.workspace.on("editor-drop", handler));
+  }
+
+  private async uploadPastedImage(file: File) {
+    const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
+    if (!token || !this.settings.syncTargetId) throw new Error("当前 Vault 尚未连接微同步账号");
+    const response = await requestUrl({
+      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/sync-targets/${this.settings.syncTargetId}/media/uploads`,
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      contentType: file.type,
+      body: await file.arrayBuffer(),
+      throw: false,
+    });
+    if (response.status !== 200) {
+      if (response.json?.code === "hosted_media_unavailable") this.canHostImages = false;
+      throw new Error(response.json?.error ?? `云端图片上传失败（HTTP ${response.status}）`);
+    }
+    const url = response.json?.url;
+    if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error("云端图片链接响应无效");
+    return url;
+  }
+
   private async publishHostedImages(base: string, token: string, taskId: string) {
     const response = await requestUrl({
       url: `${base}/api/sync-targets/${this.settings.syncTargetId}/tasks/${taskId}/media/publish`,
@@ -6795,6 +6862,21 @@ class WeTongbuSettingTab extends PluginSettingTab {
                 new Notice(`图片保存位置更新失败：${error instanceof Error ? error.message : String(error)}`, 10000);
                 this.display();
               }
+            }),
+        );
+      new Setting(containerEl)
+        .setName("粘贴图片自动上传")
+        .setDesc(this.plugin.canHostImages
+          ? `粘贴或拖入笔记的图片会上传到微同步云端，并以图片链接插入；上传失败时自动保存到本地。注意：${PASTED_IMAGE_EXPIRY_NOTICE}`
+          : `云端图片处于只读宽限期，粘贴的图片会保存到本地。${PASTED_IMAGE_EXPIRY_NOTICE}`)
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.pasteImageUploadEnabled)
+            .setDisabled(!this.plugin.canHostImages && !this.plugin.settings.pasteImageUploadEnabled)
+            .onChange(async (value) => {
+              this.plugin.settings.pasteImageUploadEnabled = value;
+              await this.plugin.saveSettings();
+              if (value) new Notice(`已开启粘贴图片自动上传。${PASTED_IMAGE_EXPIRY_NOTICE}`, 12000);
             }),
         );
     } else {
