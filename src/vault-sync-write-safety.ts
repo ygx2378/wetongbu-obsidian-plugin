@@ -328,6 +328,19 @@ export interface BinaryAssetWriteResult {
   mtime: number | null;
 }
 
+/** Avoid reading an existing file unless metadata says it can match the incoming bytes. */
+async function existingBinaryMatches(
+  adapter: { readBinary(path: string): Promise<ArrayBuffer> },
+  path: string,
+  stat: { size: number },
+  body: Uint8Array,
+  expectedHash: string,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(stat.size) || stat.size !== body.byteLength) return false;
+  const current = new Uint8Array(await adapter.readBinary(path));
+  return current.byteLength === body.byteLength && await sha256Hex(current) === expectedHash;
+}
+
 export async function writeBinaryAssetSafely(
   app: App,
   path: string,
@@ -339,11 +352,8 @@ export async function writeBinaryAssetSafely(
     const before = await adapter.stat(path);
     const expectedHash = await sha256Hex(body);
     if (before) {
-      if (before.type === "file") {
-        const current = new Uint8Array(await adapter.readBinary(path));
-        if (current.byteLength === body.byteLength && await sha256Hex(current) === expectedHash) {
-          return { created: false, mtime: Number.isFinite(before.mtime) ? before.mtime : null };
-        }
+      if (before.type === "file" && await existingBinaryMatches(adapter, path, before, body, expectedHash)) {
+        return { created: false, mtime: Number.isFinite(before.mtime) ? before.mtime : null };
       }
       throw fail("vault_write_path_collision", "附件目标在准备期间已被占用，已保留现有文件并暂缓写入");
     }
@@ -357,8 +367,7 @@ export async function writeBinaryAssetSafely(
     } catch (error) {
       const raced = await adapter.stat(path).catch(() => null);
       if (raced?.type === "file") {
-        const current = new Uint8Array(await adapter.readBinary(path));
-        if (current.byteLength === body.byteLength && await sha256Hex(current) === expectedHash) {
+        if (await existingBinaryMatches(adapter, path, raced, body, expectedHash)) {
           return { created: false, mtime: Number.isFinite(raced.mtime) ? raced.mtime : null };
         }
         throw fail("vault_write_path_collision", "附件目标在准备期间已被占用，已保留现有文件并暂缓写入");

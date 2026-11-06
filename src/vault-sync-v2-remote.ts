@@ -845,6 +845,15 @@ export class VaultSyncV2RemoteClient {
   }
 
   async getCapabilities(): Promise<VaultSyncCapabilities> {
+    try {
+      await this.request(`/api/sync-targets/${this.targetId}/vault/device-capabilities`, {
+        method: "POST", token: "plugin", body: { object_formats: ["marker-2", "marker-3"] },
+      });
+    } catch (error: any) {
+      // Older servers have no capability-report endpoint yet. Keep v2 usable;
+      // the absent report means the server will not advertise marker-3 readiness.
+      if (error?.status !== 404 && error?.status !== 405 && error?.code !== "vault_sync_schema_update_required") throw error;
+    }
     const value = await this.request("/api/sync-targets/" + this.targetId + "/vault/capabilities?retention_policy_version=1", { method: "GET", token: "plugin" });
     const keys = ["protocolVersion", "activeProtocolVersion", "protocolEpoch", "minimumWriterVersion", "canRead", "canWrite", "baselineReady", "v2WriteEnabled", "v2WriteAvailable", "scopePolicy", "historyPolicy", "retentionPolicy", "supportedFeatures", "changeCursor"];
     if (!exactKeys(value, keys) || value.protocolVersion !== 2 || ![1, 2].includes(value.activeProtocolVersion)

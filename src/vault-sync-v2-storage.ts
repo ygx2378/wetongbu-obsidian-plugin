@@ -3,6 +3,7 @@ import { Sha256Accumulator } from "./shared/sha256-stream.ts";
 import type { VaultSyncCrypto, VaultSyncCryptoKeyring } from "./shared/vault-sync-crypto.ts";
 import { getVaultSyncRetryAfterFromResponse } from "./vault-sync-retry.ts";
 import { VAULT_SYNC_DOWNLOAD_STAGE_MAX_BYTES, type VaultSyncV2DownloadStageRequest, type VaultSyncV2DownloadStageStore } from "./vault-sync-v2-download-stage.ts";
+import type { VaultSyncV2UploadStageRequest, VaultSyncV2UploadStageStore } from "./vault-sync-v2-upload-stage.ts";
 import { VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES, vaultSyncCiphertextLimitForPlaintext } from "./vault-sync-history.ts";
 import type { VaultSyncMultipartTransferDiagnostic } from "./vault-sync-diagnostics.ts";
 
@@ -62,6 +63,7 @@ export type VaultSyncV2ObjectRequestResult = {
 };
 
 export const VAULT_SYNC_MULTIPART_THRESHOLD_BYTES = 8 * 1024 * 1024;
+const VAULT_SYNC_STAGED_UPLOAD_MAX_PART_BYTES = 8 * 1024 * 1024;
 export const VAULT_SYNC_DOWNLOAD_RANGE_BYTES = 8 * 1024 * 1024;
 type VaultSyncV2DownloadLease = Omit<VaultSyncV2ContentRef, "reservationId"> & {
   downloadUrl: string; leaseId: string; leaseExpiresAt: string;
@@ -86,6 +88,9 @@ export interface VaultSyncV2PreparedUpload {
   plaintextHash: string;
   ciphertextHash: string;
   objectBytes: Uint8Array;
+  /** Present only for capability-gated, encrypted marker-3 uploads. */
+  readRange?: (offset: number, length: number) => Promise<Uint8Array>;
+  cleanupStage?: () => Promise<void>;
   uploadUrl: string | null;
   uploadExpiresAt?: string;
   deduped: boolean;
@@ -93,7 +98,12 @@ export interface VaultSyncV2PreparedUpload {
 
 export interface VaultSyncV2HostedObjectTransportOptions {
   downloadStage?: VaultSyncV2DownloadStageStore;
+  uploadStage?: VaultSyncV2UploadStageStore;
+  /** Must come from the server's all-active-readers marker-3 capability fence. */
+  marker3WriterEnabled?: boolean;
   downloadRangeBytes?: number;
+  /** Synchronous local pause boundary checked before writes and after in-flight requests. */
+  assertCanContinue?: () => void;
   /** Process-local, allowlisted stage/status observations; callback failures never affect transfer. */
   onMultipartTransfer?: (diagnostic: VaultSyncMultipartTransferDiagnostic) => void;
 }
@@ -129,6 +139,16 @@ export function createV2HostedObjectTransport(
         ...(httpStatus === undefined ? {} : { httpStatus }), ...(errorCode === undefined ? {} : { errorCode }) });
     } catch { /* diagnostics must not affect sync */ }
   };
+
+  const assertCanContinue = () => options.assertCanContinue?.();
+  const chunkedKey = activeKey as (VaultSyncCrypto & {
+    encryptObjectChunked?: (plaintext: Uint8Array, sink: (bytes: Uint8Array) => Promise<void>, knownPlaintextHash?: string) => Promise<{
+      formatVersion: 3; plaintextBytes: number; plaintextHash: string; ciphertextBytes: number;
+    }>;
+  }) | undefined;
+  const canWriteMarker3 = options.marker3WriterEnabled === true && !!options.uploadStage && !!chunkedKey
+    && typeof chunkedKey.encryptObjectChunked === "function";
+  const shouldWriteMarker3 = (byteSize: number) => canWriteMarker3 && byteSize >= VAULT_SYNC_MULTIPART_THRESHOLD_BYTES;
 
   const trackMultipartTransfer = async <T>(
     stage: VaultSyncMultipartTransferDiagnostic["stage"],
@@ -484,32 +504,59 @@ export function createV2HostedObjectTransport(
   }
 
   async function prepareObject(plaintext: Uint8Array, transferOwnership: boolean): Promise<VaultSyncV2PreparedUpload> {
-    const plaintextHash = await sha256Hex(plaintext);
-    const objectBytes = activeKey
-      ? await activeKey.encryptObject(plaintext, plaintextHash)
-      : transferOwnership ? plaintext : plaintext.slice();
-    const ciphertextHash = activeKey ? await sha256Hex(objectBytes) : plaintextHash;
-    const reservation = await remote.reserveContentObject({
-      ciphertextHash,
-      byteSize: objectBytes.byteLength,
-      keyVersion: writeKeyVersion,
-    });
-    if (reservation.ciphertextHash !== ciphertextHash || reservation.byteSize !== objectBytes.byteLength
-      || reservation.keyVersion !== writeKeyVersion) {
-      throw Object.assign(new Error("服务端返回的对象 reservation 与上传内容不一致"), { code: "integrity_mismatch" });
+    let stagedObject: Awaited<ReturnType<VaultSyncV2UploadStageStore["prepare"]>> | undefined;
+    const clearOwnedPlaintext = transferOwnership && Boolean(activeKey);
+    let objectBytes: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    try {
+      const plaintextHash = await sha256Hex(plaintext);
+      if (activeKey && shouldWriteMarker3(plaintext.byteLength)) {
+        const stageRequest: VaultSyncV2UploadStageRequest = {
+          plaintextHash, plaintextBytes: plaintext.byteLength, keyVersion: writeKeyVersion, keySaltHex: activeKey.saltHex,
+        };
+        stagedObject = await options.uploadStage!.prepare(stageRequest, (sink) => chunkedKey!.encryptObjectChunked!(
+          plaintext, sink, plaintextHash,
+        ));
+        objectBytes = new Uint8Array(0);
+      } else {
+        objectBytes = activeKey
+          ? await activeKey.encryptObject(plaintext, plaintextHash)
+          : transferOwnership ? plaintext : plaintext.slice();
+      }
+      // The ciphertext or staged ciphertext now owns everything needed for upload.
+      // Drop the plaintext before any reservation/network I/O, including on errors.
+      if (clearOwnedPlaintext) plaintext.fill(0);
+      const ciphertextHash = stagedObject?.ciphertextHash ?? (activeKey ? await sha256Hex(objectBytes) : plaintextHash);
+      const ciphertextBytes = stagedObject?.ciphertextBytes ?? objectBytes.byteLength;
+      const reservation = await remote.reserveContentObject({
+        ciphertextHash,
+        byteSize: ciphertextBytes,
+        keyVersion: writeKeyVersion,
+      });
+      if (reservation.ciphertextHash !== ciphertextHash || reservation.byteSize !== ciphertextBytes
+        || reservation.keyVersion !== writeKeyVersion) {
+        throw Object.assign(new Error("服务端返回的对象 reservation 与上传内容不一致"), { code: "integrity_mismatch" });
+      }
+      if (reservation.deduped) await stagedObject?.clear().catch(() => {});
+      return {
+        content: {
+          reservationId: reservation.reservationId,
+          objectId: reservation.objectId,
+          encryptionDomainId: reservation.encryptionDomainId,
+          keyVersion: reservation.keyVersion,
+          byteSize: reservation.byteSize,
+          ciphertextHash: reservation.ciphertextHash,
+        },
+        plaintextHash, ciphertextHash, objectBytes,
+        ...(stagedObject && !reservation.deduped ? { readRange: stagedObject.readRange, cleanupStage: stagedObject.clear } : {}),
+        uploadUrl: reservation.uploadUrl, uploadExpiresAt: reservation.uploadExpiresAt, deduped: reservation.deduped,
+      };
+    } catch (error) {
+      if (transferOwnership) objectBytes.fill(0);
+      await stagedObject?.clear().catch(() => {});
+      throw error;
+    } finally {
+      if (clearOwnedPlaintext) plaintext.fill(0);
     }
-    return {
-      content: {
-        reservationId: reservation.reservationId,
-        objectId: reservation.objectId,
-        encryptionDomainId: reservation.encryptionDomainId,
-        keyVersion: reservation.keyVersion,
-        byteSize: reservation.byteSize,
-        ciphertextHash: reservation.ciphertextHash,
-      },
-      plaintextHash, ciphertextHash, objectBytes,
-      uploadUrl: reservation.uploadUrl, uploadExpiresAt: reservation.uploadExpiresAt, deduped: reservation.deduped,
-    };
   }
 
   async function prepareObjectsBatch(
@@ -523,43 +570,94 @@ export function createV2HostedObjectTransport(
     if (!Array.isArray(plaintexts) || plaintexts.length === 0 || plaintexts.length > 100) {
       throw Object.assign(new Error("对象批量准备数量必须在 1 到 100 项之间"), { code: "invalid_object_batch" });
     }
+    if (plaintexts.some((plaintext) => shouldWriteMarker3(plaintext.byteLength))) {
+      const results: Array<{ status: "prepared"; upload: VaultSyncV2PreparedUpload } | { status: "failed"; code: string }> = [];
+      for (let index = 0; index < plaintexts.length; index += 1) {
+        try {
+          results.push({ status: "prepared", upload: await prepareObject(plaintexts[index], transferOwnership) });
+        } catch (error) {
+          results.push({ status: "failed", code: String((error as { code?: unknown } | null)?.code ?? "object_prepare_failed") });
+        } finally {
+          if (transferOwnership) {
+            plaintexts[index] = new Uint8Array(0);
+            try { onPlaintextConsumed?.(index); } catch { /* memory relief must not affect sync */ }
+          }
+        }
+      }
+      return results;
+    }
     if (!remote.prepareContentObjects) {
       throw Object.assign(new Error("服务端不支持对象批量准备"), { code: "batch_prepare_unavailable" });
     }
     const encoded: Array<{ plaintextHash: string; ciphertextHash: string; objectBytes: Uint8Array }> = [];
-    for (let index = 0; index < plaintexts.length; index += 1) {
-      const plaintext = plaintexts[index];
-      const plaintextHash = await sha256Hex(plaintext);
-      const objectBytes = activeKey
-        ? await activeKey.encryptObject(plaintext, plaintextHash)
-        : transferOwnership ? plaintext : plaintext.slice();
-      const ciphertextHash = activeKey ? await sha256Hex(objectBytes) : plaintextHash;
-      encoded.push({ plaintextHash, ciphertextHash, objectBytes });
-      if (transferOwnership) {
-        // The encoded entry now owns the bytes needed for upload. Drop this
-        // batch slot before the next item and before the remote reservation
-        // request; the push caller also releases its per-file reference.
-        plaintexts[index] = new Uint8Array(0);
-        try { onPlaintextConsumed?.(index); } catch { /* memory relief must not affect sync */ }
+    try {
+      for (let index = 0; index < plaintexts.length; index += 1) {
+        const plaintext = plaintexts[index];
+        try {
+          const plaintextHash = await sha256Hex(plaintext);
+          const objectBytes = activeKey
+            ? await activeKey.encryptObject(plaintext, plaintextHash)
+            : transferOwnership ? plaintext : plaintext.slice();
+          const ciphertextHash = activeKey ? await sha256Hex(objectBytes) : plaintextHash;
+          encoded.push({ plaintextHash, ciphertextHash, objectBytes });
+        } finally {
+          if (transferOwnership) {
+            if (activeKey) plaintext.fill(0);
+            // The encoded entry now owns the bytes needed for upload. Drop this
+            // batch slot before the next item and before the remote reservation
+            // request; the push caller also releases its per-file reference.
+            plaintexts[index] = new Uint8Array(0);
+            try { onPlaintextConsumed?.(index); } catch { /* memory relief must not affect sync */ }
+          }
+        }
       }
+    } catch (error) {
+      if (transferOwnership) {
+        // A failed batch produces no uploads, so release any unprocessed input
+        // buffers and the encoded buffers accumulated before the failure.
+        for (let index = 0; index < plaintexts.length; index += 1) {
+          const plaintext = plaintexts[index];
+          if (plaintext.byteLength) {
+            if (activeKey) plaintext.fill(0);
+            plaintexts[index] = new Uint8Array(0);
+            try { onPlaintextConsumed?.(index); } catch { /* memory relief must not affect sync */ }
+          }
+        }
+        for (const entry of encoded) entry.objectBytes.fill(0);
+      }
+      throw error;
     }
-    const reservations = await remote.prepareContentObjects(encoded.map((entry) => ({
-      ciphertextHash: entry.ciphertextHash,
-      byteSize: entry.objectBytes.byteLength,
-      keyVersion: writeKeyVersion,
-    })));
+    let reservations: Awaited<ReturnType<NonNullable<VaultSyncV2ObjectRemote["prepareContentObjects"]>>>;
+    try {
+      reservations = await remote.prepareContentObjects(encoded.map((entry) => ({
+        ciphertextHash: entry.ciphertextHash,
+        byteSize: entry.objectBytes.byteLength,
+        keyVersion: writeKeyVersion,
+      })));
+    } catch (error) {
+      if (transferOwnership) for (const entry of encoded) entry.objectBytes.fill(0);
+      throw error;
+    }
     if (!Array.isArray(reservations) || reservations.length !== encoded.length) {
+      if (transferOwnership) for (const entry of encoded) entry.objectBytes.fill(0);
       throw Object.assign(new Error("对象批量准备响应数量无效"), { code: "invalid_object_batch_response" });
     }
     return reservations.map((reservation, index) => {
       const entry = encoded[index];
-      if (reservation.index !== index) return { status: "failed" as const, code: "invalid_object_batch_response" };
-      if (reservation.status === "failed") return { status: "failed" as const, code: reservation.code || "object_prepare_failed" };
+      if (reservation.index !== index) {
+        if (transferOwnership) entry.objectBytes.fill(0);
+        return { status: "failed" as const, code: "invalid_object_batch_response" };
+      }
+      if (reservation.status === "failed") {
+        if (transferOwnership) entry.objectBytes.fill(0);
+        return { status: "failed" as const, code: reservation.code || "object_prepare_failed" };
+      }
       if (reservation.ciphertextHash !== entry.ciphertextHash
         || reservation.byteSize !== entry.objectBytes.byteLength || reservation.keyVersion !== writeKeyVersion
         || !reservation.objectId || !reservation.reservationId || !reservation.encryptionDomainId
         || typeof reservation.deduped !== "boolean"
         || (!reservation.deduped && typeof reservation.uploadUrl !== "string")) {
+        if (transferOwnership) entry.objectBytes.fill(0);
         return { status: "failed" as const, code: "integrity_mismatch" };
       }
       return { status: "prepared" as const, upload: {
@@ -623,9 +721,11 @@ export function createV2HostedObjectTransport(
     },
 
     async transfer(prepared: VaultSyncV2PreparedUpload): Promise<void> {
+      assertCanContinue();
       const { content, objectBytes } = prepared;
       if (!prepared.deduped) {
         const finalize = async () => trackMultipartTransfer("finalize", async () => {
+          assertCanContinue();
           const finalized = await remote.finalizeContentObject(content.reservationId);
           if (finalized.objectId !== content.objectId || finalized.encryptionDomainId !== content.encryptionDomainId
             || finalized.keyVersion !== content.keyVersion || finalized.byteSize !== content.byteSize
@@ -633,7 +733,7 @@ export function createV2HostedObjectTransport(
             throw Object.assign(new Error("对象落盘校验结果与 reservation 不一致"), { code: "integrity_mismatch" });
           }
         });
-        if (objectBytes.byteLength >= VAULT_SYNC_MULTIPART_THRESHOLD_BYTES) {
+        if (content.byteSize >= VAULT_SYNC_MULTIPART_THRESHOLD_BYTES) {
           if (!remote.beginContentObjectMultipartUpload || !remote.getContentObjectMultipartPartUrl
             || !remote.completeContentObjectMultipartUpload) {
             reportMultipartTransfer("initialize", "failed");
@@ -642,26 +742,37 @@ export function createV2HostedObjectTransport(
           const session = await trackMultipartTransfer("initialize", async () => {
             const value = await remote.beginContentObjectMultipartUpload!(content.reservationId);
             if (!value.deduped && (!Number.isSafeInteger(value.partSize) || (value.partSize as number) < 5 * 1024 * 1024
-              || value.partCount !== Math.max(1, Math.ceil(objectBytes.byteLength / (value.partSize as number))))) {
+              || (prepared.readRange && (value.partSize as number) > VAULT_SYNC_STAGED_UPLOAD_MAX_PART_BYTES)
+              || value.partCount !== Math.max(1, Math.ceil(content.byteSize / (value.partSize as number))))) {
               throw Object.assign(new Error("服务端分段策略与对象尺寸不匹配"), { code: "invalid_multipart_upload_response" });
             }
             return value;
           });
+          assertCanContinue();
           if (session.deduped) {
             await finalize();
+            await prepared.cleanupStage?.();
             return;
           }
           const partSize = session.partSize as number;
           const uploadedByNumber = new Map(session.uploadedParts.map((part) => [part.partNumber, part.byteSize]));
           for (let partNumber = 1; partNumber <= session.partCount; partNumber += 1) {
+            assertCanContinue();
             const offset = (partNumber - 1) * partSize;
-            const part = objectBytes.subarray(offset, Math.min(offset + partSize, objectBytes.byteLength));
-            if (uploadedByNumber.get(partNumber) === part.byteLength) continue;
-            const body = part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength) as ArrayBuffer;
+            const partByteSize = Math.min(partSize, content.byteSize - offset);
+            if (uploadedByNumber.get(partNumber) === partByteSize) continue;
+            const part = prepared.readRange
+              ? await prepared.readRange(offset, partByteSize)
+              : objectBytes.subarray(offset, offset + partByteSize);
+            if (part.byteLength !== partByteSize) throw Object.assign(new Error("本地上传分段尺寸不一致"), { code: "integrity_mismatch" });
+            const body = part.byteOffset === 0 && part.byteLength === part.buffer.byteLength
+              ? part.buffer as ArrayBuffer
+              : part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength) as ArrayBuffer;
             let response = { status: 0 } as VaultSyncV2ObjectRequestResult;
             for (let attempt = 0; attempt < 2; attempt += 1) {
               const signed = await trackMultipartTransfer("part_url",
                 () => remote.getContentObjectMultipartPartUrl!(content.reservationId, partNumber));
+              assertCanContinue();
               reportMultipartTransfer("part_upload", "started");
               try {
                 response = await request({ url: signed.uploadUrl, method: "PUT", body, throw: false });
@@ -674,28 +785,35 @@ export function createV2HostedObjectTransport(
               reportMultipartTransfer("part_upload", response.status >= 200 && response.status < 300 ? "succeeded" : "failed",
                 Number.isSafeInteger(response.status) && response.status >= 100 && response.status <= 599
                   ? response.status : undefined);
+              assertCanContinue();
               if (response.status !== 401 && response.status !== 403) break;
             }
             if (response.status < 200 || response.status >= 300) {
               throw storageError(`对象第 ${partNumber} 段上传暂未完成`, response, "object_upload_failed");
             }
           }
+          assertCanContinue();
           await trackMultipartTransfer("complete", async () => {
             const completed = await remote.completeContentObjectMultipartUpload!(content.reservationId);
             if (!completed.completed) {
               throw Object.assign(new Error("对象分段尚未完成"), { code: "multipart_parts_incomplete" });
             }
           });
+          assertCanContinue();
           await finalize();
+          await prepared.cleanupStage?.();
           return;
         }
+        if (prepared.readRange) throw Object.assign(new Error("加密上传暂存对象未进入分段传输"), { code: "invalid_multipart_upload_response" });
         if (!prepared.uploadUrl) throw Object.assign(new Error("对象上传没有获得临时地址"), { code: "hosted_storage_unavailable" });
         const makeBody = () => objectBytes.byteOffset === 0 && objectBytes.byteLength === objectBytes.buffer.byteLength
           ? objectBytes.buffer as ArrayBuffer
           : objectBytes.buffer.slice(objectBytes.byteOffset, objectBytes.byteOffset + objectBytes.byteLength) as ArrayBuffer;
         let uploadUrl = prepared.uploadUrl;
         let response = await request({ url: uploadUrl, method: "PUT", body: makeBody(), throw: false });
+        assertCanContinue();
         if (response.status === 401 || response.status === 403) {
+          assertCanContinue();
           const renewed = await remote.reserveContentObject({
             ciphertextHash: content.ciphertextHash,
             byteSize: content.byteSize,
@@ -711,12 +829,15 @@ export function createV2HostedObjectTransport(
           }
           uploadUrl = renewed.uploadUrl;
           response = await request({ url: uploadUrl, method: "PUT", body: makeBody(), throw: false });
+          assertCanContinue();
         }
         if (response.status < 200 || response.status >= 300) {
           throw storageError("对象上传暂未完成", response, "object_upload_failed");
         }
+        assertCanContinue();
         await finalize();
       }
+      await prepared.cleanupStage?.();
     },
 
     async upload(plaintext: Uint8Array): Promise<{ content: VaultSyncV2ContentRef; plaintextHash: string }> {

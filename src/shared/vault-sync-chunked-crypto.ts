@@ -2,6 +2,9 @@ import { Sha256Accumulator } from "./sha256-stream.ts";
 
 const FORMAT_VERSION = 3;
 const CHUNK_BYTES = 1024 * 1024;
+// Keep the experimental format aligned with the current client-side object cap.
+// The cap must be enforced from the envelope before a reader loops over chunks.
+const MAX_PLAINTEXT_BYTES = 24 * 1024 * 1024;
 const HEADER_BYTES = 1 + 4 + 8 + 12;
 const GCM_TAG_BYTES = 16;
 const MAX_CHUNKS = 0xffff_ffff;
@@ -42,10 +45,15 @@ function integrityError(message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code: "integrity_mismatch" });
 }
 
+function oversizedObjectError(): Error & { code: string } {
+  return Object.assign(new Error("Vault 分块对象超过当前单文件同步上限"), { code: "object_too_large" });
+}
+
 function encodeHeader(plaintextBytes: number, nonceBase: Uint8Array): Uint8Array {
   if (!Number.isSafeInteger(plaintextBytes) || plaintextBytes < 0 || nonceBase.byteLength !== 12) {
     throw new Error("Vault 分块加密参数无效");
   }
+  if (plaintextBytes > MAX_PLAINTEXT_BYTES) throw oversizedObjectError();
   const header = new Uint8Array(HEADER_BYTES);
   header[0] = FORMAT_VERSION;
   const view = new DataView(header.buffer);
@@ -73,6 +81,7 @@ function parseHeader(header: Uint8Array): { plaintextBytes: number; nonceBase: U
   let length = 0n;
   for (let offset = 5; offset <= 12; offset += 1) length = (length << 8n) | BigInt(header[offset]);
   if (length > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Vault 分块对象尺寸无效");
+  if (length > BigInt(MAX_PLAINTEXT_BYTES)) throw oversizedObjectError();
   return { plaintextBytes: Number(length), nonceBase: header.slice(13, 25) };
 }
 
@@ -109,25 +118,30 @@ class ChunkReader {
     if (!Number.isSafeInteger(length) || length < 0) throw new Error("Vault 分块读取长度无效");
     const result = new Uint8Array(length);
     let written = 0;
-    while (written < length) {
-      if (this.offset >= this.current.byteLength) {
-        let next: IteratorResult<Uint8Array>;
-        do {
-          next = await this.iterator.next();
-          if (next.done) {
-            this.finished = true;
-            throw new Error(`Vault 分块${this.label}被截断`);
-          }
-        } while (next.value.byteLength === 0);
-        this.current = next.value;
-        this.offset = 0;
+    try {
+      while (written < length) {
+        if (this.offset >= this.current.byteLength) {
+          let next: IteratorResult<Uint8Array>;
+          do {
+            next = await this.iterator.next();
+            if (next.done) {
+              this.finished = true;
+              throw new Error(`Vault 分块${this.label}被截断`);
+            }
+          } while (next.value.byteLength === 0);
+          this.current = next.value;
+          this.offset = 0;
+        }
+        const count = Math.min(length - written, this.current.byteLength - this.offset);
+        result.set(this.current.subarray(this.offset, this.offset + count), written);
+        this.offset += count;
+        written += count;
       }
-      const count = Math.min(length - written, this.current.byteLength - this.offset);
-      result.set(this.current.subarray(this.offset, this.offset + count), written);
-      this.offset += count;
-      written += count;
+      return result;
+    } catch (error) {
+      result.fill(0);
+      throw error;
     }
-    return result;
   }
 
   async assertEnd(): Promise<void> {
@@ -141,6 +155,14 @@ class ChunkReader {
       }
       if (next.value.byteLength > 0) throw new Error(`Vault 分块${this.label}含多余数据`);
     }
+  }
+
+  async close(): Promise<void> {
+    const returnIterator = !this.finished;
+    this.finished = true;
+    this.current = new Uint8Array(0);
+    this.offset = 0;
+    if (returnIterator) await this.iterator.return?.();
   }
 }
 
@@ -159,40 +181,49 @@ export function createVaultSyncChunkedObjectCrypto(key: CryptoKey) {
     const header = encodeHeader(plaintextBytes, nonceBase);
     const reader = new ChunkReader(plaintext, "明文");
     const hasher = new Sha256Accumulator();
-    await writeCiphertextChunk(header.slice());
+    try {
+      await writeCiphertextChunk(header.slice());
 
-    let plaintextOffset = 0;
-    for (let index = 0; index < chunkCount; index += 1) {
-      const plainSize = Math.min(CHUNK_BYTES, plaintextBytes - plaintextOffset);
-      const chunk = await reader.readExactly(plainSize);
-      hasher.update(chunk);
-      const encrypted = await globalThis.crypto.subtle.encrypt(
-        {
-          name: "AES-GCM",
-          iv: nonceForChunk(nonceBase, index) as Uint8Array<ArrayBuffer>,
-          additionalData: chunkAad(header, index) as Uint8Array<ArrayBuffer>,
-          tagLength: 128,
-        },
-        key,
-        chunk as Uint8Array<ArrayBuffer>,
-      );
-      await writeCiphertextChunk(new Uint8Array(encrypted));
-      plaintextOffset += plainSize;
-    }
-    await reader.assertEnd();
+      let plaintextOffset = 0;
+      for (let index = 0; index < chunkCount; index += 1) {
+        const plainSize = Math.min(CHUNK_BYTES, plaintextBytes - plaintextOffset);
+        const chunk = await reader.readExactly(plainSize);
+        try {
+          hasher.update(chunk);
+          const encrypted = await globalThis.crypto.subtle.encrypt(
+            {
+              name: "AES-GCM",
+              iv: nonceForChunk(nonceBase, index) as Uint8Array<ArrayBuffer>,
+              additionalData: chunkAad(header, index) as Uint8Array<ArrayBuffer>,
+              tagLength: 128,
+            },
+            key,
+            chunk as Uint8Array<ArrayBuffer>,
+          );
+          await writeCiphertextChunk(new Uint8Array(encrypted));
+          plaintextOffset += plainSize;
+        } finally {
+          // The source remains caller-owned; clear only this internal copy.
+          chunk.fill(0);
+        }
+      }
+      await reader.assertEnd();
 
-    const plaintextHash = hasher.digestHex();
-    if (knownPlaintextHash !== undefined && knownPlaintextHash.toLowerCase() !== plaintextHash) {
-      throw new Error("Vault 分块加密明文摘要与内容不一致");
+      const plaintextHash = hasher.digestHex();
+      if (knownPlaintextHash !== undefined && knownPlaintextHash.toLowerCase() !== plaintextHash) {
+        throw new Error("Vault 分块加密明文摘要与内容不一致");
+      }
+      return {
+        formatVersion: FORMAT_VERSION,
+        plaintextBytes,
+        plaintextHash,
+        ciphertextBytes: vaultSyncChunkedCiphertextByteSize(plaintextBytes),
+        chunkBytes: CHUNK_BYTES,
+        chunkCount,
+      };
+    } finally {
+      await reader.close().catch(() => {});
     }
-    return {
-      formatVersion: FORMAT_VERSION,
-      plaintextBytes,
-      plaintextHash,
-      ciphertextBytes: vaultSyncChunkedCiphertextByteSize(plaintextBytes),
-      chunkBytes: CHUNK_BYTES,
-      chunkCount,
-    };
   };
 
   const decryptObjectChunked = async (
@@ -201,70 +232,74 @@ export function createVaultSyncChunkedObjectCrypto(key: CryptoKey) {
     expectedPlaintextBytes?: number,
   ): Promise<VaultSyncChunkedObjectResult> => {
     const reader = new ChunkReader(ciphertext);
-    let header: Uint8Array;
     try {
-      header = await reader.readExactly(HEADER_BYTES);
-    } catch {
-      throw integrityError("Vault 分块加密对象头被截断");
-    }
-    let plaintextBytes: number;
-    try {
-      ({ plaintextBytes } = parseHeader(header));
-    } catch (error) {
-      if ((error as any)?.code === "chunked_format_unsupported") throw error;
-      throw integrityError("Vault 分块加密对象头无效");
-    }
-    if (expectedPlaintextBytes !== undefined
-      && (!Number.isSafeInteger(expectedPlaintextBytes) || expectedPlaintextBytes < 0 || plaintextBytes !== expectedPlaintextBytes)) {
-      throw Object.assign(new Error("Vault 分块对象明文尺寸与预期不一致"), { code: "integrity_mismatch" });
-    }
-    const nonceBase = header.slice(13, 25);
-    const chunkCount = chunkCountFor(plaintextBytes);
-    const hasher = new Sha256Accumulator();
-    let plaintextOffset = 0;
-
-    for (let index = 0; index < chunkCount; index += 1) {
-      const plainSize = Math.min(CHUNK_BYTES, plaintextBytes - plaintextOffset);
-      let sealed: Uint8Array;
+      let header: Uint8Array;
       try {
-        sealed = await reader.readExactly(plainSize + GCM_TAG_BYTES);
+        header = await reader.readExactly(HEADER_BYTES);
       } catch {
-        throw integrityError("Vault 分块密文被截断");
+        throw integrityError("Vault 分块加密对象头被截断");
       }
-      let plaintext: Uint8Array;
+      let plaintextBytes: number;
       try {
-        plaintext = new Uint8Array(await globalThis.crypto.subtle.decrypt(
-          {
-            name: "AES-GCM",
-            iv: nonceForChunk(nonceBase, index) as Uint8Array<ArrayBuffer>,
-            additionalData: chunkAad(header, index) as Uint8Array<ArrayBuffer>,
-            tagLength: 128,
-          },
-          key,
-          sealed as Uint8Array<ArrayBuffer>,
-        ));
-      } catch {
-        throw integrityError("Vault 分块认证失败");
+        ({ plaintextBytes } = parseHeader(header));
+      } catch (error) {
+        if ((error as any)?.code === "chunked_format_unsupported" || (error as any)?.code === "object_too_large") throw error;
+        throw integrityError("Vault 分块加密对象头无效");
       }
-      if (plaintext.byteLength !== plainSize) throw new Error("Vault 分块解密尺寸不一致");
-      hasher.update(plaintext);
-      await writePlaintextChunk(plaintext);
-      plaintextOffset += plainSize;
-    }
+      if (expectedPlaintextBytes !== undefined
+        && (!Number.isSafeInteger(expectedPlaintextBytes) || expectedPlaintextBytes < 0 || plaintextBytes !== expectedPlaintextBytes)) {
+        throw Object.assign(new Error("Vault 分块对象明文尺寸与预期不一致"), { code: "integrity_mismatch" });
+      }
+      const nonceBase = header.slice(13, 25);
+      const chunkCount = chunkCountFor(plaintextBytes);
+      const hasher = new Sha256Accumulator();
+      let plaintextOffset = 0;
 
-    try {
-      await reader.assertEnd();
-    } catch {
-      throw integrityError("Vault 分块加密对象含截断或尾随数据");
+      for (let index = 0; index < chunkCount; index += 1) {
+        const plainSize = Math.min(CHUNK_BYTES, plaintextBytes - plaintextOffset);
+        let sealed: Uint8Array;
+        try {
+          sealed = await reader.readExactly(plainSize + GCM_TAG_BYTES);
+        } catch {
+          throw integrityError("Vault 分块密文被截断");
+        }
+        let plaintext: Uint8Array;
+        try {
+          plaintext = new Uint8Array(await globalThis.crypto.subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: nonceForChunk(nonceBase, index) as Uint8Array<ArrayBuffer>,
+              additionalData: chunkAad(header, index) as Uint8Array<ArrayBuffer>,
+              tagLength: 128,
+            },
+            key,
+            sealed as Uint8Array<ArrayBuffer>,
+          ));
+        } catch {
+          throw integrityError("Vault 分块认证失败");
+        }
+        if (plaintext.byteLength !== plainSize) throw new Error("Vault 分块解密尺寸不一致");
+        hasher.update(plaintext);
+        await writePlaintextChunk(plaintext);
+        plaintextOffset += plainSize;
+      }
+
+      try {
+        await reader.assertEnd();
+      } catch {
+        throw integrityError("Vault 分块加密对象含截断或尾随数据");
+      }
+      return {
+        formatVersion: FORMAT_VERSION,
+        plaintextBytes,
+        plaintextHash: hasher.digestHex(),
+        ciphertextBytes: vaultSyncChunkedCiphertextByteSize(plaintextBytes),
+        chunkBytes: CHUNK_BYTES,
+        chunkCount,
+      };
+    } finally {
+      await reader.close().catch(() => {});
     }
-    return {
-      formatVersion: FORMAT_VERSION,
-      plaintextBytes,
-      plaintextHash: hasher.digestHex(),
-      ciphertextBytes: vaultSyncChunkedCiphertextByteSize(plaintextBytes),
-      chunkBytes: CHUNK_BYTES,
-      chunkCount,
-    };
   };
 
   const decryptObjectChunkedToBytes = async (ciphertext: Uint8Array): Promise<{

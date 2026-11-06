@@ -76,3 +76,22 @@
   min-width: 0;
   max-width: 100%;
 }
+
+.wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 0.75em;
+}
+
+.wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting .setting-item-info,
+.wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting .setting-item-control {
+  width: 100%;
+}
+
+.wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting .setting-item-control {
+  flex: 1 1 auto;
+}
+
+.wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting select {
+  width: 100%;
+}

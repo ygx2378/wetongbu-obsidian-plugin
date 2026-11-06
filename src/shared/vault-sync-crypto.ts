@@ -70,9 +70,9 @@ export interface VaultSyncCrypto {
   decryptObject(ciphertext: Uint8Array): Promise<{ plaintext: Uint8Array; plaintextHash: string }>;
 }
 
-/** Experimental v3 codec primitives. The active sync writer remains v2 until
- * format negotiation, durable temp-file output, and the reader compatibility
- * fence are integrated. */
+/** Marker-3 codec primitives. Sync writes use marker-3 only after the server
+ * reports the peer-reader fence and the caller provides durable ciphertext
+ * staging; otherwise the transport keeps using marker-2. */
 export interface VaultSyncChunkedObjectCrypto {
   encryptObjectChunked(
     plaintext: Uint8Array,

@@ -109,6 +109,8 @@ export interface VaultSyncV2PushOptions {
   onAutoMergePhase?(phase: VaultSyncPushCasAutoMergePhase): void;
   /** Confirms the first-initialization owner lease immediately before each remote write. */
   assertInitializationLease?(): Promise<void>;
+  /** Synchronous local pause boundary checked immediately before a remote commit. */
+  assertCanWrite?(): void;
   now?: () => Date;
 }
 
@@ -165,6 +167,7 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
   }
 
   function commitRemote(operation: VaultSyncOutboxOperation, request = operation.request) {
+    options.assertCanWrite?.();
     return options.remote.commitOperation(request);
   }
 
@@ -194,20 +197,35 @@ export function createVaultSyncV2PushEngine(options: VaultSyncV2PushOptions) {
   }
 
   function preparedUploadMatchesLocal(upload: VaultSyncV2PreparedUpload, expectedPlaintextHash: string): boolean {
-    // content.byteSize is the stored object size, so it includes encryption
-    // framing. Compare it with the prepared ciphertext buffer, not the Vault
-    // plaintext byte count kept in the local outbox/baseline.
+    // Staged marker-3 uploads retain only a range reader; legacy uploads keep
+    // the complete ciphertext buffer. In both cases the content reference is
+    // the authoritative ciphertext size.
     return upload.plaintextHash === expectedPlaintextHash
-      && upload.content.byteSize === upload.objectBytes.byteLength
+      && (typeof upload.readRange === "function"
+        ? upload.objectBytes.byteLength === 0 && upload.content.byteSize > 0
+        : upload.content.byteSize === upload.objectBytes.byteLength)
       && upload.content.ciphertextHash === upload.ciphertextHash;
   }
 
   async function currentBytes(path: string): Promise<Uint8Array | null> {
     const file = fileAt(path);
     if (!file) return null;
-    const declaredSize = Number(file.stat?.size);
-    if (Number.isSafeInteger(declaredSize) && declaredSize > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES) {
-      throw fail("v2_push_local_file_too_large", "本机文件超过 Vault 同步单文件上限；推送与恢复已暂停");
+    const cachedSize = file.stat?.size;
+    if (!Number.isSafeInteger(cachedSize) || cachedSize < 0
+      || cachedSize > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES) {
+      throw fail("v2_push_local_file_too_large", "本机文件大小无法安全验证或超过 Vault 同步单文件上限；推送与恢复已暂停");
+    }
+    let diskStat: any;
+    try {
+      diskStat = await app.vault.adapter.stat(path);
+    } catch {
+      throw fail("v2_push_local_file_too_large", "本机文件大小无法安全验证或超过 Vault 同步单文件上限；推送与恢复已暂停");
+    }
+    if (!diskStat) return null;
+    const declaredSize = diskStat.type === "file" ? diskStat.size : undefined;
+    if (!Number.isSafeInteger(declaredSize) || declaredSize < 0
+      || declaredSize > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES) {
+      throw fail("v2_push_local_file_too_large", "本机文件大小无法安全验证或超过 Vault 同步单文件上限；推送与恢复已暂停");
     }
     const bytes = new Uint8Array(await app.vault.readBinary(file));
     if (bytes.byteLength > VAULT_SYNC_SINGLE_OBJECT_MAX_BYTES) {

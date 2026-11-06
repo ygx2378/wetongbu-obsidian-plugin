@@ -44,10 +44,6 @@ function fail(code: string, message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code });
 }
 
-function exactBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
 function bytesToHex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -103,13 +99,24 @@ export async function createVaultSyncV2PlaintextStageWriter(
   const path = `${scopePrefix}${now()}-${randomSuffix}.tmp`;
   const hasher = new Sha256Accumulator();
   const bufferedChunks: Uint8Array[] = [];
+  let fallbackBuffer = typeof adapter.appendBinary !== "function" && request.plaintextBytes !== undefined
+    ? new Uint8Array(request.plaintextBytes)
+    : null;
   let writtenBytes = 0;
   let fileStarted = false;
   let finalized = false;
   let failed = false;
 
+  function clearBufferedPlaintext(): void {
+    fallbackBuffer?.fill(0);
+    fallbackBuffer = null;
+    for (const chunk of bufferedChunks) chunk.fill(0);
+    bufferedChunks.length = 0;
+  }
+
   async function removeStage(): Promise<void> {
     activePlaintextStages.delete(path);
+    clearBufferedPlaintext();
     try { await adapter.remove(path); } catch { /* retry cleanup is safe */ }
   }
 
@@ -169,6 +176,7 @@ export async function createVaultSyncV2PlaintextStageWriter(
       await pruneStaleStages();
     } catch (error) {
       activePlaintextStages.delete(path);
+      clearBufferedPlaintext();
       throw error;
     }
 
@@ -176,24 +184,34 @@ export async function createVaultSyncV2PlaintextStageWriter(
       path,
       async writeChunk(bytes) {
         if (finalized || failed) throw fail("plaintext_stage_closed", "明文暂存已经关闭");
-        if (!(bytes instanceof Uint8Array) || writtenBytes + bytes.byteLength > (maxPlaintextBytes as number)) {
+        if (!(bytes instanceof Uint8Array) || writtenBytes + bytes.byteLength > (maxPlaintextBytes as number)
+          || (fallbackBuffer !== null && writtenBytes + bytes.byteLength > fallbackBuffer.byteLength)) {
           failed = true;
           await removeStage();
           throw fail("plaintext_stage_size_invalid", "明文暂存超过安全尺寸上限");
         }
         try {
           if (typeof adapter.appendBinary === "function") {
-            if (!fileStarted) {
-              await adapter.writeBinary(path, exactBuffer(bytes));
-              fileStarted = true;
-            } else if (bytes.byteLength > 0) {
-              await adapter.appendBinary(path, exactBuffer(bytes));
+            // DataAdapter writes require an owned, exact-size ArrayBuffer.
+            // Clear that plaintext copy as soon as the adapter settles, on
+            // both success and failure, instead of leaving it to garbage collection.
+            const adapterBytes = bytes.slice();
+            try {
+              if (!fileStarted) {
+                await adapter.writeBinary(path, adapterBytes.buffer as ArrayBuffer);
+                fileStarted = true;
+              } else if (adapterBytes.byteLength > 0) {
+                await adapter.appendBinary(path, adapterBytes.buffer as ArrayBuffer);
+              }
+            } finally {
+              adapterBytes.fill(0);
             }
           } else {
             if (writtenBytes + bytes.byteLength > memoryFallbackMaxBytes) {
               throw fail("plaintext_stage_append_unsupported", "当前 Obsidian 适配器不支持分块明文落盘");
             }
-            bufferedChunks.push(bytes.slice());
+            if (fallbackBuffer !== null) fallbackBuffer.set(bytes, writtenBytes);
+            else bufferedChunks.push(bytes.slice());
           }
           hasher.update(bytes);
           writtenBytes += bytes.byteLength;
@@ -220,15 +238,27 @@ export async function createVaultSyncV2PlaintextStageWriter(
           await removeStage();
           throw fail("integrity_mismatch", "明文暂存摘要与预期不一致");
         }
+        let fallbackWriteBuffer: Uint8Array | null = null;
         try {
           if (typeof adapter.appendBinary !== "function") {
-            const body = new Uint8Array(finalByteSize as number);
-            let offset = 0;
-            for (const chunk of bufferedChunks) {
-              body.set(chunk, offset);
-              offset += chunk.byteLength;
+            if (fallbackBuffer !== null) {
+              fallbackWriteBuffer = fallbackBuffer;
+              fallbackBuffer = null;
+            } else {
+              fallbackWriteBuffer = new Uint8Array(finalByteSize as number);
+              let offset = 0;
+              for (const chunk of bufferedChunks) {
+                fallbackWriteBuffer.set(chunk, offset);
+                offset += chunk.byteLength;
+              }
+              for (const chunk of bufferedChunks) chunk.fill(0);
+              bufferedChunks.length = 0;
             }
-            await adapter.writeBinary(path, exactBuffer(body));
+            // A known authenticated length lets older adapters use one bounded
+            // allocation; unknown lengths assemble once and release their chunks.
+            await adapter.writeBinary(path, fallbackWriteBuffer.buffer as ArrayBuffer);
+            fallbackWriteBuffer.fill(0);
+            fallbackWriteBuffer = null;
           } else if (!fileStarted) {
             await adapter.writeBinary(path, new ArrayBuffer(0));
             fileStarted = true;
@@ -240,6 +270,10 @@ export async function createVaultSyncV2PlaintextStageWriter(
           finalized = true;
           return { path, byteSize: finalByteSize as number, plaintextHash };
         } catch (error) {
+          // writeBinary has settled, so the adapter no longer needs the caller's buffer.
+          // Clear any plaintext still owned by this writer on failed writes too.
+          fallbackWriteBuffer?.fill(0);
+          fallbackWriteBuffer = null;
           failed = true;
           await removeStage();
           throw error;
