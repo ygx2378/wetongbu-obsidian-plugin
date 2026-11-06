@@ -6843,12 +6843,12 @@ class WeTongbuSettingTab extends PluginSettingTab {
       || (this.plugin.accountLoggedIn && this.plugin.settings.imageDeliveryMode === "hosted_link")
       || this.plugin.settings.imageDeliveryMode === "hosted_link") {
       new Setting(containerEl)
-        .setName("图片保存位置")
+        .setName("微信剪藏图片保存位置")
         .setDesc(this.plugin.canHostImages
           ? this.plugin.settings.imageDeliveryMode === "hosted_link"
-            ? `图片会保存到微同步云端，以图片链接形式插入到笔记中。已使用：${formatBytes(this.plugin.hostedMediaUsedBytes)} / ${formatBytes(this.plugin.hostedMediaQuotaBytes)}。`
-            : "图片会下载到 Obsidian 本地 vault 中。"
-          : "云端图片目前处于只读宽限期：不能创建新的云端图片。")
+            ? `微信剪藏的图片会保存到微同步云端，以图片链接形式插入到笔记中。已使用：${formatBytes(this.plugin.hostedMediaUsedBytes)} / ${formatBytes(this.plugin.hostedMediaQuotaBytes)}。网页、飞书剪藏的图片位置在浏览器扩展中选择。`
+            : "微信剪藏的图片会下载到 Obsidian 本地 vault 中。网页、飞书剪藏的图片位置在浏览器扩展中选择。"
+          : "云端图片目前处于只读宽限期：微信剪藏不能创建新的云端图片。网页、飞书剪藏的图片位置在浏览器扩展中选择。")
         .addDropdown((dropdown) =>
           dropdown
             .addOption("local", "保存到本地")
@@ -6859,12 +6859,12 @@ class WeTongbuSettingTab extends PluginSettingTab {
                 await this.plugin.setImageDeliveryMode(value as ImageDeliveryMode);
                 this.display();
               } catch (error) {
-                new Notice(`图片保存位置更新失败：${error instanceof Error ? error.message : String(error)}`, 10000);
+                new Notice(`微信剪藏图片保存位置更新失败：${error instanceof Error ? error.message : String(error)}`, 10000);
                 this.display();
               }
             }),
         );
-      new Setting(containerEl)
+      const pasteImageUploadSetting = new Setting(containerEl)
         .setName("粘贴图片自动上传")
         .setDesc(this.plugin.canHostImages
           ? `粘贴或拖入笔记的图片会上传到微同步云端，并以图片链接插入；上传失败时自动保存到本地。注意：${PASTED_IMAGE_EXPIRY_NOTICE}`
@@ -6879,12 +6879,13 @@ class WeTongbuSettingTab extends PluginSettingTab {
               if (value) new Notice(`已开启粘贴图片自动上传。${PASTED_IMAGE_EXPIRY_NOTICE}`, 12000);
             }),
         );
+      pasteImageUploadSetting.settingEl.addClass("wetongbu-toggle-setting");
     } else {
       new Setting(containerEl)
-        .setName("图片保存位置")
+        .setName("微信剪藏图片保存位置")
         .setDesc(this.plugin.accountLoggedIn
-          ? "当前套餐使用本地下载。开通有效 Plus 后，可选择将图片保存在微同步云端，并在笔记中插入稳定链接。"
-          : "图片会下载到 Obsidian 本地。登录并开通 Plus 后，可选择云端图片链接。");
+          ? "微信剪藏的图片会下载到 Obsidian 本地。开通有效 Plus 后，可选择将图片保存在微同步云端，并在笔记中插入稳定链接。网页、飞书剪藏的图片位置在浏览器扩展中选择。"
+          : "微信剪藏的图片会下载到 Obsidian 本地。登录并开通 Plus 后，可选择云端图片链接。网页、飞书剪藏的图片位置在浏览器扩展中选择。");
     }
 
     if (canUseSelfHostedStorage) {
@@ -7143,7 +7144,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
             }
           }),
       );
-    vaultSyncSetting.settingEl.addClass("wetongbu-vault-sync-setting");
+    vaultSyncSetting.settingEl.addClass("wetongbu-vault-sync-setting", "wetongbu-toggle-setting");
 
     const vaultUuidSetting = new Setting(containerEl)
       .setName("当前同步 Vault UUID")

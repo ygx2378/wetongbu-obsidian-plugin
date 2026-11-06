@@ -39,8 +39,9 @@
   max-width: 100%;
 }
 
-/* Match the native Toggle spacing used by the lower safety setting. */
-.wetongbu-setting-tab .wetongbu-vault-sync-setting .setting-item-control {
+/* Keep standalone toggles at native size and spacing, like the lower safety setting. */
+.wetongbu-setting-tab .wetongbu-vault-sync-setting .setting-item-control,
+.wetongbu-setting-tab .wetongbu-toggle-setting .setting-item-control {
   flex: 0 0 auto;
   flex-wrap: nowrap;
   margin-inline-end: 16px;
