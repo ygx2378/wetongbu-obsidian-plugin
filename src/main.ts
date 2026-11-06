@@ -135,6 +135,7 @@ import { createVaultSyncScopeStateStore } from "./vault-sync-scope-state";
 import { formatPendingDeletionDeviceProgress, formatVaultSyncDeviceCursors } from "./vault-sync-device-progress";
 import { fetchV2DeviceProgressWhenActive, resolveVaultSyncProtocol } from "./vault-sync-device-progress-refresh";
 import { createVaultSyncInitializationLeaseKeeper } from "./vault-sync-initialization-lease";
+import { clipNoteFolder, isInClipSearchScope } from "./clip-note-folder";
 import {
   dismissConflictActionForActiveEditorBusy,
   registerVaultSyncEditorRetryEvents,
@@ -843,6 +844,7 @@ export default class WeTongbuPlugin extends Plugin {
     const claimToken = typeof params.token === "string" ? params.token : typeof params.claim_token === "string" ? params.claim_token : "";
     const requestedTargetId = typeof params.target === "string" ? params.target.trim() : "";
     const requestedVault = typeof params.vault === "string" ? params.vault.trim() : "";
+    const requestedNoteFolder = clipNoteFolder(params.folder);
     if (!taskId || !claimToken) {
       new Notice("微同步剪藏链接缺少任务凭证", 8000);
       return;
@@ -906,6 +908,7 @@ export default class WeTongbuPlugin extends Plugin {
           sourceUrl: payload.sourceUrl,
           capturedAt,
           operation: "create_new",
+          noteFolder: requestedNoteFolder,
         },
         markdown,
         assets: [],
@@ -4877,7 +4880,7 @@ export default class WeTongbuPlugin extends Plugin {
           targetId: this.settings.syncTargetId,
         });
         const continuationNote = task.manifest.mediaContinuationClipTaskId
-          ? await this.findClipContinuationNote(task.manifest.mediaContinuationClipTaskId)
+          ? await this.findClipContinuationNote(task.manifest.mediaContinuationClipTaskId, undefined, task.manifest.noteFolder)
           : null;
         // The browser waits for the lightweight clip to complete before
         // creating this task. If the user removed or duplicated that note in
@@ -4924,7 +4927,7 @@ export default class WeTongbuPlugin extends Plugin {
     return synced;
   }
 
-  private async findClipContinuationNote(taskId: string, requestedNotePath?: string) {
+  private async findClipContinuationNote(taskId: string, requestedNotePath?: string, noteFolder?: string | null) {
     if (requestedNotePath) {
       const normalizedPath = normalizePath(requestedNotePath);
       const file = this.app.vault.getAbstractFileByPath(normalizedPath);
@@ -4936,7 +4939,7 @@ export default class WeTongbuPlugin extends Plugin {
     const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
     const matches: Array<ArticleCandidate & { file: TFile; generation: number }> = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
-      if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+      if (!isInClipSearchScope(file.path, root, noteFolder)) continue;
       const generation = this.vaultSyncIndex.getGeneration(file.path);
       const content = await this.app.vault.cachedRead(file);
       const candidate = articleCandidate(file.path, content);
@@ -5227,6 +5230,7 @@ export default class WeTongbuPlugin extends Plugin {
         userId: manifest.user_id ?? null,
         targetId: manifest.target_id ?? null,
         mediaContinuationClipTaskId: manifest.media_continuation?.clip_task_id ?? null,
+        noteFolder: clipNoteFolder(manifest.note_folder),
       },
         markdown: new TextDecoder().decode(files.get(manifest.entry_file)!),
       assets: manifest.files
@@ -5447,7 +5451,10 @@ export default class WeTongbuPlugin extends Plugin {
       taskId: task.manifest.taskId,
       assets: task.assets,
     });
-    const noteFolder = normalizePath(layout.noteFolder);
+    // A folder chosen in the browser extension receives the note directly,
+    // without the default inbox's year/month subfolders.
+    const chosenNoteFolder = clipNoteFolder(task.manifest.noteFolder);
+    const noteFolder = normalizePath(chosenNoteFolder ?? layout.noteFolder);
     const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
     await ensureFolder(this, noteFolder);
 
@@ -5482,7 +5489,7 @@ export default class WeTongbuPlugin extends Plugin {
     if (taskId) {
       for (const file of this.app.vault.getMarkdownFiles()) {
         const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
-        if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        if (!isInClipSearchScope(file.path, root, chosenNoteFolder)) continue;
         const generation = this.vaultSyncIndex.getGeneration(file.path);
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
@@ -5513,7 +5520,7 @@ export default class WeTongbuPlugin extends Plugin {
     if (!isCreateNewZip && sourceKey) {
       const root = normalizePath(this.settings.rootFolder).replace(/\/$/, "");
       for (const file of this.app.vault.getMarkdownFiles()) {
-        if (root && file.path !== root && !file.path.startsWith(`${root}/`)) continue;
+        if (!isInClipSearchScope(file.path, root, chosenNoteFolder)) continue;
         const generation = this.vaultSyncIndex.getGeneration(file.path);
         const content = await this.app.vault.cachedRead(file);
         const candidate = articleCandidate(file.path, content);
@@ -5525,7 +5532,7 @@ export default class WeTongbuPlugin extends Plugin {
     // of creating a second note. Restricting this fallback to the calculated
     // path prevents same-title notes from unrelated sources being merged.
     if (options.allowLegacyPathMatch && candidates.length === 0) {
-      const expectedPath = normalizePath(`${layout.noteFolder}/${layout.noteFilename}`);
+      const expectedPath = normalizePath(`${noteFolder}/${layout.noteFilename}`);
       const legacyFile = this.app.vault.getAbstractFileByPath(expectedPath);
       if (legacyFile instanceof TFile) {
         const generation = this.vaultSyncIndex.getGeneration(legacyFile.path);
