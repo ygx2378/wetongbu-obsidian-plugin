@@ -1,4 +1,3 @@
-import { isValidVaultSyncInt8Decimal } from "./shared/vault-sync-protocol.mjs";
 
 export interface DeletionReviewNoticeEntry {
   path: string;
@@ -179,13 +178,10 @@ export function createPendingV2DeletionReviewHandler<TItem extends PendingV2Dele
       return [...options.getPendingItems()];
     }
     if (outcome.status === "committed") {
-      const cursorSuffix = outcome.changeCursor && isValidVaultSyncInt8Decimal(outcome.changeCursor, { allowZero: false })
-        ? `；云端变更游标 ${outcome.changeCursor}`
-        : "";
       const message = outcome.supersededOperationCount
-        ? `已确认同步删除 ${item.path}，并取消 ${outcome.supersededOperationCount} 条已被删除取代的本机待办${cursorSuffix}。`
-        : `已确认同步删除 ${item.path}${cursorSuffix}`;
-      options.showNotice(message, cursorSuffix ? 8000 : undefined);
+        ? `已确认同步删除 ${item.path}，并取消 ${outcome.supersededOperationCount} 条已被删除取代的本机待办。`
+        : `已确认同步删除 ${item.path}`;
+      options.showNotice(message);
       options.setPendingItems(removeCommittedDeletionReviewEntry(options.getPendingItems(), item));
     } else if (outcome.status === "conflict") {
       options.showNotice(`云端在确认期间发生变化；删除待办已保留，请到冲突中心重新检查 ${item.path}`, 10000);

@@ -21,7 +21,7 @@ import { normalizeVaultPath } from "./shared/vault-sync-protocol.mjs";
 import { validateWebclipManifest, verifyWebclipPackageFiles } from "./shared/feishu-package.mjs";
 import { createEncryptedVaultStorage, createFreeS3Storage, createProHostedStorage, deriveS3Config, type VaultSyncStorage } from "./vault-sync-storage";
 import { VaultSyncRemoteClient, type VaultSyncClientOptions, type VaultSyncDeviceManagement, type VaultSyncManagedDevice } from "./vault-sync-remote";
-import type { VaultSyncV2DeviceProgress, VaultSyncV2FileVersion, VaultSyncV2FileVersionsPage } from "./vault-sync-v2-remote";
+import type { VaultSyncV2FileVersion, VaultSyncV2FileVersionsPage } from "./vault-sync-v2-remote";
 import {
   createPrevSyncStore,
   formatOversizedFileNotice,
@@ -80,7 +80,6 @@ import { sha256Hex } from "./shared/hash";
 import { assertVaultEncryptionCredentialChangeSafe, createVaultSyncCrypto, type VaultSyncCrypto, type VaultSyncCryptoKeyring } from "./shared/vault-sync-crypto";
 import { addVaultSyncCryptoKeyDescriptor, assertVaultSyncEncryptionVersionCompatible, loadVaultSyncCryptoKeyring, normalizeVaultSyncCryptoKeyDescriptors, validateVaultSyncRemoteKeyVersionCatalog, type VaultSyncCryptoKeyDescriptor } from "./vault-sync-crypto-keyring";
 import { createVaultSyncOutboxStore, loadLatestVaultSyncOutboxSnapshot, type VaultSyncInboxEntry, type VaultSyncOutboxOperation, type VaultSyncOutboxSnapshot, type VaultSyncV2Identity } from "./vault-sync-outbox";
-import { summarizeVaultSyncNeedsRebase } from "./vault-sync-needs-rebase";
 import { createVaultSyncV2BaselineStore, loadLatestVaultSyncV2Baseline } from "./vault-sync-v2-baseline";
 import { createVaultSyncV2BaseContentStore } from "./vault-sync-v2-base-content";
 import { archiveLegacyPrevSyncStateForV2 } from "./vault-sync-v2-legacy-migration";
@@ -132,8 +131,7 @@ import { createVaultSyncOrderedQueue } from "./vault-sync-ordered-queue";
 import { canAutomaticallyPropagateDeletes, type VaultSyncDeleteMode } from "./vault-sync-deletion-policy";
 import { loadVaultSyncInterval, normalizeVaultSyncInterval, VAULT_SYNC_INTERVAL_OPTIONS } from "./vault-sync-preferences";
 import { createVaultSyncScopeStateStore } from "./vault-sync-scope-state";
-import { formatPendingDeletionDeviceProgress, formatVaultSyncDeviceCursors } from "./vault-sync-device-progress";
-import { fetchV2DeviceProgressWhenActive, resolveVaultSyncProtocol } from "./vault-sync-device-progress-refresh";
+import { resolveVaultSyncProtocol } from "./vault-sync-device-progress-refresh";
 import { createVaultSyncInitializationLeaseKeeper } from "./vault-sync-initialization-lease";
 import { clipNoteFolder, isInClipSearchScope } from "./clip-note-folder";
 import {
@@ -533,8 +531,6 @@ export default class WeTongbuPlugin extends Plugin {
   captureReceiverStatus: { device_name: string | null; is_current_device: boolean } | null = null;
   vaultEncryptionInput = "";
   vaultEncryptionRotationInput = "";
-  vaultSyncDeviceProgress: VaultSyncV2DeviceProgress | null = null;
-  vaultSyncDeviceProgressFetchedAt = "";
   vaultSyncDeviceManagement: VaultSyncDeviceManagement | null = null;
   vaultSyncDeviceManagementFetchedAt = "";
   private pluginTokenMissingNoticeShown = false;
@@ -4073,18 +4069,6 @@ export default class WeTongbuPlugin extends Plugin {
     }
   }
 
-  async refreshVaultSyncDeviceProgress() {
-    const pluginToken = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    if (!pluginToken || !this.settings.syncTargetId) throw new Error("请先连接当前 Vault");
-    const remote = createVaultSyncRemoteClient({
-      apiBaseUrl: this.settings.apiBaseUrl,
-      targetId: this.settings.syncTargetId,
-      pluginToken,
-    });
-    this.vaultSyncDeviceProgress = await fetchV2DeviceProgressWhenActive(remote);
-    this.vaultSyncDeviceProgressFetchedAt = new Date().toISOString();
-  }
-
   async refreshVaultSyncDeviceManagement() {
     const pluginToken = await this.app.secretStorage.getSecret(this.pluginTokenSecretId());
     const installationId = this.settings.vaultInstallationId;
@@ -4728,33 +4712,6 @@ export default class WeTongbuPlugin extends Plugin {
     } catch (error) {
       if (!cloudStateVerified) await showCachedConflicts();
       else new Notice(`无法打开同步冲突中心：${error instanceof Error ? error.message : String(error)}`, 10000);
-    }
-  }
-
-  async openVaultSyncNeedsRebaseReview() {
-    const targetId = this.settings.syncTargetId;
-    const deviceId = this.settings.vaultDeviceId;
-    if (!targetId || !deviceId) {
-      new Notice("当前 Vault 尚未连接同步设备，无法读取本机需重基记录");
-      return;
-    }
-    try {
-      const snapshot = await loadLatestVaultSyncOutboxSnapshot(this.app, {
-        apiBaseUrl: normalizeApiBaseUrl(this.settings.apiBaseUrl), targetId, deviceId,
-      });
-      if (!snapshot) {
-        new Notice("本机没有可校验的同步 outbox 快照");
-        return;
-      }
-      const baselineEntries = await createVaultSyncV2BaselineStore(this.app, snapshot.identity).load().catch(() => []);
-      const items = summarizeVaultSyncNeedsRebase(snapshot, baselineEntries);
-      if (!items.length) {
-        new Notice("本机 outbox 没有需重基的操作");
-        return;
-      }
-      new VaultSyncNeedsRebaseModal(this.app, items).open();
-    } catch (error) {
-      new Notice(`无法读取本机需重基记录：${error instanceof Error ? error.message : String(error)}`, 10000);
     }
   }
 
@@ -5732,25 +5689,6 @@ interface VaultSyncV2ConflictPreview {
   canEditMerge?: boolean;
   remoteChoiceBlockedByActiveEditor?: boolean;
   localHash?: string;
-}
-
-class VaultSyncNeedsRebaseModal extends Modal {
-  constructor(app: App, private items: ReturnType<typeof summarizeVaultSyncNeedsRebase>) { super(app); }
-
-  onOpen() {
-    this.titleEl.setText(`本机需重基记录（${this.items.length}）`);
-    this.contentEl.empty();
-    this.contentEl.createEl("p", {
-      text: "这些是本机保留的旧 outbox 请求，已停止自动重试，只供核对；不会阻塞其他独立笔记同步，也不是远端 inbox 冲突。此窗口只读，不会重放或清理记录。路径来自旧请求或最近的本机基线，可能不是当前路径。",
-    });
-    for (const item of this.items) {
-      new Setting(this.contentEl)
-        .setName(item.location)
-        .setDesc(`${item.action} · 原因：${item.reason} · 操作 ${item.operationId.slice(0, 8)}… · 文件 ${item.fileId.slice(0, 8)}…`);
-    }
-  }
-
-  onClose() { this.contentEl.empty(); }
 }
 
 class VaultSyncV2OfflineConflictSnapshotModal extends Modal {
@@ -7153,25 +7091,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
       );
     vaultSyncSetting.settingEl.addClass("wetongbu-vault-sync-setting", "wetongbu-toggle-setting");
 
-    const vaultUuidSetting = new Setting(containerEl)
-      .setName("当前同步 Vault UUID")
-      .setDesc(this.plugin.settings.syncTargetId
-        ? "复制当前连接的云端 Vault 标识，用于专用空测试 Vault 的基线核验。UUID 不是访问凭证；请勿使用日常 Vault 进行生产 canary，也不要分享整个插件设置文件。"
-        : "当前尚未连接云端 Vault。登录账号并连接到已有 Vault 后，UUID 会显示在这里。");
-    if (this.plugin.settings.syncTargetId) {
-      vaultUuidSetting
-        .addButton((button) => button
-          .setButtonText("复制 UUID")
-          .onClick(async () => {
-            try {
-              await navigator.clipboard.writeText(this.plugin.settings.syncTargetId);
-              new Notice("当前同步 Vault UUID 已复制到剪贴板");
-            } catch {
-              new Notice("复制 UUID 失败，请稍后重试；不要分享整个插件设置文件。", 10000);
-            }
-          }));
-    }
-
     if (this.plugin.settings.syncTargetId && this.plugin.settings.vaultInstallationId) {
       const pathMoveProgress = new Setting(containerEl)
         .setName("文件改名/移动进度")
@@ -7215,10 +7134,9 @@ class WeTongbuSettingTab extends PluginSettingTab {
       const management = this.plugin.vaultSyncDeviceManagement;
       const stateLabel = (state: VaultSyncManagedDevice["state"]) => state === "up_to_date"
         ? "已追平" : state === "catching_up" ? "正在追赶" : "暂无应用回执";
-      const cursors = (device: VaultSyncManagedDevice) => `applied ${device.appliedCursor ?? "未知"} / received ${device.receivedCursor ?? "未知"}`;
       new Setting(containerEl)
         .setName("同步设备管理")
-        .setDesc(`查看当前 Vault 的已登记设备。只有当前 Vault 同步暂停、凭证关联完整且没有被其他活动设备共用时才能停用；云端文件、历史版本与 ACK 记录保留，未同步的本地修改不会进入云端。${this.plugin.vaultSyncDeviceManagementFetchedAt ? ` 最近查询：${this.plugin.vaultSyncDeviceManagementFetchedAt}。` : ""}`)
+        .setDesc(`查看当前 Vault 的已登记设备。只有当前 Vault 同步暂停、凭证关联完整且没有被其他活动设备共用时才能停用；云端文件和历史版本会保留，未同步的本地修改不会进入云端。${this.plugin.vaultSyncDeviceManagementFetchedAt ? ` 最近查询：${this.plugin.vaultSyncDeviceManagementFetchedAt}。` : ""}`)
         .addButton((button) => button
           .setButtonText("刷新设备列表")
           .onClick(async () => {
@@ -7236,7 +7154,7 @@ class WeTongbuSettingTab extends PluginSettingTab {
         for (const device of management.devices) {
           const suffix = device.isCurrent ? "，本机" : "";
           const canRetire = !this.plugin.settings.vaultSyncEnabled && device.canRetire;
-          const description = `最近同步：${device.lastSyncAt || "未知"}；${cursors(device)}；${stateLabel(device.state)}${!device.isCurrent && !device.canRetire ? "；凭证关联缺失或仍被其他活动设备共用，不能安全停用" : ""}${!device.isCurrent && device.canRetire && this.plugin.settings.vaultSyncEnabled ? "；请先暂停当前 Vault 同步" : ""}`;
+          const description = `最近同步：${device.lastSyncAt || "未知"}；${stateLabel(device.state)}${!device.isCurrent && !device.canRetire ? "；凭证关联缺失或仍被其他活动设备共用，不能安全停用" : ""}${!device.isCurrent && device.canRetire && this.plugin.settings.vaultSyncEnabled ? "；请先暂停当前 Vault 同步" : ""}`;
           const deviceSetting = new Setting(containerEl)
             .setName(`${device.deviceName}（ID ${device.deviceId.slice(0, 8)}${suffix}）`)
             .setDesc(description);
@@ -7256,149 +7174,6 @@ class WeTongbuSettingTab extends PluginSettingTab {
           new Setting(containerEl).setName("当前没有已登记的同步设备");
         }
       }
-    }
-
-    if (this.plugin.settings.vaultSyncEnabled && canVaultSync) {
-      const progress = this.plugin.vaultSyncDeviceProgress;
-      const stateLabel = (state: "up_to_date" | "catching_up" | "unknown") => state === "up_to_date"
-        ? "已追平"
-        : state === "catching_up" ? "正在追赶" : "暂无应用回执";
-      const progressExplanation = "设备‘已追平’表示已应用游标达到当前云端游标；已应用游标按连续变更计算，尚未提交到云端的本地改动（包括待确认删除）不会显示在这里。确认删除成功提示中的‘云端变更游标’可与接收设备的‘已应用游标’比较；后者达到或超过该值，才表示该设备已应用这条删除变更。“查询于”是本机完成刷新状态时记下的时间，不是传播计时；不同设备查询时间的差值不能直接作为笔记同步耗时。设备名后的 ID 前缀可与冲突详情里的来源设备对应。";
-      const pendingDeletionCount = this.plugin.pendingDeletionCount;
-      const pendingDeletionProgress = formatPendingDeletionDeviceProgress(pendingDeletionCount);
-      const progressDescription = progress
-        ? [`云端游标 ${progress.changeCursor}`,
-          ...progress.devices.map((device) => `${device.deviceName}（ID ${device.deviceId.slice(0, 8)}${device.deviceId === this.plugin.settings.vaultDeviceId ? "，本机" : ""}）：${stateLabel(device.state)}（${formatVaultSyncDeviceCursors(device)}）`),
-          `查询于 ${this.plugin.vaultSyncDeviceProgressFetchedAt || "刚刚"}`,
-          ...(pendingDeletionProgress ? [pendingDeletionProgress] : []),
-          progressExplanation].join("；")
-        : `状态依据各设备已应用 ACK；旧设备或尚未完成首次快照的设备会显示为未知。${pendingDeletionProgress ? `${pendingDeletionProgress} ` : ""}${progressExplanation}`;
-      new Setting(containerEl)
-        .setName("设备追平状态")
-        .setDesc(progressDescription)
-        .addButton((button) => button
-          .setButtonText("刷新设备状态")
-          .onClick(async () => {
-            try {
-              button.setDisabled(true);
-              await this.plugin.refreshVaultSyncDeviceProgress();
-              this.displayPreservingScroll();
-            } catch (error) {
-              new Notice(`读取设备同步状态失败：${error instanceof Error ? error.message : String(error)}`, 8000);
-            } finally {
-              button.setDisabled(false);
-            }
-          }));
-      if (pendingDeletionCount > 0) {
-        new Setting(containerEl)
-          .setName("本机待提交删除")
-          .setDesc("设备追平状态不包含本机待审删除；云端尚未收到这些删除。")
-          .addButton((button) => button
-            .setButtonText(`处理 ${pendingDeletionCount} 项待确认删除`)
-            .onClick(() => { void this.plugin.openPendingDeletionReview(); }));
-      }
-
-      const diagnostics = this.plugin.vaultSyncDiagnostics.snapshot();
-      const formatSeconds = (value: number | null | undefined) => value === null || value === undefined
-        ? "—"
-        : `${(value / 1000).toFixed(1)} 秒`;
-      const latest = diagnostics.latest;
-      const eventIssueLabels: Record<string, string> = {
-        ticket_unauthorized: "票据请求未授权",
-        ticket_rate_limited: "票据请求限流",
-        ticket_server_error: "票据服务端错误",
-        ticket_http_error: "票据 HTTP 请求失败",
-        ticket_response_invalid: "票据响应无效",
-        ticket_session_mismatch: "设备会话不匹配",
-        ticket_transport_error: "票据请求网络错误",
-        websocket_unavailable: "WebSocket 不可用",
-        websocket_open_timeout: "WebSocket 建连超时",
-        websocket_ready_timeout: "WebSocket 认证握手超时",
-      } as const;
-      const eventIssueDescription = (issue: typeof diagnostics.lastEventIssue) => {
-        if (!issue) return "";
-        const stagedClose = issue.match(/^websocket_closed_(before_open|before_ready|after_ready)_(0|[1-4][0-9]{3})$/);
-        if (stagedClose) {
-          const stageLabels: Record<string, string> = {
-            before_open: "连接建立前中断",
-            before_ready: "认证握手完成前中断",
-            after_ready: "认证连接建立后断开",
-          };
-          return `最近异常：WebSocket ${stageLabels[stagedClose[1]]}，关闭码 ${stagedClose[2]}。`;
-        }
-        if (issue.startsWith("websocket_closed_")) return `最近异常：WebSocket 关闭码 ${issue.slice("websocket_closed_".length)}。`;
-        return `最近异常：${eventIssueLabels[issue]}。`;
-      };
-      const diagnosticStageLabels: Record<VaultSyncDiagnosticStage, string> = {
-        device_auth: "设备凭据",
-        remote_status: "云端状态",
-        encryption_setup: "加密准备",
-        capability_read: "能力读取",
-        local_prepare: "本机准备",
-        pull: "拉取",
-        push: "推送",
-        finalize: "收尾",
-        legacy_sync: "旧版同步",
-      };
-      const multipartStageLabels: Record<VaultSyncMultipartTransferDiagnostic["stage"], string> = {
-        initialize: "会话初始化",
-        part_url: "分段地址",
-        part_upload: "分段上传",
-        complete: "分段完成",
-        finalize: "对象校验",
-      };
-      const multipartOutcomeLabels: Record<VaultSyncMultipartTransferDiagnostic["outcome"], string> = {
-        started: "已开始",
-        succeeded: "成功",
-        failed: "失败",
-      };
-      const work = latest?.work;
-      const v1WorkDescription = latest?.protocol === "v1" && work?.v1UploadedCount !== undefined
-        ? `V1 操作：上传 ${work.v1UploadedCount}、下载 ${work.v1DownloadedCount ?? 0}、本地删除 ${work.v1DeletedLocalCount ?? 0}、云端删除 ${work.v1DeletedRemoteCount ?? 0}、冲突 ${work.v1ConflictCount ?? 0}、失败 ${work.v1FailedCount ?? 0}${work.v1Aborted ? "、已中止" : ""}${work.v1NeedsBootstrapDecision ? "、等待首次同步方向确认" : ""}${work.v1SafetyBlocked ? "、安全保护暂停" : ""}${work.v1DeletionReviewRequired ? "、删除待审核" : ""}`
-        : "";
-      const localWorkDescription = work ? [
-        v1WorkDescription,
-        work.scanEntryCount === undefined
-          ? "本机扫描未运行"
-          : `本机扫描 ${work.scanEntryCount} 个文件${work.scanIssueCount ? `，扫描异常 ${work.scanIssueCount} 项` : ""}`,
-        work.pushCommittedCount === undefined
-          ? "推送阶段未运行"
-          : `推送：已提交 ${work.pushCommittedCount}、改名 ${work.pushRenamedCount ?? 0}、删除 ${work.pushDeletedCount ?? 0}、冲突 ${work.pushConflictCount ?? 0}、失败 ${work.pushFailedCount ?? 0}、需重基 ${work.pushNeedsRebaseCount ?? 0}、预算暂缓 ${work.pushSkippedForBudgetCount ?? 0}、删除待审核 ${work.pendingDeletionReviewCount ?? 0}`,
-        work.outboxReadable === false
-          ? "本机 outbox 读取失败"
-          : work.outboxSnapshotPresent === false
-            ? "本机 outbox 没有可用快照"
-            : work.outboxSnapshotPresent
-              ? `本机 outbox：排队 ${work.outboxQueuedCount ?? 0}、准备 ${work.outboxPreparingCount ?? 0}、已上传 ${work.outboxUploadedCount ?? 0}、提交中 ${work.outboxCommittingCount ?? 0}、已确认未清理 ${work.outboxConfirmedCount ?? 0}、冲突 ${work.outboxConflictCount ?? 0}、需重基 ${work.outboxNeedsRebaseCount ?? 0}；inbox 未应用 ${work.inboxReceivedCount ?? 0}、待解决 ${work.inboxNeedsResolutionCount ?? 0}`
-              : "本机 outbox 状态未采集",
-      ].filter(Boolean).join("。 ") + "。" : "";
-      const diagnosticDescription = [
-        `仅本机内存保留本次 Obsidian 运行期的耗时、聚合计数和状态，不上传，重启后清空。完整同步 ${diagnostics.completedCount} 轮：总用时 P50 ${formatSeconds(diagnostics.durationP50Ms)} / P95 ${formatSeconds(diagnostics.durationP95Ms)}。`,
-        "“需重基”表示已停止自动重试的旧请求，保留供核对；不会阻塞其他独立笔记同步。点击“查看需重基项”可查看操作类型、原因和路径。",
-        `v2 拉取 P95 ${formatSeconds(diagnostics.pullP95Ms)}，推送阶段 P95 ${formatSeconds(diagnostics.pushP95Ms)}。`,
-        `推送 CAS 自动合并：尝试 ${diagnostics.pushCasAutoMergeAttemptCount} 次、持久重提 ${diagnostics.pushCasAutoMergeRetryQueuedCount} 次、云端确认 ${diagnostics.pushCasAutoMergeRetryCommittedCount} 次。`,
-        `CAS（比较并交换）统计只覆盖符合条件的 Markdown 推送冲突：尝试表示开始自动重算，持久重提表示合并结果已存入本机待办，云端确认表示云端已确认提交。三项均为 0 表示本轮没有触发这条重试路径，不代表同步失败。`,
-        `云端提交→本机安全应用 P50 ${formatSeconds(diagnostics.appliedLatencyP50Ms)} / P95 ${formatSeconds(diagnostics.appliedLatencyP95Ms)}（${diagnostics.appliedLatencySampleCount} 个样本；包含提交后等待本机安全落盘的时间，打开中的笔记会使应用延后；不含本机编辑到云端提交前的等待与上传）。`,
-        `自动同步总等待 P95 ${formatSeconds(diagnostics.queueWaitP95Ms)}（${diagnostics.queueWaitSampleCount} 个样本；按系统时钟从本机变更计到同步启动，可能包含后台或离线暂停，也可能受系统时钟校准影响）。未暂停调度等待 P95 ${formatSeconds(diagnostics.activeQueueWaitP95Ms)}（${diagnostics.activeQueueWaitSampleCount} 个样本；只累计调度器未暂停时间，不代表系统睡眠检测或设备间传播时延）；事件通道${({ stopped: "已停止", offline: "离线", connecting: "连接中", connected: "已连接", polling: "轮询回退" } as const)[diagnostics.connectionStatus]}；本次运行成功重连 ${diagnostics.successfulReconnectCount} 次。${eventIssueDescription(diagnostics.lastEventIssue)}`,
-        latest ? `最近一轮：${latest.protocol} / ${latest.outcome} / ${formatSeconds(latest.durationMs)}${latest.stage ? ` / 阶段 ${diagnosticStageLabels[latest.stage]}` : ""}${latest.failureCode ? ` / ${latest.failureCode}` : ""}${latest.multipartTransfer ? ` / 分段传输 ${multipartStageLabels[latest.multipartTransfer.stage]} ${multipartOutcomeLabels[latest.multipartTransfer.outcome]}${latest.multipartTransfer.httpStatus ? `（HTTP ${latest.multipartTransfer.httpStatus}` : ""}${latest.multipartTransfer.errorCode ? `${latest.multipartTransfer.httpStatus ? "，" : "（"}${latest.multipartTransfer.errorCode}` : ""}${latest.multipartTransfer.httpStatus || latest.multipartTransfer.errorCode ? "）" : ""}` : ""}。` : "尚无本次运行的同步样本。",
-        "分段诊断只保留本轮最后报告的客户端阶段、可见 HTTP 状态和固定安全错误码；“已开始”只表示客户端进入该步骤，不代表服务端已收到请求。",
-        localWorkDescription,
-      ].join(" ");
-      new Setting(containerEl)
-        .setName("本地同步性能统计")
-        .setDesc(diagnosticDescription)
-        .addButton((button) => button
-          .setButtonText("刷新统计")
-          .onClick(() => this.displayPreservingScroll()))
-        .addButton((button) => button
-          .setButtonText("查看需重基项")
-          .onClick(() => { void this.plugin.openVaultSyncNeedsRebaseReview(); }))
-        .addButton((button) => button
-          .setButtonText("清空")
-          .onClick(() => {
-            this.plugin.vaultSyncDiagnostics.clear();
-            this.displayPreservingScroll();
-          }));
     }
 
     if (this.plugin.accountCanVaultSync) {
