@@ -25,3 +25,19 @@ export function isInClipSearchScope(path: string, rootFolder: string, noteFolder
   const inside = (folder: string) => !folder || path === folder || path.startsWith(`${folder}/`);
   return inside(rootFolder) || Boolean(noteFolder && inside(noteFolder));
 }
+
+/**
+ * Attachments of notes under the plugin root keep the dated `90_附件` layout.
+ * Notes living elsewhere (a folder chosen in the browser extension) keep their
+ * attachments in an `附件` folder beside the note, so clipping into a chosen
+ * folder never recreates the plugin root.
+ */
+export function clipAttachmentFolder(input: { rootFolder: string; noteFolder: string; layoutAttachmentFolder: string }) {
+  const trim = (value: string) => value.replace(/^\/+|\/+$/g, "");
+  const rootFolder = trim(input.rootFolder);
+  const noteFolder = trim(input.noteFolder);
+  if (!rootFolder || noteFolder === rootFolder || noteFolder.startsWith(`${rootFolder}/`)) {
+    return input.layoutAttachmentFolder;
+  }
+  return noteFolder ? `${noteFolder}/附件` : "附件";
+}

@@ -133,7 +133,7 @@ import { loadVaultSyncInterval, normalizeVaultSyncInterval, VAULT_SYNC_INTERVAL_
 import { createVaultSyncScopeStateStore } from "./vault-sync-scope-state";
 import { resolveVaultSyncProtocol } from "./vault-sync-device-progress-refresh";
 import { createVaultSyncInitializationLeaseKeeper } from "./vault-sync-initialization-lease";
-import { clipNoteFolder, isInClipSearchScope } from "./clip-note-folder";
+import { clipAttachmentFolder, clipNoteFolder, isInClipSearchScope } from "./clip-note-folder";
 import {
   dismissConflictActionForActiveEditorBusy,
   registerVaultSyncEditorRetryEvents,
@@ -772,7 +772,6 @@ export default class WeTongbuPlugin extends Plugin {
     }
     this.vaultSyncWriteRecoveryReady = true;
     this.articleSyncSchedulerStarted = true;
-    void this.ensureWorkspace();
     void this.syncNow(true).then(() => this.recoverCaptureHandoffs());
     this.restartArticleSyncTimer();
     this.restartVaultSyncTimer();
@@ -1191,7 +1190,7 @@ export default class WeTongbuPlugin extends Plugin {
       taskId: task.manifest.taskId,
       assets: localClipImageLayoutAssets(sourcePaths, assets),
     });
-    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    const attachmentFolder = this.clipAttachmentFolder(layout, noteFolder);
     const plans: Array<{ asset: any; targetPath: string; writeLocal: boolean; relativePath: string }> = [];
     for (const [index, asset] of assets.entries()) {
       const clipIndex = Number.isInteger(asset.clipIndex) && asset.clipIndex >= 0 && asset.clipIndex < layout.assetNames.length
@@ -4922,7 +4921,7 @@ export default class WeTongbuPlugin extends Plugin {
     });
     const notePath = candidate.path;
     const noteFolder = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
-    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    const attachmentFolder = this.clipAttachmentFolder(layout, noteFolder);
     const createdPaths: Array<{ path: string; body: Uint8Array; mtime: number | null }> = [];
     const localFiles: Array<{ path: string; body: Uint8Array }> = [];
     try {
@@ -5202,24 +5201,12 @@ export default class WeTongbuPlugin extends Plugin {
     };
   }
 
-  private async ensureWorkspace() {
-    const root = normalizePath(this.settings.rootFolder);
-    await ensureFolder(this, `${root}/00_收件箱`);
-    await ensureFolder(this, `${root}/10_已处理`);
-    await ensureFolder(this, `${root}/90_附件`);
-    const guides = [
-      ["AGENTS.md", "# 微同步 AI 处理说明\n\n待完善。\n"],
-      ["CLAUDE.md", "# 微同步 Claude 处理说明\n\n待完善。\n"],
-    ];
-    for (const [filename, content] of guides) {
-      const target = normalizePath(`${root}/${filename}`);
-      if (!this.app.vault.getAbstractFileByPath(target)) {
-        await withVaultPathWriteLock(target, async () => {
-          if (this.app.vault.getAbstractFileByPath(target)) return;
-          await this.app.vault.create(target, content);
-        });
-      }
-    }
+  private clipAttachmentFolder(layout: { attachmentFolder: string }, noteFolder: string) {
+    return normalizePath(clipAttachmentFolder({
+      rootFolder: normalizePath(this.settings.rootFolder),
+      noteFolder,
+      layoutAttachmentFolder: layout.attachmentFolder,
+    }));
   }
 
   private async completeCaptureTask(task: any) {
@@ -5297,7 +5284,7 @@ export default class WeTongbuPlugin extends Plugin {
       assets: task.assets,
     });
     const noteFolder = normalizePath(note.parent?.path || layout.noteFolder);
-    const attachmentFolder = normalizePath(layout.attachmentFolder);
+    const attachmentFolder = this.clipAttachmentFolder(layout, noteFolder);
     const newline = original.includes("\r\n") ? "\r\n" : "\n";
     let body = incomingBody.replace(/\r?\n/g, newline);
     const localAssets: Array<{ asset: any; targetPath: string; writeLocal: boolean }> = [];
@@ -5412,7 +5399,7 @@ export default class WeTongbuPlugin extends Plugin {
     // without the default inbox's year/month subfolders.
     const chosenNoteFolder = clipNoteFolder(task.manifest.noteFolder);
     const noteFolder = normalizePath(chosenNoteFolder ?? layout.noteFolder);
-    const taskAttachmentFolder = normalizePath(layout.attachmentFolder);
+    const taskAttachmentFolder = this.clipAttachmentFolder(layout, noteFolder);
     await ensureFolder(this, noteFolder);
 
     // ZIP captures carry a managed body marker so later captures can preserve
@@ -6986,29 +6973,27 @@ class WeTongbuSettingTab extends PluginSettingTab {
 
     this.textSetting(
       "微同步目录",
-      `文章、附件和 AI 说明文件的剪藏根目录；Vault Sync 选择“仅 ${this.plugin.settings.rootFolder} 目录”时也以此路径筛选文件。这里是相对 Vault 根目录的路径，可手工填写，也可在下方搜索选择当前 Vault 已有目录。目录路径保存在本机；多端同步时，请在所有设备填写相同路径。`,
+      `未在浏览器扩展指定保存位置的剪藏（含微信文章）写入此目录，首次写入时才会创建，不会预先建立空文件夹；Chrome 已指定文件夹的剪藏不使用此目录，其附件存放在该文件夹下的“附件”目录。Vault Sync 选择“仅 ${this.plugin.settings.rootFolder} 目录”时也以此路径筛选文件。这里是相对 Vault 根目录的路径，可手工填写，也可在下方搜索选择当前 Vault 已有目录。目录路径保存在本机；多端同步时，请在所有设备填写相同路径。`,
       "rootFolder",
     );
 
-    if (this.plugin.accountCanVaultSync) {
-      new Setting(containerEl)
-        .setName("选择 Vault 内目录")
-        .setDesc("搜索并选择当前 Vault 已有文件夹，只会填入上方“微同步目录”；不会自动更改云端同步范围或立即发起同步。")
-        .addButton((button) => button
-          .setButtonText("浏览目录")
-          .onClick(() => {
-            const folders = this.app.vault.getAllFolders()
-              .filter((folder) => Boolean(normalizeVaultPath(folder.path)))
-              .sort((left, right) => left.path.localeCompare(right.path));
-            if (folders.length === 0) {
-              new Notice("当前 Vault 尚无可选择的文件夹；请先创建文件夹，或手工填写微同步目录。", 8000);
-              return;
-            }
-            new VaultFolderPickerModal(this.app, folders, (path) => {
-              void this.setMicroSyncFolderFromPicker(path);
-            }).open();
-          }));
-    }
+    new Setting(containerEl)
+      .setName("选择 Vault 内目录")
+      .setDesc("搜索并选择当前 Vault 已有文件夹，只会填入上方“微同步目录”；不会自动更改云端同步范围或立即发起同步。")
+      .addButton((button) => button
+        .setButtonText("浏览目录")
+        .onClick(() => {
+          const folders = this.app.vault.getAllFolders()
+            .filter((folder) => Boolean(normalizeVaultPath(folder.path)))
+            .sort((left, right) => left.path.localeCompare(right.path));
+          if (folders.length === 0) {
+            new Notice("当前 Vault 尚无可选择的文件夹；请先创建文件夹，或手工填写微同步目录。", 8000);
+            return;
+          }
+          new VaultFolderPickerModal(this.app, folders, (path) => {
+            void this.setMicroSyncFolderFromPicker(path);
+          }).open();
+        }));
 
     if (this.plugin.pendingDeletionCount > 0) {
       new Setting(containerEl)
