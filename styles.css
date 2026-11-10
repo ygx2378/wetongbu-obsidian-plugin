@@ -96,3 +96,82 @@
 .wetongbu-setting-tab.wetongbu-mobile-settings .wetongbu-vault-sync-scope-setting select {
   width: 100%;
 }
+
+/* Advanced settings: collapsed by default so everyday options stay short. */
+.wetongbu-setting-tab .wetongbu-advanced-settings {
+  margin-top: 1.5em;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 0.75em;
+}
+
+.wetongbu-setting-tab .wetongbu-advanced-settings > summary {
+  cursor: pointer;
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+  padding: 0.5em 0;
+}
+
+/* Sync center: status first, then what needs the user, then reference lists. */
+.wetongbu-sync-center {
+  padding: var(--size-4-3);
+}
+
+.wetongbu-sync-center-status {
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+  padding: var(--size-4-3) var(--size-4-4);
+  margin-bottom: var(--size-4-3);
+}
+
+.wetongbu-sync-center-label {
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-semibold);
+}
+
+.wetongbu-sync-center-label::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-inline-end: 8px;
+  vertical-align: middle;
+  background: var(--text-faint);
+}
+
+.wetongbu-sync-center-status[data-tone="ok"] .wetongbu-sync-center-label::before { background: var(--color-green); }
+.wetongbu-sync-center-status[data-tone="busy"] .wetongbu-sync-center-label::before { background: var(--color-blue); }
+.wetongbu-sync-center-status[data-tone="attention"] .wetongbu-sync-center-label::before { background: var(--color-orange); }
+.wetongbu-sync-center-status[data-tone="error"] .wetongbu-sync-center-label::before { background: var(--color-red); }
+
+.wetongbu-sync-center-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin-top: 4px;
+}
+
+.wetongbu-sync-center-actions {
+  margin-top: var(--size-4-3);
+}
+
+.wetongbu-sync-center-actions button {
+  width: 100%;
+}
+
+.wetongbu-sync-center-section {
+  margin-bottom: var(--size-4-4);
+}
+
+.wetongbu-sync-center-empty,
+.wetongbu-sync-center-link {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: 0.5em 0;
+}
+
+.wetongbu-sync-center-trash-item .setting-item-name {
+  word-break: break-all;
+}
+
+.wetongbu-sync-status[data-tone="attention"] { color: var(--color-orange); }
+.wetongbu-sync-status[data-tone="error"] { color: var(--color-red); }

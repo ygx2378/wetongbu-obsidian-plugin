@@ -5,10 +5,10 @@
 import { isValidVaultSyncInt8Decimal, normalizeVaultPath, portableVaultPathKey } from "./shared/vault-sync-protocol.mjs";
 import type { FileEntity } from "./vault-sync-diff";
 import { VaultSyncV2RemoteClient } from "./vault-sync-v2-remote.ts";
-import type { VaultSyncCapabilities, VaultSyncOperationReceiptOutcome, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
+import type { VaultSyncCapabilities, VaultSyncOperationReceiptOutcome, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2DeletedFilesPage, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
 import type { VaultSyncV2Request } from "./vault-sync-outbox.ts";
 import { getVaultSyncRetryAfterFromResponse } from "./vault-sync-retry.ts";
-export type { VaultSyncCapabilities, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
+export type { VaultSyncCapabilities, VaultSyncOperationResult, VaultSyncOperationWindow, VaultSyncV2Ack, VaultSyncV2ChangePage, VaultSyncV2DeviceProgress, VaultSyncV2DeviceSession, VaultSyncV2EncryptionRotation, VaultSyncV2EncryptionRotationObjectPage, VaultSyncV2EncryptionRotationReservation, VaultSyncV2DeletedFilesPage, VaultSyncV2FileVersionsPage, VaultSyncV2Initialization, VaultSyncV2ObjectDownload, VaultSyncV2ObjectReservation, VaultSyncV2SnapshotApplyLease, VaultSyncV2SnapshotPage, VaultSyncV2SnapshotSummary } from "./vault-sync-v2-remote.ts";
 
 export interface ManifestItem {
   path: string;
@@ -324,6 +324,10 @@ export class VaultSyncRemoteClient {
 
   async getFileVersions(input: { fileId: string; beforeVersionNumber?: string; limit?: number }): Promise<VaultSyncV2FileVersionsPage> {
     return this.v2.getFileVersions(input);
+  }
+
+  async getDeletedFiles(limit?: number): Promise<VaultSyncV2DeletedFilesPage> {
+    return this.v2.getDeletedFiles(limit);
   }
 
   async getFileVersionContent(fileId: string, versionId: string): Promise<VaultSyncV2ObjectDownload> {

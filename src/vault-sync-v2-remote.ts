@@ -274,6 +274,21 @@ export interface VaultSyncV2FileVersionsPage {
   nextBeforeVersionNumber: string | null;
 }
 
+export interface VaultSyncV2DeletedFile {
+  fileId: string;
+  path: string;
+  deletedAt: string;
+  expiresAt: string;
+  /** Last content version before the delete; null when its body is no longer restorable. */
+  restoreVersion: VaultSyncV2FileVersion | null;
+}
+
+export interface VaultSyncV2DeletedFilesPage {
+  retentionDays: number;
+  hasMore: boolean;
+  items: VaultSyncV2DeletedFile[];
+}
+
 export type VaultSyncOperationResult =
   | { protocolVersion: 2; protocolEpoch: number; operationId: string; status: "committed"; fileId: string; fileVersionId: string; changeCursor: string; alreadyApplied: boolean }
   | { protocolVersion: 2; protocolEpoch: number; operationId: string; status: "conflict"; fileId: string; currentHead: { fileVersionId: string; changeCursor: string; path: string }; alreadyApplied: false };
@@ -694,6 +709,19 @@ function parseOperationResult(
     return result as VaultSyncOperationResult;
   }
   throw invalidOperationResponse(receipt);
+}
+
+function isFileVersionShape(item: any): item is VaultSyncV2FileVersion {
+  return exactKeys(item, ["versionId", "versionNumber", "changeCursor", "previousVersionId", "path", "isDeleted", "byteSize", "createdAt", "createdByDeviceId", "isCurrent", "contentStatus", "contentObjectId"])
+    && UUID.test(item.versionId) && isValidVaultSyncInt8Decimal(item.versionNumber, { allowZero: false })
+    && isValidVaultSyncInt8Decimal(item.changeCursor)
+    && (item.previousVersionId === null || (typeof item.previousVersionId === "string" && UUID.test(item.previousVersionId)))
+    && typeof item.path === "string" && !!item.path && normalizeVaultPath(item.path) === item.path
+    && typeof item.isDeleted === "boolean" && isSafeInteger(item.byteSize) && isDateTime(item.createdAt)
+    && (item.createdByDeviceId === null || (typeof item.createdByDeviceId === "string" && UUID.test(item.createdByDeviceId)))
+    && typeof item.isCurrent === "boolean"
+    && ["object_referenced", "legacy_unverified", "unavailable", "deleted", "pruned"].includes(item.contentStatus)
+    && (item.contentObjectId === null || (typeof item.contentObjectId === "string" && UUID.test(item.contentObjectId)));
 }
 
 export class VaultSyncV2RemoteClient {
@@ -1373,16 +1401,7 @@ export class VaultSyncV2RemoteClient {
     let currentItems = 0;
     const before = input.beforeVersionNumber === undefined ? null : BigInt(input.beforeVersionNumber);
     for (const [index, item] of response.items.entries()) {
-      if (!exactKeys(item, ["versionId", "versionNumber", "changeCursor", "previousVersionId", "path", "isDeleted", "byteSize", "createdAt", "createdByDeviceId", "isCurrent", "contentStatus", "contentObjectId"])
-        || !UUID.test(item.versionId) || !isValidVaultSyncInt8Decimal(item.versionNumber, { allowZero: false })
-        || !isValidVaultSyncInt8Decimal(item.changeCursor)
-        || !(item.previousVersionId === null || (typeof item.previousVersionId === "string" && UUID.test(item.previousVersionId)))
-        || typeof item.path !== "string" || !item.path || normalizeVaultPath(item.path) !== item.path
-        || typeof item.isDeleted !== "boolean" || !isSafeInteger(item.byteSize) || !isDateTime(item.createdAt)
-        || !(item.createdByDeviceId === null || (typeof item.createdByDeviceId === "string" && UUID.test(item.createdByDeviceId)))
-        || typeof item.isCurrent !== "boolean"
-        || !["object_referenced", "legacy_unverified", "unavailable", "deleted", "pruned"].includes(item.contentStatus)
-        || !(item.contentObjectId === null || (typeof item.contentObjectId === "string" && UUID.test(item.contentObjectId)))) {
+      if (!isFileVersionShape(item)) {
         throw Object.assign(new Error("历史版本条目不符合合同"), { code: "invalid_history_response" });
       }
       const currentNumber = BigInt(item.versionNumber);
@@ -1412,6 +1431,32 @@ export class VaultSyncV2RemoteClient {
       throw Object.assign(new Error("历史版本分页游标与条目不一致"), { code: "invalid_history_response" });
     }
     return response as VaultSyncV2FileVersionsPage;
+  }
+
+  async getDeletedFiles(limit = 200): Promise<VaultSyncV2DeletedFilesPage> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw Object.assign(new Error("回收站页大小无效"), { code: "trash_limit_invalid" });
+    }
+    const response = await this.request(
+      "/api/sync-targets/" + this.targetId + "/vault/trash?limit=" + limit,
+      { method: "GET", token: "device" },
+    );
+    if (!exactKeys(response, ["retentionDays", "hasMore", "items"])
+      || !isSafeInteger(response.retentionDays) || response.retentionDays < 1
+      || typeof response.hasMore !== "boolean" || !Array.isArray(response.items) || response.items.length > limit) {
+      throw Object.assign(new Error("回收站响应不符合合同"), { code: "invalid_trash_response" });
+    }
+    for (const item of response.items) {
+      if (!exactKeys(item, ["fileId", "path", "deletedAt", "expiresAt", "restoreVersion"])
+        || typeof item.fileId !== "string" || !UUID.test(item.fileId)
+        || typeof item.path !== "string" || !item.path || normalizeVaultPath(item.path) !== item.path
+        || !isDateTime(item.deletedAt) || !isDateTime(item.expiresAt)
+        || !(item.restoreVersion === null || (isFileVersionShape(item.restoreVersion)
+          && item.restoreVersion.contentStatus === "object_referenced" && !item.restoreVersion.isCurrent))) {
+        throw Object.assign(new Error("回收站条目不符合合同"), { code: "invalid_trash_response" });
+      }
+    }
+    return response as VaultSyncV2DeletedFilesPage;
   }
 
   async getFileVersionContent(fileId: string, versionId: string): Promise<VaultSyncV2ObjectDownload> {
