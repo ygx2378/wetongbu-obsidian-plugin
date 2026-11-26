@@ -41,7 +41,7 @@ import { resolveAssetTarget } from "./asset-target";
 import { applyMediaContinuationAsset, commitMediaContinuationNoteAndEvidence, localClipImageLayoutAssets, processLocalClipImages, replaceMarkdownDestination } from "./media-continuation";
 import { completeLocalClipTaskWithRetry } from "./local-clip-completion";
 import { unzipWebclipArchive } from "./webclip-zip";
-import { localPastedImageName, replacePlaceholder, selectPastedImages, uploadPastedImages } from "./paste-image-upload";
+import { PASTE_IMAGE_MAX_BYTES, PASTE_IMAGE_UPLOAD_TIMEOUT_MS, PasteImageTooLargeError, PasteUploadError, localPastedImageName, replacePlaceholder, scaledImageSize, selectPastedImages, shouldCompressPastedImage, uploadPastedImages, withTimeout } from "./paste-image-upload";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { createVaultSyncBootstrapNoticeGate } from "./vault-sync-bootstrap-notice";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
@@ -5175,6 +5175,8 @@ export default class WeTongbuPlugin extends Plugin {
       const sourceFile = info.file;
       if (!files.length || !sourceFile) return;
       evt.preventDefault();
+      // Compress once per image so retries resend the same bytes.
+      const compressed = new Map<File, Promise<Blob>>();
       void uploadPastedImages({
         files,
         createId: () => crypto.randomUUID(),
@@ -5189,13 +5191,21 @@ export default class WeTongbuPlugin extends Plugin {
           }
           await this.app.vault.process(sourceFile, (content) => replacePlaceholder(content, placeholder, replacement) ?? content);
         },
-        upload: (file) => this.uploadPastedImage(file),
+        upload: (file) => {
+          compressed.set(file, compressed.get(file) ?? this.compressPastedImage(file));
+          return this.uploadPastedImage(compressed.get(file)!).catch((error) => {
+            console.warn("WeTongbu pasted image upload failed", error);
+            throw error;
+          });
+        },
+        createPreview: (file) => URL.createObjectURL(file),
+        releasePreview: (url) => URL.revokeObjectURL(url),
         saveLocally: async (file) => {
           const path = await this.app.fileManager.getAvailablePathForAttachment(localPastedImageName(file), sourceFile.path);
           const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
           return `!${this.app.fileManager.generateMarkdownLink(created, sourceFile.path)}`;
         },
-        notify: (message) => new Notice(message, 10000),
+        notify: (message) => new Notice(message, 0),
       }).catch((error) => {
         new Notice(`图片粘贴处理失败：${error instanceof Error ? error.message : String(error)}`, 10000);
       });
@@ -5204,23 +5214,56 @@ export default class WeTongbuPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("editor-drop", handler));
   }
 
-  private async uploadPastedImage(file: File) {
+  // Screenshots are often multi-megabyte PNGs; shrink them before they cross the
+  // network. Falls back to the original when encoding fails or does not help.
+  private async compressPastedImage(file: File): Promise<Blob> {
+    if (!shouldCompressPastedImage(file)) return file;
+    try {
+      const bitmap = await createImageBitmap(file);
+      const { width, height } = scaledImageSize(bitmap.width, bitmap.height);
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d")?.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/webp", 0.9));
+      return blob && blob.type === "image/webp" && blob.size < file.size ? blob : file;
+    } catch (error) {
+      console.warn("WeTongbu pasted image compression skipped", error);
+      return file;
+    }
+  }
+
+  private async uploadPastedImage(pending: Promise<Blob>) {
     const token = this.app.secretStorage.getSecret(this.pluginTokenSecretId());
-    if (!token || !this.settings.syncTargetId) throw new Error("当前 Vault 尚未连接微同步账号");
-    const response = await requestUrl({
+    if (!token || !this.settings.syncTargetId) throw new PasteUploadError("当前 Vault 尚未连接微同步账号", false);
+    const image = await pending;
+    if (image.size > PASTE_IMAGE_MAX_BYTES) throw new PasteImageTooLargeError();
+    const response = await withTimeout(requestUrl({
       url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/sync-targets/${this.settings.syncTargetId}/media/uploads`,
       method: "PUT",
       headers: { Authorization: `Bearer ${token}` },
-      contentType: file.type,
-      body: await file.arrayBuffer(),
+      contentType: image.type,
+      body: await image.arrayBuffer(),
       throw: false,
+    }), PASTE_IMAGE_UPLOAD_TIMEOUT_MS, "上传超时（60 秒），请检查网络").catch((error) => {
+      // A timed-out request keeps running in the background; do not stack another on top.
+      if (error instanceof Error && error.message.startsWith("上传超时")) throw new PasteUploadError(error.message, false);
+      throw error;
     });
-    if (response.status !== 200) {
-      if (response.json?.code === "hosted_media_unavailable") this.canHostImages = false;
-      throw new Error(response.json?.error ?? `云端图片上传失败（HTTP ${response.status}）`);
+    // Cloudflare error pages are HTML, so the JSON body may not parse.
+    let json: any = null;
+    try {
+      json = response.json;
+    } catch {
+      json = null;
     }
-    const url = response.json?.url;
-    if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error("云端图片链接响应无效");
+    if (response.status !== 200) {
+      if (json?.code === "hosted_media_unavailable") this.canHostImages = false;
+      throw new PasteUploadError(json?.error ?? `云端图片上传失败（HTTP ${response.status}）`, response.status >= 500);
+    }
+    const url = json?.url;
+    if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new PasteUploadError("云端图片链接响应无效", false);
     return url;
   }
 
