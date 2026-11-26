@@ -41,7 +41,7 @@ import { resolveAssetTarget } from "./asset-target";
 import { applyMediaContinuationAsset, commitMediaContinuationNoteAndEvidence, localClipImageLayoutAssets, processLocalClipImages, replaceMarkdownDestination } from "./media-continuation";
 import { completeLocalClipTaskWithRetry } from "./local-clip-completion";
 import { unzipWebclipArchive } from "./webclip-zip";
-import { PASTE_IMAGE_MAX_BYTES, PASTE_IMAGE_UPLOAD_TIMEOUT_MS, PasteImageTooLargeError, PasteUploadError, localPastedImageName, replacePlaceholder, scaledImageSize, selectPastedImages, shouldCompressPastedImage, uploadPastedImages, withTimeout } from "./paste-image-upload";
+import { PASTE_IMAGE_MAX_BYTES, PasteImageTooLargeError, PasteUploadError, localPastedImageName, replacePlaceholder, scaledImageSize, selectPastedImages, shouldCompressPastedImage, uploadPastedImageBytes, uploadPastedImages } from "./paste-image-upload";
 import { createVaultSyncOrchestrator, type SyncResult } from "./vault-sync";
 import { createVaultSyncBootstrapNoticeGate } from "./vault-sync-bootstrap-notice";
 import { findDuplicateLocalFiles, type DeletionAction, type DeletionResolution } from "./vault-sync-deletion";
@@ -5239,32 +5239,18 @@ export default class WeTongbuPlugin extends Plugin {
     if (!token || !this.settings.syncTargetId) throw new PasteUploadError("当前 Vault 尚未连接微同步账号", false);
     const image = await pending;
     if (image.size > PASTE_IMAGE_MAX_BYTES) throw new PasteImageTooLargeError();
-    const response = await withTimeout(requestUrl({
-      url: `${this.settings.apiBaseUrl.replace(/\/$/, "")}/api/sync-targets/${this.settings.syncTargetId}/media/uploads`,
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}` },
+    const bytes = await image.arrayBuffer();
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return uploadPastedImageBytes({
+      http: (request) => requestUrl(request),
+      apiBaseUrl: this.settings.apiBaseUrl,
+      targetId: this.settings.syncTargetId,
+      token,
+      bytes,
       contentType: image.type,
-      body: await image.arrayBuffer(),
-      throw: false,
-    }), PASTE_IMAGE_UPLOAD_TIMEOUT_MS, "上传超时（60 秒），请检查网络").catch((error) => {
-      // A timed-out request keeps running in the background; do not stack another on top.
-      if (error instanceof Error && error.message.startsWith("上传超时")) throw new PasteUploadError(error.message, false);
-      throw error;
+      sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      onHostedMediaUnavailable: () => { this.canHostImages = false; },
     });
-    // Cloudflare error pages are HTML, so the JSON body may not parse.
-    let json: any = null;
-    try {
-      json = response.json;
-    } catch {
-      json = null;
-    }
-    if (response.status !== 200) {
-      if (json?.code === "hosted_media_unavailable") this.canHostImages = false;
-      throw new PasteUploadError(json?.error ?? `云端图片上传失败（HTTP ${response.status}）`, response.status >= 500);
-    }
-    const url = json?.url;
-    if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new PasteUploadError("云端图片链接响应无效", false);
-    return url;
   }
 
   private async publishHostedImages(base: string, token: string, taskId: string) {

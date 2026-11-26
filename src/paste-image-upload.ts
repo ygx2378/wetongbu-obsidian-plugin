@@ -5,6 +5,7 @@
 export const PASTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const PASTE_IMAGE_MAX_EDGE = 2560;
 export const PASTE_IMAGE_UPLOAD_TIMEOUT_MS = 60_000;
+export const PASTE_IMAGE_API_TIMEOUT_MS = 30_000;
 
 const PASTE_IMAGE_EXTENSIONS: Record<string, string> = {
   "image/png": "png",
@@ -102,6 +103,135 @@ export class PasteUploadError extends Error {
 export function isRetryablePasteUploadError(error: unknown) {
   const retryable = (error as { retryable?: unknown } | null)?.retryable;
   return typeof retryable === "boolean" ? retryable : true;
+}
+
+export interface PasteHttpRequest {
+  url: string;
+  method: string;
+  headers?: Record<string, string>;
+  contentType?: string;
+  body?: string | ArrayBuffer;
+  throw: false;
+}
+
+export interface PasteHttpResponse {
+  status: number;
+  readonly json: any;
+}
+
+export interface PastedImageUploadInput {
+  http: (request: PasteHttpRequest) => Promise<PasteHttpResponse>;
+  apiBaseUrl: string;
+  targetId: string;
+  token: string;
+  bytes: ArrayBuffer;
+  contentType: string;
+  sha256: string;
+  onHostedMediaUnavailable?: () => void;
+  apiTimeoutMs?: number;
+  uploadTimeoutMs?: number;
+}
+
+// Cloudflare and storage error pages are HTML, so the JSON body may not parse.
+function responseJson(response: PasteHttpResponse) {
+  try {
+    return response.json;
+  } catch {
+    return null;
+  }
+}
+
+// A timed-out request keeps running in the background; do not stack another on
+// top of it, so timeouts are never retried.
+async function timed<T>(promise: Promise<T>, ms: number, message: string) {
+  try {
+    return await withTimeout(promise, ms, message);
+  } catch (error) {
+    if (error instanceof Error && error.message === message) throw new PasteUploadError(message, false);
+    throw error;
+  }
+}
+
+function apiError(response: PasteHttpResponse, json: any, input: PastedImageUploadInput) {
+  if (json?.code === "hosted_media_unavailable") input.onHostedMediaUnavailable?.();
+  return new PasteUploadError(json?.error ?? `云端图片上传失败（HTTP ${response.status}）`, response.status >= 500);
+}
+
+function hostedUrl(json: any) {
+  const url = json?.url;
+  if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new PasteUploadError("云端图片链接响应无效", false);
+  return url;
+}
+
+/**
+ * Uploads one image and returns its signed gateway link. The bytes go straight
+ * to object storage through a presigned URL; the API only reserves and then
+ * verifies the object. Servers without the direct flow get the old single PUT.
+ */
+export async function uploadPastedImageBytes(input: PastedImageUploadInput) {
+  const apiTimeoutMs = input.apiTimeoutMs ?? PASTE_IMAGE_API_TIMEOUT_MS;
+  const uploadTimeoutMs = input.uploadTimeoutMs ?? PASTE_IMAGE_UPLOAD_TIMEOUT_MS;
+  const apiTimeout = `连接微同步超时（${Math.round(apiTimeoutMs / 1000)} 秒），请检查网络`;
+  const uploadTimeout = `上传超时（${Math.round(uploadTimeoutMs / 1000)} 秒），请检查网络`;
+  const base = `${input.apiBaseUrl.replace(/\/$/, "")}/api/sync-targets/${input.targetId}/media/uploads`;
+  const headers = { Authorization: `Bearer ${input.token}` };
+
+  const created = await timed(input.http({
+    url: base,
+    method: "POST",
+    headers,
+    contentType: "application/json",
+    body: JSON.stringify({ sha256: input.sha256, byte_size: input.bytes.byteLength, content_type: input.contentType }),
+    throw: false,
+  }), apiTimeoutMs, apiTimeout);
+  const createdJson = responseJson(created);
+  if (created.status === 404 && !createdJson?.code) {
+    const legacy = await timed(input.http({
+      url: base,
+      method: "PUT",
+      headers,
+      contentType: input.contentType,
+      body: input.bytes,
+      throw: false,
+    }), uploadTimeoutMs, uploadTimeout);
+    const legacyJson = responseJson(legacy);
+    if (legacy.status !== 200) throw apiError(legacy, legacyJson, input);
+    return hostedUrl(legacyJson);
+  }
+  if (created.status !== 200) throw apiError(created, createdJson, input);
+  if (createdJson?.status === "uploaded") return hostedUrl(createdJson);
+
+  const uploadId = createdJson?.upload_id;
+  const uploadUrl = createdJson?.upload_url;
+  if (typeof uploadId !== "string" || typeof uploadUrl !== "string" || !/^https:\/\//.test(uploadUrl)) {
+    throw new PasteUploadError("云端图片上传地址响应无效", false);
+  }
+  const uploaded = await timed(input.http({
+    url: uploadUrl,
+    method: "PUT",
+    contentType: createdJson.content_type ?? input.contentType,
+    body: input.bytes,
+    throw: false,
+  }), uploadTimeoutMs, uploadTimeout);
+  if (uploaded.status < 200 || uploaded.status >= 300) {
+    throw new PasteUploadError(`云端图片上传失败（存储 HTTP ${uploaded.status}）`, uploaded.status >= 500);
+  }
+
+  const completed = await timed(input.http({
+    url: `${base}/${encodeURIComponent(uploadId)}/complete`,
+    method: "POST",
+    headers,
+    contentType: "application/json",
+    body: "{}",
+    throw: false,
+  }), apiTimeoutMs, apiTimeout);
+  const completedJson = responseJson(completed);
+  if (completed.status !== 200) {
+    const error = apiError(completed, completedJson, input);
+    if (completedJson?.code === "media_upload_incomplete") throw new PasteUploadError(error.message, true);
+    throw error;
+  }
+  return hostedUrl(completedJson);
 }
 
 export const PASTE_IMAGE_RETRY_DELAYS_MS = [2_000, 5_000];
